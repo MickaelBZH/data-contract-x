@@ -1,0 +1,109 @@
+apiVersion: v3.1.0
+kind: DataContract
+id: iot_events
+name: IoT analytics events
+version: 1.0.0
+status: draft
+domain: analytics
+description:
+  purpose: Raw analytics events with deeply nested context (depth 3) and a free-form
+    VARIANT payload. Stresses nested-struct handling on import, tag and export.
+servers:
+  - server: prod
+    type: snowflake
+    environment: prod
+    account: MYORG-ACCOUNT
+    database: ANALYTICS_DB
+    schema: LOAD
+    warehouse: ANALYTICS_WH
+schema:
+  - name: IOT_EVENTS
+    physicalName: IOT_EVENTS
+    physicalType: table
+    logicalType: object
+    description: One row per analytics event.
+    properties:
+      - name: event_id
+        logicalType: string
+        physicalType: VARCHAR
+        primaryKey: true
+        required: true
+        unique: true
+        examples: ["evt-0001"]
+      - name: event_type
+        logicalType: string
+        physicalType: VARCHAR
+        examples: [trip_started]
+      - name: user_id
+        logicalType: string
+        physicalType: VARCHAR
+        description: Pseudonymous user identifier.
+        tags: [DATA_CLASSIFICATION=CONFIDENTIAL]
+        examples: ["u-12345"]
+      - name: occurred_at
+        logicalType: date
+        physicalType: TIMESTAMP_NTZ
+        required: true
+        examples: ["2024-11-01T14:22:00Z"]
+      - name: context
+        logicalType: object
+        physicalType: OBJECT
+        description: Event context (depth 2-3 nested struct).
+        properties:
+          - name: app_version
+            logicalType: string
+            physicalType: VARCHAR
+            examples: ["3.4.1"]
+          - name: device
+            logicalType: object
+            physicalType: OBJECT
+            description: Device sub-struct.
+            properties:
+              - name: os
+                logicalType: string
+                physicalType: VARCHAR
+                examples: [Android]
+              - name: os_version
+                logicalType: string
+                physicalType: VARCHAR
+                examples: ["14"]
+              - name: model
+                logicalType: string
+                physicalType: VARCHAR
+                examples: [Pixel 8]
+          - name: geo
+            logicalType: object
+            physicalType: OBJECT
+            description: Coarse geo sub-struct.
+            tags: [DATA_CLASSIFICATION=CONFIDENTIAL]
+            properties:
+              - name: country_code
+                logicalType: string
+                physicalType: VARCHAR
+                logicalTypeOptions:
+                  minLength: 2
+                  maxLength: 2
+                examples: [FR]
+              - name: city
+                logicalType: string
+                physicalType: VARCHAR
+                examples: [Paris]
+      - name: payload
+        logicalType: object
+        physicalType: VARIANT
+        description: Free-form event payload stored as VARIANT.
+      - name: labels
+        logicalType: array
+        physicalType: ARRAY
+        description: Optional labels (array of strings).
+        items:
+          name: label
+          logicalType: string
+          physicalType: VARCHAR
+          examples: [beta]
+    quality:
+      - type: library
+        metric: rowCount
+        dimension: coverage
+        description: Events table must not be empty.
+        mustBeGreaterThan: 0

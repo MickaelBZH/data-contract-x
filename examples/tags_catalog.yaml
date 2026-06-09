@@ -1,0 +1,40 @@
+# Controlled tag catalog for `dcx enrich tags`.
+#
+#   dcx enrich tags <contract> --catalog examples/tags_catalog.yaml
+#
+# The LLM may only assign values defined here. This is a generic, standard
+# starting point — edit the values/examples to match your organization.
+tags:
+  - name: DATA_CLASSIFICATION
+    description: >
+      Data sensitivity level. Assign exactly one — the highest level that applies.
+    multiple: false
+    values:
+      - value: PUBLIC
+        description: Non-sensitive data that can be shared freely.
+        examples: [country_code, currency, language, product_category]
+      - value: INTERNAL
+        description: Internal business data, not for public release. The default.
+        default: true
+        examples: [order_id, status, created_at, loyalty_points]
+      - value: CONFIDENTIAL
+        description: Personal data or sensitive business data; need-to-know access.
+        examples: [full_name, email, phone, home_address, date_of_birth]
+      - value: RESTRICTED
+        description: >
+          Highly sensitive data under legal or regulatory controls — financial,
+          health, credentials, or government identifiers.
+        examples: [national_id, passport_number, iban, credit_card_number, health_status]
+
+  - name: DATA_DOMAIN
+    description: The business domain that owns the column.
+    multiple: false
+    values:
+      - value: CUSTOMER
+        examples: [customer_id, email, loyalty_points]
+      - value: FINANCE
+        examples: [amount, currency, invoice_id, iban]
+      - value: PRODUCT
+        examples: [sku, product_category, unit_price]
+      - value: OPERATIONS
+        examples: [order_id, status, created_at, warehouse_id]

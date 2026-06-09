@@ -1,0 +1,176 @@
+apiVersion: v3.1.0
+kind: DataContract
+id: customers
+name: Customer master
+version: 1.0.0
+status: active
+domain: customer
+description:
+  purpose: Master record of retail customers, their contact details and preferences.
+servers:
+  - server: prod
+    type: snowflake
+    environment: prod
+    account: MYORG-ACCOUNT
+    database: ANALYTICS_DB
+    schema: LOAD
+    warehouse: ANALYTICS_WH
+schema:
+  - name: CUSTOMERS
+    physicalName: CUSTOMERS
+    physicalType: table
+    logicalType: object
+    description: One row per customer.
+    properties:
+      - name: customer_id
+        logicalType: integer
+        physicalType: NUMBER
+        description: Surrogate key uniquely identifying each customer.
+        primaryKey: true
+        required: true
+        unique: true
+        logicalTypeOptions:
+          minimum: 1
+        examples: [1001]
+        tags:
+          - DATA_CLASSIFICATION=INTERNAL
+        quality:
+          - type: library
+            metric: nullValues
+            dimension: completeness
+            description: customer_id must never be null.
+            mustBe: 0
+          - type: library
+            metric: duplicateValues
+            dimension: uniqueness
+            description: customer_id must be unique.
+            mustBe: 0
+      - name: full_name
+        logicalType: string
+        physicalType: VARCHAR
+        description: Customer full name.
+        required: true
+        logicalTypeOptions:
+          maxLength: 200
+        examples: [Alice Dupont]
+        tags:
+          - DATA_CLASSIFICATION=CONFIDENTIAL
+      - name: email
+        logicalType: string
+        physicalType: VARCHAR
+        description: Primary contact email.
+        required: true
+        unique: true
+        logicalTypeOptions:
+          format: email
+          maxLength: 255
+        examples: [alice.dupont@example.com]
+        tags:
+          - DATA_CLASSIFICATION=CONFIDENTIAL
+        quality:
+          - type: library
+            metric: invalidValues
+            dimension: conformity
+            description: email must be a syntactically valid address.
+            arguments:
+              format: email
+            mustBe: 0
+      - name: phone
+        logicalType: string
+        physicalType: VARCHAR
+        description: Mobile phone number in E.164 format.
+        logicalTypeOptions:
+          maxLength: 20
+        examples: ["+33 6 12 34 56 78"]
+        tags:
+          - DATA_CLASSIFICATION=CONFIDENTIAL
+      - name: national_id
+        logicalType: string
+        physicalType: VARCHAR
+        description: Government-issued national identification number.
+        logicalTypeOptions:
+          maxLength: 32
+        tags:
+          - DATA_CLASSIFICATION=RESTRICTED
+      - name: date_of_birth
+        logicalType: date
+        physicalType: DATE
+        description: Customer date of birth.
+        examples: ["1990-07-22"]
+        tags:
+          - DATA_CLASSIFICATION=CONFIDENTIAL
+      - name: address
+        logicalType: object
+        physicalType: OBJECT
+        description: Postal address (nested struct).
+        properties:
+          - name: street
+            logicalType: string
+            physicalType: VARCHAR
+            examples: ["12 Rue de la Paix"]
+          - name: city
+            logicalType: string
+            physicalType: VARCHAR
+            examples: [Paris]
+          - name: postal_code
+            logicalType: string
+            physicalType: VARCHAR
+            examples: ["75002"]
+          - name: country_code
+            logicalType: string
+            physicalType: VARCHAR
+            description: ISO 3166-1 alpha-2 country code.
+            logicalTypeOptions:
+              minLength: 2
+              maxLength: 2
+            examples: [FR]
+      - name: preferences
+        logicalType: object
+        physicalType: OBJECT
+        description: Customer preferences (nested struct).
+        properties:
+          - name: language
+            logicalType: string
+            physicalType: VARCHAR
+            examples: [fr]
+          - name: currency
+            logicalType: string
+            physicalType: VARCHAR
+            examples: [EUR]
+          - name: marketing_opt_in
+            logicalType: boolean
+            physicalType: BOOLEAN
+            examples: [true]
+      - name: status
+        logicalType: string
+        physicalType: VARCHAR
+        description: Customer lifecycle status.
+        logicalTypeOptions:
+          pattern: "^(prospect|active|premium|churned)$"
+        examples: [premium]
+        tags:
+          - DATA_CLASSIFICATION=INTERNAL
+      - name: loyalty_points
+        logicalType: integer
+        physicalType: NUMBER
+        description: Accumulated loyalty points.
+        logicalTypeOptions:
+          minimum: 0
+        examples: [340]
+      - name: created_at
+        logicalType: date
+        physicalType: TIMESTAMP_NTZ
+        description: Record creation timestamp.
+        required: true
+        examples: ["2023-04-12T08:30:00Z"]
+      - name: updated_at
+        logicalType: date
+        physicalType: TIMESTAMP_NTZ
+        description: Last update timestamp.
+        examples: ["2024-11-01T14:22:00Z"]
+    quality:
+      - type: library
+        metric: rowCount
+        dimension: coverage
+        description: The customer table must not be empty.
+        mustBeGreaterThan: 0
