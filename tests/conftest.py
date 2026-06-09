@@ -1,13 +1,24 @@
-"""Make CLI-output assertions deterministic regardless of the runner's color env.
+"""Stable CLI-output assertions across machines.
 
-CI (e.g. GitHub Actions) sets ``FORCE_COLOR``, which makes Typer/rich render help
-and error text as ANSI panels — the styling/wrapping breaks plain substring checks
-on ``result.output`` (locally, where output is a non-TTY, it renders plain). Force
-plain, wide output so ``CliRunner`` results are stable on every machine.
+CI (e.g. GitHub Actions) sets ``FORCE_COLOR``, so Typer/rich renders help and
+error text as ANSI panels — the color codes break plain substring checks on
+``result.output``, and a narrow terminal would wrap option names mid-token. We
+pin a wide width (no wrapping) and expose a ``strip_ansi`` fixture so tests can
+assert against plain text regardless of the runner's color settings.
 """
 
 import os
+import re
 
-os.environ.pop("FORCE_COLOR", None)
-os.environ["NO_COLOR"] = "1"
+import pytest
+
+# Fixed wide width so rich never wraps an option name across lines.
 os.environ["COLUMNS"] = "200"
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+@pytest.fixture
+def strip_ansi():
+    """Return a function that strips ANSI color codes from CLI output."""
+    return lambda text: _ANSI_RE.sub("", text)

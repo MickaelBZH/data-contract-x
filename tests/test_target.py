@@ -365,7 +365,7 @@ def test_invalid_server_type_errors(tmp_path):
     assert "No such command" in result.output
 
 
-def test_invalid_format_for_type_errors(tmp_path):
+def test_invalid_format_for_type_errors(tmp_path, strip_ansi):
     contract = tmp_path / "contract.yaml"
     _write_contract(contract)
 
@@ -374,7 +374,7 @@ def test_invalid_format_for_type_errors(tmp_path):
         "--host", "k:9092", "--format", "parquet",  # parquet not in KafkaFormat enum
     ])
     assert result.exit_code == 2
-    assert "Invalid value for '--format'" in result.output
+    assert "Invalid value for '--format'" in strip_ansi(result.output)
 
 
 EXPECTED_SUBCOMMANDS = {
@@ -466,12 +466,13 @@ def test_azure_parquet_resolves_parquet_physical_types(tmp_path):
     assert props["created_at"]["physicalType"] == "TIMESTAMP_MICROS"
 
 
-def test_snowflake_help_shows_only_snowflake_options():
+def test_snowflake_help_shows_only_snowflake_options(strip_ansi):
     result = runner.invoke(app, ["target", "snowflake", "--help"])
     assert result.exit_code == 0
-    assert "--account" in result.output
-    assert "--warehouse" in result.output
-    assert "--project" not in result.output
-    assert "--dataset" not in result.output
-    assert "--bootstrap" not in result.output
-    assert "--region-name" not in result.output
+    out = strip_ansi(result.output)
+    assert "--account" in out
+    assert "--warehouse" in out
+    assert "--project" not in out
+    assert "--dataset" not in out
+    assert "--bootstrap" not in out
+    assert "--region-name" not in out

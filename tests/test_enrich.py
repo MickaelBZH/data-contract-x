@@ -875,14 +875,15 @@ def test_cli_enriches_via_monkeypatched_llm(tmp_path, monkeypatch):
     assert _props(enriched)["id"].description == "Surrogate key."
 
 
-def test_cli_no_api_key_flag(tmp_path):
+def test_cli_no_api_key_flag(tmp_path, strip_ansi):
     contract_path = tmp_path / "datacontract.yaml"
     contract_path.write_text(CONTRACT_YAML)
     result = runner.invoke(app, [
         "enrich", "columns", str(contract_path), "--api-key", "secret",
     ])
     assert result.exit_code != 0
-    assert "api-key" in result.output.lower() or "api_key" in result.output.lower()
+    out = strip_ansi(result.output).lower()
+    assert "api-key" in out or "api_key" in out
 
 
 def test_cli_quality_via_monkeypatched_llm(tmp_path, monkeypatch):
