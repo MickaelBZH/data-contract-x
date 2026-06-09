@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 # PyPI distribution name. The import package and CLI stay `dcx`.
 name = "datacontract-x"
-version = "0.1.0"
+version = "0.1.1"
 description = "Data Contract eXtended — AI-native, platform-extensible data contracts: LLM enrichment (descriptions, tags, data quality), live import, and apply. Built on datacontract-cli."
 license = "MIT"
 license-files = ["LICENSE"]
