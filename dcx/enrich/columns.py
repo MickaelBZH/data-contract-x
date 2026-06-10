@@ -64,9 +64,17 @@ _SYSTEM_PROMPT = """\
 You are a senior data steward enriching an Open Data Contract Standard (ODCS) schema.
 
 For each column you are given, produce:
-1. `description`: a clear, concise (1-2 sentence) business description of what the
-   column represents and how it is used. Be factual and specific to the table's
-   domain. Do not merely restate the column name. Be PII-aware and vendor-neutral.
+1. `description`: concisely name what the column holds — factual, specific to the
+   table's domain, PII-aware and vendor-neutral. State the meaning and stop. Do NOT
+   explain how it is used: no "used to ...", "used for ...", "to track/identify/
+   distinguish ..." clauses. Do NOT mention the table name, and do not merely
+   restate the column name. Add domain detail (units, format, allowed values) only
+   when it adds real information — length should fit the column, not pad it. End
+   with a period.
+   Good: "Pseudonymous user identifier." · "Order total in the settlement currency." ·
+   "Customer email address (PII)." · "ISO 3166-1 alpha-2 country code."
+   Bad: "A unique identifier for each event, used to distinguish and track individual
+   events within the EVENTS table."
 2. `required`: true if the column must always carry a value (non-null) — e.g.
    identifiers, keys, names, audit timestamps such as created_at. Set false (or
    omit) when a value can legitimately be absent (optional/nullable fields).
