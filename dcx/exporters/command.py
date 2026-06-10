@@ -19,6 +19,7 @@ from datacontract.command_export import export_app
 from typing_extensions import Annotated
 
 from dcx.exporters import snowflake  # noqa: F401  registers the snowflake-full exporter
+from dcx.exporters.snowflake import DdlMode
 
 
 @export_app.command(
@@ -39,6 +40,21 @@ def _export_snowflake_full(
     json_schema: Annotated[
         Optional[str], typer.Option(help="Validate the contract against this JSON Schema URL."),
     ] = None,
+    ddl_mode: Annotated[
+        DdlMode,
+        typer.Option(
+            "--ddl-mode",
+            help="Table handling (matches `apply`): auto = CREATE TABLE IF NOT EXISTS + govern "
+            "(default); always = plain CREATE TABLE; never = ALTER/govern existing only.",
+        ),
+    ] = DdlMode.auto,
+    comments: Annotated[
+        bool,
+        typer.Option(
+            "--comments/--no-comments",
+            help="Emit COMMENT ON TABLE/COLUMN for descriptions (in auto / never modes).",
+        ),
+    ] = True,
     structured_types: Annotated[
         bool,
         typer.Option(
@@ -87,6 +103,8 @@ def _export_snowflake_full(
         export_format="snowflake-full",
         schema_name=schema_name,
         sql_server_type="snowflake",
+        **ddl_mode.to_sql_kwargs(),
+        include_comments=comments,
         structured_types=structured_types,
         include_tags=include_tags,
         include_quality=include_quality,

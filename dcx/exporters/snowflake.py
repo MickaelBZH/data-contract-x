@@ -33,6 +33,7 @@ emit a `-- TODO` comment instead of breaking the script.
 
 import logging
 from contextlib import contextmanager
+from enum import Enum
 from typing import Iterable, Optional
 
 import datacontract.export.sql_exporter as _upstream_sql_exporter
@@ -59,6 +60,30 @@ _LIBRARY_METRIC_TO_DMF: dict[str, tuple[str, str]] = {
 }
 
 
+class DdlMode(str, Enum):
+    """How the snowflake-full SQL handles table creation when the table may or may
+    not exist. Shared by `dcx apply snowflake` and `dcx export snowflake-full`.
+
+    - `auto`   — `CREATE TABLE IF NOT EXISTS`: create missing tables, govern
+      existing ones (comments/tags/DQ). The default; safe when existence is unknown.
+    - `always` — plain `CREATE TABLE`: fails if the table already exists. Use when
+      you intend to create fresh tables and want a loud error otherwise.
+    - `never`  — no `CREATE TABLE`: alter-only governance of existing tables.
+    """
+
+    auto = "auto"
+    always = "always"
+    never = "never"
+
+    def to_sql_kwargs(self) -> dict[str, bool]:
+        """Map to the `to_snowflake_full_sql` DDL flags."""
+        return {
+            DdlMode.auto:   {"include_ddl": True, "ddl_if_not_exists": True},
+            DdlMode.always: {"include_ddl": True, "ddl_if_not_exists": False},
+            DdlMode.never:  {"include_ddl": False, "ddl_if_not_exists": False},
+        }[self]
+
+
 class SnowflakeFullExporter(Exporter):
     """Exporter for `snowflake-full` format — registered in the upstream factory."""
 
@@ -72,7 +97,10 @@ class SnowflakeFullExporter(Exporter):
     ) -> str:
         return to_snowflake_full_sql(
             data_contract,
+            include_ddl=bool(export_args.get("include_ddl", True)),
+            ddl_if_not_exists=bool(export_args.get("ddl_if_not_exists", False)),
             structured_types=bool(export_args.get("structured_types", False)),
+            include_comments=bool(export_args.get("include_comments", True)),
             include_tags=bool(export_args.get("include_tags", True)),
             include_quality=bool(export_args.get("include_quality", False)),
             create_tags=bool(export_args.get("create_tags", False)),

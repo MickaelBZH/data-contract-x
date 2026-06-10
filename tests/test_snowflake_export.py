@@ -341,7 +341,7 @@ def test_cli_export_snowflake_full_to_stdout(tmp_path):
         "export", "snowflake-full", str(contract_path),
     ])
     assert result.exit_code == 0, result.output
-    assert "CREATE TABLE SALES_DB.SALES.orders" in result.output
+    assert "CREATE TABLE IF NOT EXISTS SALES_DB.SALES.orders" in result.output  # auto default
     assert "ALTER TABLE SALES_DB.SALES.orders SET TAG critical" in result.output
     # quality off by default
     assert "DATA METRIC FUNCTION" not in result.output
@@ -373,7 +373,7 @@ def test_cli_export_to_file(tmp_path):
     ])
     assert result.exit_code == 0, result.output
     sql = out_path.read_text()
-    assert "CREATE TABLE SALES_DB.SALES.orders" in sql
+    assert "CREATE TABLE IF NOT EXISTS SALES_DB.SALES.orders" in sql  # auto default
     assert "CREATE TAG IF NOT EXISTS GOV.TAGS.critical" in sql
     assert "SET TAG GOV.TAGS.classification = 'PII'" in sql
     assert "ADD DATA METRIC FUNCTION" in sql
@@ -398,7 +398,7 @@ def test_api_export_snowflake_full(tmp_path):
     assert response.status_code == 200, response.text
     assert "text/plain" in response.headers["content-type"]
     body = response.text
-    assert "CREATE TABLE SALES_DB.SALES.orders" in body
+    assert "CREATE TABLE IF NOT EXISTS SALES_DB.SALES.orders" in body  # auto default
     assert "CREATE TAG IF NOT EXISTS critical;" in body
     assert "ADD DATA METRIC FUNCTION SNOWFLAKE.CORE.ROW_COUNT" in body
 
@@ -614,3 +614,33 @@ def test_structured_types_renders_nested_shape():
     # free-form VARIANT (no properties) stays untyped
     assert "payload VARIANT" in sql
     assert "payload OBJECT(" not in sql
+
+
+# === ddl-mode / apply parity (export shares apply's SQL-generation knobs) =====
+
+def test_export_ddl_modes(tmp_path):
+    contract_path = tmp_path / "datacontract.yaml"
+    contract_path.write_text(CONTRACT_YAML)
+
+    auto = runner.invoke(app, ["export", "snowflake-full", str(contract_path)])
+    assert auto.exit_code == 0, auto.output
+    assert "CREATE TABLE IF NOT EXISTS SALES_DB.SALES.orders" in auto.output  # default
+
+    always = runner.invoke(app, ["export", "snowflake-full", str(contract_path), "--ddl-mode", "always"])
+    assert "CREATE TABLE SALES_DB.SALES.orders" in always.output
+    assert "IF NOT EXISTS" not in always.output
+
+    never = runner.invoke(app, ["export", "snowflake-full", str(contract_path), "--ddl-mode", "never"])
+    assert "CREATE TABLE" not in never.output          # alter/govern only
+    assert "SET TAG" in never.output                   # tags still emitted
+
+
+def test_export_snowflake_full_matches_apply_dry_run(tmp_path):
+    """`export snowflake-full` produces the same SQL as `apply snowflake --dry-run`."""
+    contract_path = tmp_path / "datacontract.yaml"
+    contract_path.write_text(CONTRACT_YAML)
+
+    exp = runner.invoke(app, ["export", "snowflake-full", str(contract_path), "--include-quality"])
+    dry = runner.invoke(app, ["apply", "snowflake", str(contract_path), "--dry-run", "--include-quality"])
+    assert exp.exit_code == 0 and dry.exit_code == 0, (exp.output, dry.output)
+    assert exp.output.strip() == dry.output.strip()

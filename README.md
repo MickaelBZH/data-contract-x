@@ -136,10 +136,11 @@ dcx enrich all     contract.yaml --catalog tags_catalog.yaml --output contract.f
 | `dcx export snowflake-full` | A Snowflake setup script: DDL + tags + Data Metric Functions, in one file |
 | `dcx export <format>` | Any upstream format — `sql`, `jsonschema`, `html`, `markdown`, `mermaid`, `dbt-*`, `avro`, `protobuf`, `bigquery`, `spark`, `sqlalchemy`, `iceberg`, `sodacl`, `great-expectations`, `dbml`, `pydantic-model`, `odcs`, `rdf`, `go`, `excel`, … |
 
-`snowflake-full` options: `--include-tags`, `--include-quality`, `--create-tags`, `--tag-namespace DB.SCHEMA`, and `--structured-types` (render nested columns as typed `OBJECT(field type, …)` / `ARRAY(type)`).
+`snowflake-full` shares [`apply`](#apply)'s SQL-generation knobs, so it emits the exact same script `apply --dry-run` would: `--ddl-mode auto\|always\|never` (default `auto` → `CREATE TABLE IF NOT EXISTS` + govern), `--structured-types`, `--comments`, `--include-tags`, `--include-quality`, `--create-tags`, `--tag-namespace DB.SCHEMA`. (`apply`'s `--strict` drift check has no export equivalent — it needs a live connection.)
 
 ```bash
 dcx export snowflake-full contract.yaml --include-quality --create-tags --output setup.sql
+dcx export snowflake-full contract.yaml --ddl-mode never --output govern.sql   # alter-only
 dcx export html contract.yaml --output contract.html
 ```
 

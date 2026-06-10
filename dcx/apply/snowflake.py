@@ -16,41 +16,19 @@ to build the script, then runs it via `snowflake-connector-python`.
 """
 
 import os
-from enum import Enum
 from typing import Any, Optional
 
 import typer
 from open_data_contract_standard.model import OpenDataContractStandard, Server
 from typing_extensions import Annotated
 
-from dcx.exporters.snowflake import to_snowflake_full_sql
+# DdlMode lives with the SQL generator (it maps to to_snowflake_full_sql flags) and
+# is re-exported here so `dcx.apply.snowflake.DdlMode` keeps working.
+from dcx.exporters.snowflake import DdlMode, to_snowflake_full_sql
 
 
 class ApplyError(Exception):
     """An apply-time failure with a user-actionable message."""
-
-
-class DdlMode(str, Enum):
-    """How `apply` handles table creation when it doesn't know if a table exists.
-
-    - `auto`   — `CREATE TABLE IF NOT EXISTS`: create missing tables, govern
-      existing ones (comments/tags/DQ). The default; safe when existence is unknown.
-    - `always` — plain `CREATE TABLE`: fails if the table already exists. Use when
-      you intend to create fresh tables and want a loud error otherwise.
-    - `never`  — no `CREATE TABLE`: alter-only governance of existing tables.
-    """
-
-    auto = "auto"
-    always = "always"
-    never = "never"
-
-    def to_sql_kwargs(self) -> dict[str, bool]:
-        """Map to the `to_snowflake_full_sql` DDL flags."""
-        return {
-            DdlMode.auto:   {"include_ddl": True, "ddl_if_not_exists": True},
-            DdlMode.always: {"include_ddl": True, "ddl_if_not_exists": False},
-            DdlMode.never:  {"include_ddl": False, "ddl_if_not_exists": False},
-        }[self]
 
 
 # Snowflake connector kwarg → env var name. The connector itself doesn't
