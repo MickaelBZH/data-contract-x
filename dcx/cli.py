@@ -56,6 +56,31 @@ app.info.cls = _OrderedCommandsBypassDcxShim
 import_app.info.cls = _ImportBypassDcxShim
 
 
+def _version_callback(value: bool) -> None:
+    if value:
+        import dcx
+
+        typer.echo(dcx.__version__)
+        raise typer.Exit()
+
+
+# Re-register the root callback so `dcx --version` reports dcx's version instead
+# of upstream's, which prints the datacontract-cli version. Re-applying
+# `@app.callback()` replaces upstream's. Use `dcx info` for both versions.
+@app.callback()
+def common(
+    ctx: Context,
+    version: bool = typer.Option(
+        None,
+        "--version",
+        help="Prints the dcx version.",
+        callback=_version_callback,
+        is_eager=True,
+    ),
+) -> None:
+    """Data Contract eXtended — AI-native, platform-extensible data contracts."""
+
+
 @app.command("info")
 def info() -> None:
     """Show dcx and underlying datacontract-cli versions."""
