@@ -18,8 +18,17 @@ import typer
 from datacontract.command_export import export_app
 from typing_extensions import Annotated
 
+from dcx.exporters import dbt as _dbt  # noqa: F401  registers the dbt exporter
 from dcx.exporters import snowflake  # noqa: F401  registers the snowflake-full exporter
+from dcx.exporters.dbt import DbtKind
 from dcx.exporters.snowflake import DdlMode
+
+# Replace upstream's `export dbt` removed-shim (renamed to `dbt-models` in v0.12.0)
+# with the dcx unified `dbt` command defined below. The upstream `dbt-models`,
+# `dbt-sources`, and `dbt-staging-sql` commands are left untouched.
+export_app.registered_commands = [
+    c for c in export_app.registered_commands if c.name != "dbt"
+]
 
 
 @export_app.command(
@@ -117,6 +126,72 @@ def _export_snowflake_full(
     if capture is not None:
         capture["result"] = result
         capture["format"] = "snowflake-full"
+        return
+
+    if output is None:
+        typer.echo(result, nl=False)
+    else:
+        if isinstance(result, bytes):
+            output.write_bytes(result)
+        else:
+            output.write_text(result, encoding="utf-8")
+        typer.echo(f"Wrote {output}", err=True)
+
+
+@export_app.command(
+    name="dbt",
+    epilog="Example: dcx export dbt datacontract.yaml --kind models --output schema.yml",
+)
+def _export_dbt(
+    location: Annotated[str, typer.Argument(help="Path to the data contract.")] = "datacontract.yaml",
+    output: Annotated[
+        Optional[Path], typer.Option(help="Write the output to this path. Default: stdout."),
+    ] = None,
+    kind: Annotated[
+        DbtKind,
+        typer.Option(
+            "--kind",
+            help="Which dbt artifact to emit: models (schema.yml, default), sources "
+            "(sources.yml), or staging (a staging SELECT).",
+        ),
+    ] = DbtKind.models,
+    server: Annotated[
+        Optional[str], typer.Option(help="Use this server name from the contract (sets the dbt adapter)."),
+    ] = None,
+    schema_name: Annotated[
+        str, typer.Option(help="Contract schema to export (default: all). Required for --kind staging."),
+    ] = "all",
+    json_schema: Annotated[
+        Optional[str], typer.Option(help="Validate the contract against this JSON Schema URL."),
+    ] = None,
+    inline_references: Annotated[
+        bool, typer.Option(help="Resolve $ref in the contract before exporting."),
+    ] = True,
+) -> None:
+    """Export a contract to dbt: model schema, sources, or a staging SQL file.
+
+    ODCS governance is mapped to idiomatic dbt: `NAME=VALUE` tags and `classification`
+    /`businessName`/`criticalDataElement` go to `config.meta`, while bare tags become
+    `config.tags`. Schema-level tags land on the model's `config`.
+    """
+    from datacontract.data_contract import DataContract
+    from dcx.api import _export_capture_var
+
+    result = DataContract(
+        data_contract_file=location,
+        schema_location=json_schema,
+        server=server,
+        inline_references=inline_references,
+    ).export(
+        export_format="dbt",
+        schema_name=schema_name,
+        kind=kind.value,
+    )
+
+    capture = _export_capture_var.get()
+    if capture is not None:
+        capture["result"] = result
+        capture["format"] = "dbt"
         return
 
     if output is None:

@@ -546,7 +546,9 @@ _API_CONTRACT = {
 
 
 def test_api_apply_dry_run_no_token_returns_sql():
-    r = _api_client().post("/apply/snowflake", json={"contract": _API_CONTRACT, "dry_run": True})
+    r = _api_client().post(
+        "/apply/snowflake", json={"contract": _API_CONTRACT, "options": {"dry_run": True}},
+    )
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["dry_run"] is True
@@ -555,7 +557,7 @@ def test_api_apply_dry_run_no_token_returns_sql():
 
 
 def test_api_apply_execute_requires_token():
-    r = _api_client().post("/apply/snowflake", json={"contract": _API_CONTRACT})
+    r = _api_client().post("/apply/snowflake", json={"contract": _API_CONTRACT, "options": {}})
     assert r.status_code == 401
     assert "Bearer" in r.json()["detail"]
 
@@ -572,7 +574,7 @@ def test_api_apply_executes_with_token(monkeypatch):
     r = _api_client().post(
         "/apply/snowflake",
         headers={"Authorization": "Bearer tok-xyz"},
-        json={"contract": _API_CONTRACT, "include_quality": False},
+        json={"contract": _API_CONTRACT, "options": {"include_quality": False}},
     )
     assert r.status_code == 200, r.text
     assert captured["token"] == "tok-xyz"
@@ -591,7 +593,7 @@ def test_api_apply_error_is_502(monkeypatch):
     r = _api_client().post(
         "/apply/snowflake",
         headers={"Authorization": "Bearer tok"},
-        json={"contract": _API_CONTRACT},
+        json={"contract": _API_CONTRACT, "options": {}},
     )
     assert r.status_code == 502
     assert "bad token" in r.json()["detail"]

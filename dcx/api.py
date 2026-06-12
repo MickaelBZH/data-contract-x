@@ -878,12 +878,12 @@ def mirror_snowflake_import_to_fastapi(api_app: FastAPI, prefix: str = "/import"
 # review and needs no token.
 
 
-class ApplySnowflakeRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+class ApplySnowflakeRequestOptions(BaseModel):
+    """Apply options — the body's `options` object, mirroring the CLI flags. Matches
+    the `{contract, options}` shape produced for the auto-generated endpoints."""
 
-    contract: Union[Dict[str, Any], str] = Field(
-        ..., description="The data contract (JSON object or YAML string)."
-    )
+    model_config = ConfigDict(extra="forbid")
+
     server_name: Optional[str] = Field(None, description="Named server from the contract.")
     account: Optional[str] = Field(None, description="Override account (else from server block).")
     role: Optional[str] = Field(None, description="Role to assume (needs APPLY TAG / table ownership).")
@@ -920,6 +920,16 @@ class ApplySnowflakeRequest(BaseModel):
     )
 
 
+# Built with `create_model` (like the auto-generated endpoints) so it reuses the
+# shared `_CONTRACT_FIELD` and lands on the same `{contract, options}` body shape.
+ApplySnowflakeRequest = create_model(
+    "ApplySnowflakeRequest",
+    __config__=ConfigDict(extra="forbid"),
+    contract=_CONTRACT_FIELD,
+    options=(ApplySnowflakeRequestOptions, ...),
+)
+
+
 def mirror_apply_snowflake_to_fastapi(api_app: FastAPI, prefix: str = "/apply") -> None:
     """Register `POST {prefix}/snowflake` authenticated by a caller OAuth token."""
 
@@ -938,8 +948,9 @@ def mirror_apply_snowflake_to_fastapi(api_app: FastAPI, prefix: str = "/apply") 
     ):
         from dcx.apply import snowflake as apply_module
 
+        opts = body.options
         token = _bearer_token(authorization)
-        if not body.dry_run and not token:
+        if not opts.dry_run and not token:
             raise HTTPException(
                 status_code=401,
                 detail="Provide a Snowflake OAuth token via 'Authorization: Bearer <token>'.",
@@ -949,20 +960,20 @@ def mirror_apply_snowflake_to_fastapi(api_app: FastAPI, prefix: str = "/apply") 
             result = apply_module.apply_snowflake_oauth(
                 contract,
                 token=token or "",
-                server_name=body.server_name,
-                account=body.account,
-                role=body.role,
-                warehouse=body.warehouse,
-                dry_run=body.dry_run,
-                ddl_mode=body.ddl_mode,
-                strict=body.strict,
-                structured_types=body.structured_types,
-                include_comments=body.include_comments,
-                include_tags=body.include_tags,
-                include_quality=body.include_quality,
-                create_tags=body.create_tags,
-                tag_namespace=body.tag_namespace,
-                metric_schedule=body.metric_schedule,
+                server_name=opts.server_name,
+                account=opts.account,
+                role=opts.role,
+                warehouse=opts.warehouse,
+                dry_run=opts.dry_run,
+                ddl_mode=opts.ddl_mode,
+                strict=opts.strict,
+                structured_types=opts.structured_types,
+                include_comments=opts.include_comments,
+                include_tags=opts.include_tags,
+                include_quality=opts.include_quality,
+                create_tags=opts.create_tags,
+                tag_namespace=opts.tag_namespace,
+                metric_schedule=opts.metric_schedule,
             )
         except apply_module.ApplyError as exc:
             raise HTTPException(status_code=502, detail=str(exc))

@@ -134,18 +134,22 @@ dcx enrich all     contract.yaml --catalog tags_catalog.yaml --output contract.f
 | Sub-command | Output |
 |---|---|
 | `dcx export snowflake-full` | A Snowflake setup script: DDL + tags + Data Metric Functions, in one file |
+| `dcx export dbt` | dbt `models` / `sources` / `staging`, with ODCS governance mapped to `config.meta` / `config.tags` |
 | `dcx export <format>` | Any upstream format — `sql`, `jsonschema`, `html`, `markdown`, `mermaid`, `dbt-*`, `avro`, `protobuf`, `bigquery`, `spark`, `sqlalchemy`, `iceberg`, `sodacl`, `great-expectations`, `dbml`, `pydantic-model`, `odcs`, `rdf`, `go`, `excel`, … |
 
 `snowflake-full` shares [`apply`](#apply)'s SQL-generation knobs, so it emits the exact same script `apply --dry-run` would: `--ddl-mode auto\|always\|never` (default `auto` → `CREATE TABLE IF NOT EXISTS` + govern), `--structured-types`, `--comments`, `--include-tags`, `--include-quality`, `--create-tags`, `--tag-namespace DB.SCHEMA`. (`apply`'s `--strict` drift check has no export equivalent — it needs a live connection.)
 
+`dbt` unifies upstream's `dbt-models` / `dbt-sources` / `dbt-staging-sql` under one command via `--kind models\|sources\|staging` (default `models`), and maps ODCS governance the idiomatic dbt way: `NAME=VALUE` tags plus `classification` / `businessName` / `criticalDataElement` go to **`config.meta`** (key/value metadata for docs + catalogs), while bare tags become **`config.tags`** (dbt selection labels). Schema-level tags — dropped by the upstream models exporter — land on the model's `config`. (The upstream `dbt-models` / `dbt-sources` / `dbt-staging-sql` commands remain available, unchanged.)
+
 ```bash
 dcx export snowflake-full contract.yaml --include-quality --create-tags --output setup.sql
 dcx export snowflake-full contract.yaml --ddl-mode never --output govern.sql   # alter-only
+dcx export dbt contract.yaml --kind models --server production --output schema.yml
 dcx export html contract.yaml --output contract.html
 ```
 
 **API**
-- `POST /export/{format}` — including `POST /export/snowflake-full`. The response media type depends on the format (JSON / YAML / text / binary).
+- `POST /export/{format}` — including `POST /export/snowflake-full` and `POST /export/dbt` (`{options: {kind: "models"}}`). The response media type depends on the format (JSON / YAML / text / binary).
 
 ### `apply` — push governance to a live platform
 
