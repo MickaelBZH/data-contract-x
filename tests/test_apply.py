@@ -4,7 +4,7 @@ import pytest
 from open_data_contract_standard.model import OpenDataContractStandard
 from typer.testing import CliRunner
 
-from dcx.apply.snowflake import ApplyError, _resolve_connection_params, apply_snowflake
+from dcx.apply.snowflake import ApplyError, _resolve_connection_params
 from dcx.cli import app
 
 runner = CliRunner()
@@ -207,6 +207,32 @@ def mock_snowflake_connector(monkeypatch):
     import snowflake.connector as _connector_module
     monkeypatch.setattr(_connector_module, "connect", fake_connect)
     return state
+
+
+def test_quiet_aws_credential_noise_lowers_botocore_logger():
+    import logging
+    from dcx.apply.snowflake import quiet_aws_credential_noise
+
+    log = logging.getLogger("botocore.credentials")
+    log.setLevel(logging.WARNING)
+    quiet_aws_credential_noise()
+    assert log.level == logging.ERROR
+
+
+def test_connect_path_quiets_botocore_noise(tmp_path, mock_snowflake_connector, monkeypatch):
+    """The Snowflake connect path silences botocore's SSO refresh noise — covering the
+    API/apply paths the CLI-only command suppression used to miss."""
+    import logging
+
+    logging.getLogger("botocore.credentials").setLevel(logging.WARNING)
+    monkeypatch.setenv("SNOWFLAKE_USER", "me")
+    monkeypatch.setenv("SNOWFLAKE_PASSWORD", "s3cret")
+    contract_path = tmp_path / "datacontract.yaml"
+    contract_path.write_text(CONTRACT_YAML)
+
+    result = runner.invoke(app, ["apply", "snowflake", str(contract_path), "--ddl-mode", "always"])
+    assert result.exit_code == 0, result.output
+    assert logging.getLogger("botocore.credentials").level == logging.ERROR
 
 
 def test_apply_executes_against_connector(tmp_path, mock_snowflake_connector, monkeypatch):

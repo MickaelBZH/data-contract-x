@@ -20,7 +20,7 @@ from typing_extensions import Annotated
 
 from dcx.exporters import dbt as _dbt  # noqa: F401  registers the dbt exporter
 from dcx.exporters import snowflake  # noqa: F401  registers the snowflake-full exporter
-from dcx.exporters.dbt import DbtKind
+from dcx.exporters.dbt import DbtKind, DbtMetaKeyStyle
 from dcx.exporters.snowflake import DdlMode
 
 # Replace upstream's `export dbt` removed-shim (renamed to `dbt-models` in v0.12.0)
@@ -161,6 +161,14 @@ def _export_dbt(
     schema_name: Annotated[
         str, typer.Option(help="Contract schema to export (default: all). Required for --kind staging."),
     ] = "all",
+    meta_key_style: Annotated[
+        DbtMetaKeyStyle,
+        typer.Option(
+            "--meta-key-style",
+            help="How a namespaced tag name becomes a config.meta key: full "
+            "(db.schema.name, default), sanitized (db_schema_name), or short (name).",
+        ),
+    ] = DbtMetaKeyStyle.full,
     json_schema: Annotated[
         Optional[str], typer.Option(help="Validate the contract against this JSON Schema URL."),
     ] = None,
@@ -172,7 +180,9 @@ def _export_dbt(
 
     ODCS governance is mapped to idiomatic dbt: `NAME=VALUE` tags and `classification`
     /`businessName`/`criticalDataElement` go to `config.meta`, while bare tags become
-    `config.tags`. Schema-level tags land on the model's `config`.
+    `config.tags`. Schema-level tags land on the model's `config`. Fully-qualified tag
+    names (`db.schema.name`) keep their namespace in the meta key; use --meta-key-style
+    to sanitize or shorten it.
     """
     from datacontract.data_contract import DataContract
     from dcx.api import _export_capture_var
@@ -186,6 +196,7 @@ def _export_dbt(
         export_format="dbt",
         schema_name=schema_name,
         kind=kind.value,
+        meta_key_style=meta_key_style.value,
     )
 
     capture = _export_capture_var.get()

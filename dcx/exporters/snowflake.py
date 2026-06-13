@@ -357,7 +357,12 @@ def to_snowflake_full_sql(
 
 
 def _qualify_tag(tag: str, namespace: Optional[str]) -> str:
-    return f"{namespace}.{tag}" if namespace else tag
+    # `--tag-namespace` qualifies *bare* tag names. A tag that's already namespaced
+    # (e.g. imported as DB.SCHEMA.NAME) is left untouched, so it never gets
+    # double-qualified into NAMESPACE.DB.SCHEMA.NAME.
+    if namespace and "." not in tag:
+        return f"{namespace}.{tag}"
+    return tag
 
 
 def _sql_escape(value: str) -> str:

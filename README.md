@@ -139,7 +139,7 @@ dcx enrich all     contract.yaml --catalog tags_catalog.yaml --output contract.f
 
 `snowflake-full` shares [`apply`](#apply)'s SQL-generation knobs, so it emits the exact same script `apply --dry-run` would: `--ddl-mode auto\|always\|never` (default `auto` → `CREATE TABLE IF NOT EXISTS` + govern), `--structured-types`, `--comments`, `--include-tags`, `--include-quality`, `--create-tags`, `--tag-namespace DB.SCHEMA`. (`apply`'s `--strict` drift check has no export equivalent — it needs a live connection.)
 
-`dbt` unifies upstream's `dbt-models` / `dbt-sources` / `dbt-staging-sql` under one command via `--kind models\|sources\|staging` (default `models`), and maps ODCS governance the idiomatic dbt way: `NAME=VALUE` tags plus `classification` / `businessName` / `criticalDataElement` go to **`config.meta`** (key/value metadata for docs + catalogs), while bare tags become **`config.tags`** (dbt selection labels). Schema-level tags — dropped by the upstream models exporter — land on the model's `config`. (The upstream `dbt-models` / `dbt-sources` / `dbt-staging-sql` commands remain available, unchanged.)
+`dbt` unifies upstream's `dbt-models` / `dbt-sources` / `dbt-staging-sql` under one command via `--kind models\|sources\|staging` (default `models`), and maps ODCS governance the idiomatic dbt way: `NAME=VALUE` tags plus `classification` / `businessName` / `criticalDataElement` go to **`config.meta`** (key/value metadata for docs + catalogs), while bare tags become **`config.tags`** (dbt selection labels). Schema-level tags — dropped by the upstream models exporter — land on the model's `config`. Tags imported from Snowflake are fully qualified (`DB.SCHEMA.NAME`); `--meta-key-style full\|sanitized\|short` controls how that namespace appears in the meta key (`db.schema.name` · `db_schema_name` · `name`). (The upstream `dbt-models` / `dbt-sources` / `dbt-staging-sql` commands remain available, unchanged.)
 
 ```bash
 dcx export snowflake-full contract.yaml --include-quality --create-tags --output setup.sql
@@ -164,7 +164,7 @@ With the default `--ddl-mode auto` you don't need to know whether the table exis
 | `--ddl-mode auto\|always\|never` | create-if-missing-then-govern (default) · always `CREATE TABLE` · govern existing only |
 | `--strict` | fail instead of warn on schema drift |
 | `--structured-types` | typed nested `OBJECT(...)` / `ARRAY(...)` |
-| `--include-quality` · `--create-tags` · `--tag-namespace` | data-metric functions · `CREATE TAG IF NOT EXISTS` · qualify tag refs |
+| `--include-quality` · `--create-tags` · `--tag-namespace` | data-metric functions · `CREATE TAG IF NOT EXISTS` · qualify *bare* tag refs (already-namespaced `DB.SCHEMA.NAME` tags are left as-is) |
 | `--dry-run` | print the SQL without connecting |
 
 ```bash

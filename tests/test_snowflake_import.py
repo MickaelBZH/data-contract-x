@@ -167,12 +167,17 @@ class _FakeCursor:
         if "TAG_REFERENCES_ALL_COLUMNS" in sql:
             if self.data.get("tags_raise"):
                 raise RuntimeError("Insufficient privileges to operate on tag")
-            self.description = [("COLUMN_NAME",), ("TAG_NAME",), ("TAG_VALUE",), ("LEVEL",)]
+            self.description = [
+                ("COLUMN_NAME",), ("TAG_DATABASE",), ("TAG_SCHEMA",),
+                ("TAG_NAME",), ("TAG_VALUE",), ("LEVEL",),
+            ]
             self._rows = self._tags_for(sql)[0]
         elif "TAG_REFERENCES(" in sql:
             if self.data.get("tags_raise"):
                 raise RuntimeError("Insufficient privileges to operate on tag")
-            self.description = [("TAG_NAME",), ("TAG_VALUE",), ("LEVEL",)]
+            self.description = [
+                ("TAG_DATABASE",), ("TAG_SCHEMA",), ("TAG_NAME",), ("TAG_VALUE",), ("LEVEL",),
+            ]
             self._rows = self._tags_for(sql)[1]
         elif "INFORMATION_SCHEMA.COLUMNS" in sql:
             self.description = []
@@ -219,11 +224,12 @@ def _fake_data():
             ("t", "DB", "SCH", "CUSTOMER", "ID", 1),
             ("t", "DB", "SCH", "ORDERS", "ID", 1),
         ],
-        # per-table (column_tag_rows, table_tag_rows)
+        # per-table (column_tag_rows, table_tag_rows); tag rows carry their namespace
+        # (TAG_DATABASE, TAG_SCHEMA) so the importer can fully-qualify them.
         "tags": {
             "CUSTOMER": (
-                [("EMAIL", "DATA_CLASSIFICATION", "PD_DATA", "COLUMN")],
-                [("OWNER", "data-eng", "TABLE")],
+                [("EMAIL", "GOVERNANCE", "TAGS", "DATA_CLASSIFICATION", "PD_DATA", "COLUMN")],
+                [("GOVERNANCE", "TAGS", "OWNER", "data-eng", "TABLE")],
             ),
             "ORDERS": ([], []),
         },
@@ -276,8 +282,9 @@ def test_build_applies_tags():
 def test_fetch_tags_shapes():
     conn = _FakeConn(_fake_data())
     column_tags, table_tags = _fetch_tags(conn, "db", "sch", ["CUSTOMER", "ORDERS"])
-    assert column_tags == {("CUSTOMER", "EMAIL"): ["DATA_CLASSIFICATION=PD_DATA"]}
-    assert table_tags == {"CUSTOMER": ["OWNER=data-eng"]}
+    # Fully qualified with the tag's own DB.SCHEMA namespace.
+    assert column_tags == {("CUSTOMER", "EMAIL"): ["GOVERNANCE.TAGS.DATA_CLASSIFICATION=PD_DATA"]}
+    assert table_tags == {"CUSTOMER": ["GOVERNANCE.TAGS.OWNER=data-eng"]}
 
 
 def test_fetch_tags_graceful_on_error(capsys):
@@ -294,8 +301,8 @@ def test_import_end_to_end_includes_tags(monkeypatch):
     monkeypatch.setattr(si, "_connect", lambda import_args: _FakeConn(_fake_data()))
     contract = import_snowflake({"database": "DB", "schema": "SCH", "account": "ACME"})
     props = {p.name: p for p in contract.schema_[0].properties}  # CUSTOMER
-    assert props["EMAIL"].tags == ["DATA_CLASSIFICATION=PD_DATA"]
-    assert contract.schema_[0].tags == ["OWNER=data-eng"]
+    assert props["EMAIL"].tags == ["GOVERNANCE.TAGS.DATA_CLASSIFICATION=PD_DATA"]
+    assert contract.schema_[0].tags == ["GOVERNANCE.TAGS.OWNER=data-eng"]
 
 
 def test_import_no_tags_skips_tag_queries(monkeypatch):

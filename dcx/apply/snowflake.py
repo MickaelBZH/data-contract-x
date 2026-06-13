@@ -15,6 +15,7 @@ to build the script, then runs it via `snowflake-connector-python`.
   key-pair, externalbrowser SSO, OAuth) — we just pass the values through.
 """
 
+import logging
 import os
 from typing import Any, Optional
 
@@ -25,6 +26,20 @@ from typing_extensions import Annotated
 # DdlMode lives with the SQL generator (it maps to to_snowflake_full_sql flags) and
 # is re-exported here so `dcx.apply.snowflake.DdlMode` keeps working.
 from dcx.exporters.snowflake import DdlMode, to_snowflake_full_sql
+
+
+def quiet_aws_credential_noise() -> None:
+    """Drop botocore's credential-refresh logger to ERROR before a Snowflake connect.
+
+    `snowflake-connector-python` hard-depends on boto3 and probes the local AWS
+    credential chain on connect (its WIF util builds a `boto3.session.Session()`),
+    even for Azure/GCP accounts that never touch AWS. An expired/absent AWS SSO
+    profile then logs a scary but harmless WARNING + traceback. Reaching Snowflake
+    never legitimately needs AWS, so we silence that one logger at every connect
+    site — CLI *and* API, import *and* apply. Real connection failures still raise
+    and are surfaced as ApplyError/SnowflakeImportError, so nothing is hidden.
+    """
+    logging.getLogger("botocore.credentials").setLevel(logging.ERROR)
 
 
 class ApplyError(Exception):
@@ -411,6 +426,7 @@ def _connect_apply(
 
     conn_kwargs.setdefault("login_timeout", SNOWFLAKE_LOGIN_TIMEOUT)
     conn_kwargs.setdefault("network_timeout", SNOWFLAKE_NETWORK_TIMEOUT)
+    quiet_aws_credential_noise()
     try:
         conn = snowflake.connector.connect(**conn_kwargs)
     except Exception as exc:

@@ -126,6 +126,37 @@ def test_tag_namespace_qualifies_references():
     assert "SET TAG GOV.TAGS.classification = 'PII';" in sql
 
 
+def test_fully_qualified_tag_not_double_qualified():
+    """A namespaced tag (e.g. imported as DB.SCHEMA.NAME) keeps its own namespace;
+    --tag-namespace only qualifies bare tags."""
+    yaml_fq = textwrap.dedent(
+        """\
+        apiVersion: v3.1.0
+        kind: DataContract
+        id: ex
+        name: Ex
+        version: 1.0.0
+        status: draft
+        schema:
+          - name: customers
+            physicalType: table
+            properties:
+              - name: email
+                physicalType: STRING
+                tags:
+                  - GOVERNANCE.TAGS.DATA_CLASSIFICATION=PD_DATA   # already qualified
+                  - sensitive                                    # bare
+        """
+    )
+    contract = OpenDataContractStandard.from_string(yaml_fq)
+    sql = to_snowflake_full_sql(contract, tag_namespace="EXTRA.NS")
+    # FQ tag keeps its own namespace, not EXTRA.NS.GOVERNANCE.TAGS...
+    assert "SET TAG GOVERNANCE.TAGS.DATA_CLASSIFICATION = 'PD_DATA';" in sql
+    assert "EXTRA.NS.GOVERNANCE" not in sql
+    # ...while the bare tag is still qualified by --tag-namespace.
+    assert "SET TAG EXTRA.NS.sensitive = 'sensitive';" in sql
+
+
 def test_no_tags_when_disabled():
     sql = to_snowflake_full_sql(_load_contract(), include_tags=False)
     assert "SET TAG" not in sql

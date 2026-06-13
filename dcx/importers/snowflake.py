@@ -29,6 +29,7 @@ from open_data_contract_standard.model import (
 from dcx.apply.snowflake import (
     _ENV_VARS,
     _first,
+    quiet_aws_credential_noise,
     SNOWFLAKE_LOGIN_TIMEOUT,
     SNOWFLAKE_NETWORK_TIMEOUT,
 )
@@ -99,8 +100,8 @@ def build_snowflake_contract(
     (bool), comment, char_len, precision, scale (in INFORMATION_SCHEMA order).
     `primary_keys`: table name → set of PK column names.
     `table_comments`: table name → comment.
-    `column_tags`: (table, column) → list of `NAME=VALUE` tag strings.
-    `table_tags`: table → list of `NAME=VALUE` tag strings.
+    `column_tags`: (table, column) → list of `DB.SCHEMA.NAME=VALUE` tag strings.
+    `table_tags`: table → list of `DB.SCHEMA.NAME=VALUE` tag strings.
     `server_info`: account, database, schema, warehouse.
     """
     column_tags = column_tags or {}
@@ -236,6 +237,7 @@ def _connect(import_args: dict):
 
     conn_kwargs.setdefault("login_timeout", SNOWFLAKE_LOGIN_TIMEOUT)
     conn_kwargs.setdefault("network_timeout", SNOWFLAKE_NETWORK_TIMEOUT)
+    quiet_aws_credential_noise()
     try:
         return snowflake.connector.connect(**conn_kwargs)
     except Exception as exc:
@@ -292,13 +294,31 @@ def _fetch_metadata(conn, database: str, schema: str, tables: Optional[list[str]
     return columns, primary_keys, table_comments
 
 
+def _fq_tag(row: tuple, idx: dict) -> str:
+    """Build a fully-qualified `DB.SCHEMA.TAG_NAME=VALUE` tag string.
+
+    Keeping the tag's namespace (database + schema) is required so `apply` /
+    `export snowflake-full` can emit `SET TAG DB.SCHEMA.NAME = '...'` against the
+    exact tag object — a bare name would resolve against the session's *current*
+    schema and target the wrong tag (or none). Degrades to fewer qualifiers if the
+    namespace columns are absent/empty.
+    """
+    parts = [
+        str(row[idx[key]])
+        for key in ("tag_database", "tag_schema")
+        if key in idx and row[idx[key]]
+    ]
+    parts.append(str(row[idx["tag_name"]]))
+    return f"{'.'.join(parts)}={row[idx['tag_value']]}"
+
+
 def _fetch_tags(conn, database: str, schema: str, table_names: list[str]):
     """Read column- and table-level tags via INFORMATION_SCHEMA table functions.
 
-    Returns (column_tags, table_tags) keyed by (table, column) / table, each a
-    list of `NAME=VALUE` strings (the dcx tag convention). Object tagging is an
-    Enterprise feature and tag visibility is role-dependent; on any query failure
-    we warn once and return whatever we have (graceful degradation).
+    Returns (column_tags, table_tags) keyed by (table, column) / table, each a list
+    of fully-qualified `DB.SCHEMA.NAME=VALUE` strings (the dcx tag convention).
+    Object tagging is an Enterprise feature and tag visibility is role-dependent; on
+    any query failure we warn once and return whatever we have (graceful degradation).
     """
     db = database.upper()
     sch = schema.upper()
@@ -323,8 +343,7 @@ def _fetch_tags(conn, database: str, schema: str, table_names: list[str]):
                     if "level" in idx and row[idx["level"]] and str(row[idx["level"]]).upper() != "COLUMN":
                         continue
                     col = row[idx["column_name"]]
-                    name, value = row[idx["tag_name"]], row[idx["tag_value"]]
-                    column_tags.setdefault((table, col), []).append(f"{name}={value}")
+                    column_tags.setdefault((table, col), []).append(_fq_tag(row, idx))
             except Exception as exc:  # noqa: BLE001 — graceful degradation
                 errors.append(str(exc))
 
@@ -338,8 +357,7 @@ def _fetch_tags(conn, database: str, schema: str, table_names: list[str]):
                 for row in cur.fetchall():
                     if "level" in idx and row[idx["level"]] and str(row[idx["level"]]).upper() != "TABLE":
                         continue
-                    name, value = row[idx["tag_name"]], row[idx["tag_value"]]
-                    table_tags.setdefault(table, []).append(f"{name}={value}")
+                    table_tags.setdefault(table, []).append(_fq_tag(row, idx))
             except Exception as exc:  # noqa: BLE001
                 errors.append(str(exc))
     finally:
@@ -461,6 +479,7 @@ def import_snowflake_oauth(
 
     conn_kwargs.setdefault("login_timeout", SNOWFLAKE_LOGIN_TIMEOUT)
     conn_kwargs.setdefault("network_timeout", SNOWFLAKE_NETWORK_TIMEOUT)
+    quiet_aws_credential_noise()
     try:
         conn = snowflake.connector.connect(**conn_kwargs)
     except Exception as exc:

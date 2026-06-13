@@ -5,7 +5,7 @@ from open_data_contract_standard.model import OpenDataContractStandard
 from typer.testing import CliRunner
 
 from dcx.cli import app
-from dcx.exporters.dbt import DbtKind, to_dbt_yaml
+from dcx.exporters.dbt import DbtKind, DbtMetaKeyStyle, to_dbt_yaml
 
 runner = CliRunner()
 
@@ -104,6 +104,94 @@ def test_schema_level_tags_mapped_to_model_config():
     assert model["config"]["meta"]["table_classification"] == "RESTRICTED"
     # upstream model meta is preserved
     assert model["config"]["meta"]["data_contract"] == "customers"
+
+
+# === Meta-key style for fully-qualified tag names ===========================
+
+
+_FQ_CONTRACT = textwrap.dedent(
+    """\
+    apiVersion: v3.1.0
+    kind: DataContract
+    id: c
+    name: C
+    version: 1.0.0
+    status: draft
+    schema:
+      - name: T
+        physicalType: table
+        properties:
+          - name: email
+            physicalType: STRING
+            tags:
+              - GOVERNANCE.TAGS.DATA_CLASSIFICATION=PD_DATA
+    """
+)
+
+
+def _fq_meta(style: DbtMetaKeyStyle) -> dict:
+    doc = yamllib.safe_load(
+        to_dbt_yaml(OpenDataContractStandard.from_string(_FQ_CONTRACT), kind=DbtKind.models, meta_key_style=style)
+    )
+    return doc["models"][0]["columns"][0]["config"]["meta"]
+
+
+def test_meta_key_style_full_keeps_dotted_namespace():
+    assert _fq_meta(DbtMetaKeyStyle.full) == {"governance.tags.data_classification": "PD_DATA"}
+
+
+def test_meta_key_style_sanitized_replaces_dots():
+    assert _fq_meta(DbtMetaKeyStyle.sanitized) == {"governance_tags_data_classification": "PD_DATA"}
+
+
+def test_meta_key_style_short_uses_last_segment():
+    assert _fq_meta(DbtMetaKeyStyle.short) == {"data_classification": "PD_DATA"}
+
+
+def test_meta_key_style_default_is_full():
+    # to_dbt_yaml default + the CLI default both keep the namespace.
+    assert _fq_meta(DbtMetaKeyStyle.full) == _fq_meta(DbtMetaKeyStyle("full"))
+
+
+def test_meta_key_style_namespace_collision_tradeoff():
+    """Same short name across two namespaces: full keeps both, short collapses them."""
+    yaml_two = textwrap.dedent(
+        """\
+        apiVersion: v3.1.0
+        kind: DataContract
+        id: c
+        name: C
+        version: 1.0.0
+        status: draft
+        schema:
+          - name: T
+            physicalType: table
+            properties:
+              - name: email
+                physicalType: STRING
+                tags:
+                  - GOV.TAGS.CLASSIFICATION=A
+                  - SEC.AUDIT.CLASSIFICATION=B
+        """
+    )
+    contract = OpenDataContractStandard.from_string(yaml_two)
+
+    full = yamllib.safe_load(to_dbt_yaml(contract, kind=DbtKind.models, meta_key_style=DbtMetaKeyStyle.full))
+    full_meta = full["models"][0]["columns"][0]["config"]["meta"]
+    assert full_meta == {"gov.tags.classification": "A", "sec.audit.classification": "B"}
+
+    short = yamllib.safe_load(to_dbt_yaml(contract, kind=DbtKind.models, meta_key_style=DbtMetaKeyStyle.short))
+    short_meta = short["models"][0]["columns"][0]["config"]["meta"]
+    assert short_meta == {"classification": "B"}  # second wins — the documented risk
+
+
+def test_cli_export_dbt_meta_key_style_short(tmp_path):
+    path = tmp_path / "datacontract.yaml"
+    path.write_text(_FQ_CONTRACT)
+    result = runner.invoke(app, ["export", "dbt", str(path), "--meta-key-style", "short"])
+    assert result.exit_code == 0, result.output
+    doc = yamllib.safe_load(result.output)
+    assert doc["models"][0]["columns"][0]["config"]["meta"] == {"data_classification": "PD_DATA"}
 
 
 # === Unmapped type bug fix ==================================================
