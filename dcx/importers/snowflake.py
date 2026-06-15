@@ -67,6 +67,27 @@ def _map_type(data_type: Optional[str], scale: Optional[int]) -> tuple[str, Opti
     return _SF_TYPE_MAP.get(dt, ("string", None))
 
 
+# Snowflake INFORMATION_SCHEMA.TABLES.TABLE_TYPE → ODCS `physicalType`. Preserves the
+# real asset type; `view` is governed as a view by export/apply, others as tables.
+_TABLE_TYPE_TO_PHYSICAL: dict[str, str] = {
+    "BASE TABLE": "table",
+    "TABLE": "table",
+    "LOCAL TEMPORARY": "table",
+    "TEMPORARY TABLE": "table",
+    "VIEW": "view",
+    "MATERIALIZED VIEW": "materialized view",
+    "EXTERNAL TABLE": "external table",
+}
+
+
+def _physical_object_type(table_type: Optional[str]) -> str:
+    """Map a Snowflake TABLE_TYPE to an ODCS `physicalType` (defaults to `table`)."""
+    if not table_type:
+        return "table"
+    tt = table_type.strip().upper()
+    return _TABLE_TYPE_TO_PHYSICAL.get(tt, tt.lower())
+
+
 def _physical_type(data_type: Optional[str], char_len, prec, scale) -> str:
     """Reconstruct a canonical Snowflake type string for `physicalType`."""
     dt = (data_type or "").upper()
@@ -92,6 +113,7 @@ def build_snowflake_contract(
     table_comments: dict[str, Optional[str]],
     column_tags: Optional[dict] = None,
     table_tags: Optional[dict] = None,
+    table_types: Optional[dict] = None,
     server_name: str = "production",
 ) -> OpenDataContractStandard:
     """Build an ODCS contract from already-fetched Snowflake metadata.
@@ -102,10 +124,12 @@ def build_snowflake_contract(
     `table_comments`: table name → comment.
     `column_tags`: (table, column) → list of `DB.SCHEMA.NAME=VALUE` tag strings.
     `table_tags`: table → list of `DB.SCHEMA.NAME=VALUE` tag strings.
+    `table_types`: table → Snowflake TABLE_TYPE (e.g. `VIEW`) → sets `physicalType`.
     `server_info`: account, database, schema, warehouse.
     """
     column_tags = column_tags or {}
     table_tags = table_tags or {}
+    table_types = table_types or {}
     # Group columns by table, preserving first-seen order.
     tables: dict[str, list[dict]] = {}
     for col in columns:
@@ -150,7 +174,11 @@ def build_snowflake_contract(
 
             props.append(prop)
 
-        obj = SchemaObject(name=table_name, physicalType="table", properties=props)
+        obj = SchemaObject(
+            name=table_name,
+            physicalType=_physical_object_type(table_types.get(table_name)),
+            properties=props,
+        )
         if table_comments.get(table_name):
             obj.description = table_comments[table_name]
         ttags = table_tags.get(table_name)
@@ -245,7 +273,7 @@ def _connect(import_args: dict):
 
 
 def _fetch_metadata(conn, database: str, schema: str, tables: Optional[list[str]]):
-    """Read columns, primary keys and table comments from Snowflake."""
+    """Read columns, primary keys, table comments and table types from Snowflake."""
     db = database.upper()
     sch = schema.upper()
     table_filter = [t.upper() for t in tables] if tables else None
@@ -272,13 +300,17 @@ def _fetch_metadata(conn, database: str, schema: str, tables: Optional[list[str]
                 "precision": prec, "scale": scale,
             })
 
-        # --- table comments ---
+        # --- table comments + types (covers tables and views) ---
         cur.execute(
-            f'SELECT TABLE_NAME, COMMENT FROM "{db}".INFORMATION_SCHEMA.TABLES '
+            f'SELECT TABLE_NAME, COMMENT, TABLE_TYPE FROM "{db}".INFORMATION_SCHEMA.TABLES '
             f'WHERE TABLE_SCHEMA = %s',
             (sch,),
         )
-        table_comments = {row[0]: row[1] for row in cur.fetchall()}
+        table_comments: dict = {}
+        table_types: dict = {}
+        for row in cur.fetchall():
+            table_comments[row[0]] = row[1]
+            table_types[row[0]] = row[2]
 
         # --- primary keys ---
         primary_keys: dict[str, set] = {}
@@ -291,7 +323,7 @@ def _fetch_metadata(conn, database: str, schema: str, tables: Optional[list[str]
     finally:
         cur.close()
 
-    return columns, primary_keys, table_comments
+    return columns, primary_keys, table_comments, table_types
 
 
 def _fq_tag(row: tuple, idx: dict) -> str:
@@ -382,7 +414,9 @@ def _contract_from_connection(
     server_name: str,
 ) -> OpenDataContractStandard:
     """Read metadata over an open connection and build the contract (caller closes conn)."""
-    columns, primary_keys, table_comments = _fetch_metadata(conn, database, schema, tables)
+    columns, primary_keys, table_comments, table_types = _fetch_metadata(
+        conn, database, schema, tables,
+    )
     if not columns:
         raise SnowflakeImportError(
             f"No columns found in {database}.{schema}"
@@ -402,6 +436,7 @@ def _contract_from_connection(
         table_comments=table_comments,
         column_tags=column_tags,
         table_tags=table_tags,
+        table_types=table_types,
         server_name=server_name,
     )
 

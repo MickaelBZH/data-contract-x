@@ -45,8 +45,9 @@ from datacontract.export.sql_type_converter import convert_to_sql_type
 from datacontract.integration.dbt_test_mapping import field_to_data_tests
 from open_data_contract_standard.model import OpenDataContractStandard, SchemaObject, SchemaProperty
 
-# The `NAME=VALUE` tag convention is shared with the Snowflake exporters.
-from dcx.exporters.snowflake import _parse_tag
+# The `NAME=VALUE` tag convention + namespace filtering are shared with the
+# Snowflake exporters.
+from dcx.exporters.snowflake import _filter_tags_by_namespace, _parse_tag
 
 
 class DbtKind(str, Enum):
@@ -103,19 +104,22 @@ def _adapter_type(odcs: OpenDataContractStandard, server: Optional[str]) -> Opti
     return found.type if found is not None else server
 
 
-def _governance(src, meta_key_style: DbtMetaKeyStyle) -> tuple[dict, list]:
+def _governance(
+    src, meta_key_style: DbtMetaKeyStyle, tag_namespace_filter: Optional[list] = None,
+) -> tuple[dict, list]:
     """Map an ODCS element's governance fields to dbt (meta dict, tags list).
 
     - `NAME=VALUE` tag → `meta[_meta_key(name)] = value` (key/value metadata)
     - bare tag         → `tags` list (a dbt selection label)
     - `classification` / `businessName` / `criticalDataElement` → `meta`
 
-    Schema objects carry only `tags`; the `getattr` guards make the column-only
-    fields no-ops there, so the same helper serves both columns and tables.
+    With `tag_namespace_filter`, only tags in those namespaces survive (the dedicated
+    fields above are exempt). Schema objects carry only `tags`; the `getattr` guards
+    make the column-only fields no-ops there, so the same helper serves columns and tables.
     """
     meta: dict = {}
     tags: list = []
-    for tag in getattr(src, "tags", None) or []:
+    for tag in _filter_tags_by_namespace(getattr(src, "tags", None), tag_namespace_filter):
         if "=" in tag:
             name, value = _parse_tag(tag)
             meta[_meta_key(name, meta_key_style)] = value
@@ -142,6 +146,7 @@ def _to_dbt_column(
     is_single_pk: bool = False,
     *,
     meta_key_style: DbtMetaKeyStyle = DbtMetaKeyStyle.full,
+    tag_namespace_filter: Optional[list] = None,
 ) -> dict:
     """Build a dbt column dict in a readable key order, routing governance to `config`."""
     adapter_type = adapter_type or "snowflake"
@@ -171,7 +176,7 @@ def _to_dbt_column(
         if prop.unique or (is_primary_key and is_single_pk):
             column.setdefault("constraints", []).append({"type": "unique"})
 
-    meta, tags = _governance(prop, meta_key_style)
+    meta, tags = _governance(prop, meta_key_style, tag_namespace_filter)
     config: dict = {}
     if meta:
         config["meta"] = meta
@@ -203,6 +208,7 @@ def _to_columns(
     primary_key_columns: Optional[list] = None,
     *,
     meta_key_style: DbtMetaKeyStyle = DbtMetaKeyStyle.full,
+    tag_namespace_filter: Optional[list] = None,
 ) -> list:
     primary_key_columns = primary_key_columns or []
     is_single_pk = len(primary_key_columns) == 1
@@ -210,7 +216,7 @@ def _to_columns(
         _to_dbt_column(
             odcs, prop, supports_constraints, adapter_type,
             prop.name in primary_key_columns, is_single_pk,
-            meta_key_style=meta_key_style,
+            meta_key_style=meta_key_style, tag_namespace_filter=tag_namespace_filter,
         )
         for prop in properties
     ]
@@ -219,6 +225,7 @@ def _to_columns(
 def _to_dbt_model(
     schema_name: str, schema_object: SchemaObject, odcs: OpenDataContractStandard,
     adapter_type: Optional[str], meta_key_style: DbtMetaKeyStyle,
+    tag_namespace_filter: Optional[list] = None,
 ) -> dict:
     model_type = _to_dbt_model_type(schema_object.physicalType)
 
@@ -231,7 +238,7 @@ def _to_dbt_model(
 
     # Schema-object (table) level tags — dropped by the upstream models exporter —
     # land on the model's config.meta / config.tags.
-    meta, tags = _governance(schema_object, meta_key_style)
+    meta, tags = _governance(schema_object, meta_key_style, tag_namespace_filter)
     config["meta"].update(meta)
     if tags:
         config.setdefault("tags", []).extend(tags)
@@ -254,6 +261,7 @@ def _to_dbt_model(
     columns = _to_columns(
         odcs, schema_object.properties or [], _supports_constraints(model_type),
         adapter_type, primary_key_columns, meta_key_style=meta_key_style,
+        tag_namespace_filter=tag_namespace_filter,
     )
     if columns:
         dbt_model["columns"] = columns
@@ -262,12 +270,16 @@ def _to_dbt_model(
 
 def _to_models_yaml(
     odcs: OpenDataContractStandard, server: Optional[str], meta_key_style: DbtMetaKeyStyle,
+    tag_namespace_filter: Optional[list] = None,
 ) -> str:
     adapter_type = _adapter_type(odcs, server)
     dbt = {"version": 2, "models": []}
     for schema_obj in odcs.schema_ or []:
         dbt["models"].append(
-            _to_dbt_model(schema_obj.name, schema_obj, odcs, adapter_type, meta_key_style)
+            _to_dbt_model(
+                schema_obj.name, schema_obj, odcs, adapter_type, meta_key_style,
+                tag_namespace_filter,
+            )
         )
     return yaml.safe_dump(dbt, indent=2, sort_keys=False, allow_unicode=True)
 
@@ -275,12 +287,13 @@ def _to_models_yaml(
 def _to_dbt_source_table(
     odcs: OpenDataContractStandard, model_key: str, model_value: SchemaObject,
     adapter_type: Optional[str], meta_key_style: DbtMetaKeyStyle,
+    tag_namespace_filter: Optional[list] = None,
 ) -> dict:
     table: dict = {"name": model_key}
     if model_value.description is not None:
         table["description"] = model_value.description.strip().replace("\n", " ")
 
-    meta, tags = _governance(model_value, meta_key_style)
+    meta, tags = _governance(model_value, meta_key_style, tag_namespace_filter)
     config: dict = {}
     if meta:
         config["meta"] = meta
@@ -291,6 +304,7 @@ def _to_dbt_source_table(
 
     columns = _to_columns(
         odcs, model_value.properties or [], False, adapter_type, meta_key_style=meta_key_style,
+        tag_namespace_filter=tag_namespace_filter,
     )
     if columns:
         table["columns"] = columns
@@ -299,6 +313,7 @@ def _to_dbt_source_table(
 
 def _to_sources_yaml(
     odcs: OpenDataContractStandard, server: Optional[str], meta_key_style: DbtMetaKeyStyle,
+    tag_namespace_filter: Optional[list] = None,
 ) -> str:
     source: dict = {"name": odcs.id}
     dbt = {"version": 2, "sources": [source]}
@@ -322,7 +337,10 @@ def _to_sources_yaml(
             source["schema"] = found_server.schema_
 
     source["tables"] = [
-        _to_dbt_source_table(odcs, schema_obj.name, schema_obj, adapter_type, meta_key_style)
+        _to_dbt_source_table(
+            odcs, schema_obj.name, schema_obj, adapter_type, meta_key_style,
+            tag_namespace_filter,
+        )
         for schema_obj in (odcs.schema_ or [])
     ]
     return yaml.safe_dump(dbt, indent=2, sort_keys=False, allow_unicode=True)
@@ -340,14 +358,15 @@ def to_dbt_yaml(
     server: Optional[str] = None,
     schema_name: str = "all",
     meta_key_style: DbtMetaKeyStyle = DbtMetaKeyStyle.full,
+    tag_namespace_filter: Optional[list] = None,
 ) -> str:
     """Render the requested dbt artifact for a contract."""
     kind = DbtKind(kind)
     meta_key_style = DbtMetaKeyStyle(meta_key_style)
     if kind is DbtKind.models:
-        return _to_models_yaml(contract, server, meta_key_style)
+        return _to_models_yaml(contract, server, meta_key_style, tag_namespace_filter)
     if kind is DbtKind.sources:
-        return _to_sources_yaml(contract, server, meta_key_style)
+        return _to_sources_yaml(contract, server, meta_key_style, tag_namespace_filter)
     return _to_staging_sql(contract, schema_name)
 
 
@@ -368,6 +387,7 @@ class DcxDbtExporter(Exporter):
             server=server,
             schema_name=schema_name,
             meta_key_style=DbtMetaKeyStyle(export_args.get("meta_key_style", "full")),
+            tag_namespace_filter=export_args.get("tag_namespace_filter"),
         )
 
 

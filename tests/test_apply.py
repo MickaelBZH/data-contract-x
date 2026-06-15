@@ -582,6 +582,25 @@ def test_api_apply_dry_run_no_token_returns_sql():
     assert body["statements_executed"] == 0
 
 
+def test_api_apply_tag_namespace_filter():
+    contract = {
+        "apiVersion": "v3.1.0", "kind": "DataContract", "id": "o", "name": "O", "version": "1.0.0",
+        "servers": [{"server": "p", "type": "snowflake", "account": "ACME", "database": "DB", "schema": "LOAD"}],
+        "schema": [{"name": "orders", "properties": [
+            {"name": "id", "logicalType": "integer",
+             "tags": ["GOV.TAGS.CLASS=A", "CORP.GLOBAL.SRC=x"]},
+        ]}],
+    }
+    r = _api_client().post(
+        "/apply/snowflake",
+        json={"contract": contract, "options": {"dry_run": True, "tag_namespace_filter": ["GOV.TAGS"]}},
+    )
+    assert r.status_code == 200, r.text
+    sql = r.json()["sql"]
+    assert "GOV.TAGS.CLASS" in sql
+    assert "CORP.GLOBAL" not in sql
+
+
 def test_api_apply_execute_requires_token():
     r = _api_client().post("/apply/snowflake", json={"contract": _API_CONTRACT, "options": {}})
     assert r.status_code == 401

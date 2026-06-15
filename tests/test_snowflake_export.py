@@ -157,6 +157,120 @@ def test_fully_qualified_tag_not_double_qualified():
     assert "SET TAG EXTRA.NS.sensitive = 'sensitive';" in sql
 
 
+_MULTI_NS_CONTRACT = textwrap.dedent(
+    """\
+    apiVersion: v3.1.0
+    kind: DataContract
+    id: ex
+    name: Ex
+    version: 1.0.0
+    status: draft
+    schema:
+      - name: customers
+        physicalType: table
+        tags:
+          - GOV.TAGS.OWNER=data-eng
+          - CORP.GLOBAL.SOURCE=legacy
+        properties:
+          - name: email
+            physicalType: STRING
+            classification: PII
+            tags:
+              - GOV.TAGS.DATA_CLASSIFICATION=PD_DATA
+              - CORP.GLOBAL.RETENTION=7y
+              - sensitive
+    """
+)
+
+
+def test_tag_namespace_filter_keeps_only_allowed_namespace():
+    contract = OpenDataContractStandard.from_string(_MULTI_NS_CONTRACT)
+    sql = to_snowflake_full_sql(contract, tag_namespace_filter=["GOV.TAGS"])
+    assert "SET TAG GOV.TAGS.OWNER = 'data-eng';" in sql
+    assert "SET TAG GOV.TAGS.DATA_CLASSIFICATION = 'PD_DATA';" in sql
+    # other namespace and the bare tag are dropped
+    assert "CORP.GLOBAL" not in sql
+    assert "SET TAG sensitive" not in sql
+    # classification is a dedicated field, not a namespaced tag → still emitted
+    assert "SET TAG classification = 'PII';" in sql
+
+
+def test_tag_namespace_filter_multiple_namespaces():
+    contract = OpenDataContractStandard.from_string(_MULTI_NS_CONTRACT)
+    sql = to_snowflake_full_sql(contract, tag_namespace_filter=["GOV.TAGS", "CORP.GLOBAL"])
+    assert "GOV.TAGS.OWNER" in sql
+    assert "CORP.GLOBAL.SOURCE" in sql
+    assert "CORP.GLOBAL.RETENTION" in sql
+    assert "SET TAG sensitive" not in sql  # still no namespace → dropped
+
+
+def test_tag_namespace_filter_limits_create_tags():
+    contract = OpenDataContractStandard.from_string(_MULTI_NS_CONTRACT)
+    sql = to_snowflake_full_sql(contract, create_tags=True, tag_namespace_filter=["GOV.TAGS"])
+    create = [line for line in sql.splitlines() if line.startswith("CREATE TAG")]
+    assert "CREATE TAG IF NOT EXISTS GOV.TAGS.OWNER;" in create
+    assert "CREATE TAG IF NOT EXISTS GOV.TAGS.DATA_CLASSIFICATION;" in create
+    assert not any("CORP.GLOBAL" in c for c in create)
+
+
+def test_no_tag_namespace_filter_emits_everything():
+    contract = OpenDataContractStandard.from_string(_MULTI_NS_CONTRACT)
+    sql = to_snowflake_full_sql(contract)
+    assert "CORP.GLOBAL.SOURCE" in sql
+    assert "SET TAG sensitive = 'sensitive';" in sql
+
+
+_VIEW_CONTRACT = textwrap.dedent(
+    """\
+    apiVersion: v3.1.0
+    kind: DataContract
+    id: c
+    name: C
+    version: 1.0.0
+    status: draft
+    schema:
+      - name: CUSTOMERS
+        physicalType: table
+        description: Base table
+        properties:
+          - name: id
+            physicalType: NUMBER
+            description: pk
+      - name: CUSTOMERS_V
+        physicalType: view
+        description: Curated view
+        properties:
+          - name: id
+            physicalType: NUMBER
+            description: surrogate key
+            tags: [GOV.TAGS.PII=high]
+    """
+)
+
+
+def test_view_governed_as_view_not_table():
+    contract = OpenDataContractStandard.from_string(_VIEW_CONTRACT)
+    sql = to_snowflake_full_sql(contract, ddl_if_not_exists=True)  # auto mode
+    # No CREATE for the view (contract has no view definition)
+    assert "CUSTOMERS_V (" not in sql
+    assert "CREATE TABLE IF NOT EXISTS CUSTOMERS (" in sql
+    # View governance uses VIEW keywords
+    assert "COMMENT ON VIEW CUSTOMERS_V IS 'Curated view';" in sql
+    assert "ALTER VIEW CUSTOMERS_V MODIFY COLUMN id SET TAG GOV.TAGS.PII = 'high';" in sql
+    # Table still uses TABLE keywords
+    assert "COMMENT ON TABLE CUSTOMERS IS 'Base table';" in sql
+
+
+def test_view_comments_emitted_even_in_always_mode():
+    """Plain CREATE TABLE carries table comments inline, but a view has no CREATE, so
+    its comments must still be emitted standalone."""
+    contract = OpenDataContractStandard.from_string(_VIEW_CONTRACT)
+    sql = to_snowflake_full_sql(contract, include_ddl=True, ddl_if_not_exists=False)
+    assert "COMMENT ON VIEW CUSTOMERS_V IS 'Curated view';" in sql
+    # the base table's comment is inline in CREATE TABLE, not standalone
+    assert "COMMENT ON TABLE CUSTOMERS IS" not in sql
+
+
 def test_no_tags_when_disabled():
     sql = to_snowflake_full_sql(_load_contract(), include_tags=False)
     assert "SET TAG" not in sql

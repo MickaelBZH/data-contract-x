@@ -194,6 +194,52 @@ def test_cli_export_dbt_meta_key_style_short(tmp_path):
     assert doc["models"][0]["columns"][0]["config"]["meta"] == {"data_classification": "PD_DATA"}
 
 
+# === Tag namespace filter ===================================================
+
+
+_MULTI_NS = textwrap.dedent(
+    """\
+    apiVersion: v3.1.0
+    kind: DataContract
+    id: c
+    name: C
+    version: 1.0.0
+    status: draft
+    schema:
+      - name: T
+        physicalType: table
+        tags:
+          - GOV.TAGS.OWNER=data-eng
+          - CORP.GLOBAL.SOURCE=legacy
+        properties:
+          - name: email
+            physicalType: STRING
+            classification: PII
+            tags:
+              - GOV.TAGS.DATA_CLASSIFICATION=PD_DATA
+              - CORP.GLOBAL.RETENTION=7y
+              - sensitive
+    """
+)
+
+
+def test_dbt_tag_namespace_filter():
+    contract = OpenDataContractStandard.from_string(_MULTI_NS)
+    doc = yamllib.safe_load(
+        to_dbt_yaml(contract, kind=DbtKind.models, tag_namespace_filter=["GOV.TAGS"])
+    )
+    model = doc["models"][0]
+    # model-level: only GOV.TAGS survives
+    assert model["config"]["meta"]["gov.tags.owner"] == "data-eng"
+    assert not any("corp.global" in k for k in model["config"]["meta"])
+    # column-level: GOV.TAGS meta kept; CORP.GLOBAL + bare tag dropped; classification exempt
+    col = model["columns"][0]
+    assert col["config"]["meta"]["gov.tags.data_classification"] == "PD_DATA"
+    assert col["config"]["meta"]["classification"] == "PII"
+    assert not any("corp.global" in k for k in col["config"]["meta"])
+    assert "tags" not in col["config"]  # bare `sensitive` filtered out
+
+
 # === Unmapped type bug fix ==================================================
 
 

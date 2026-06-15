@@ -915,6 +915,11 @@ class ApplySnowflakeRequestOptions(BaseModel):
     include_quality: bool = Field(True, description="Emit Data Metric Function statements (Enterprise).")
     create_tags: bool = Field(False, description="Also emit CREATE TAG IF NOT EXISTS.")
     tag_namespace: Optional[str] = Field(None, description="Database.schema prefix for tag references.")
+    tag_namespace_filter: Optional[list[str]] = Field(
+        None,
+        description="Only emit tags whose namespace (DB.SCHEMA) is in this list; "
+        "un-namespaced tags are skipped. Omit to emit all tags.",
+    )
     metric_schedule: str = Field(
         "USING CRON 0 0 * * * UTC", description="DATA_METRIC_SCHEDULE clause for DMF tables."
     )
@@ -973,6 +978,7 @@ def mirror_apply_snowflake_to_fastapi(api_app: FastAPI, prefix: str = "/apply") 
                 include_quality=opts.include_quality,
                 create_tags=opts.create_tags,
                 tag_namespace=opts.tag_namespace,
+                tag_namespace_filter=opts.tag_namespace_filter,
                 metric_schedule=opts.metric_schedule,
             )
         except apply_module.ApplyError as exc:

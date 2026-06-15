@@ -17,7 +17,7 @@ to build the script, then runs it via `snowflake-connector-python`.
 
 import logging
 import os
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 import typer
 from open_data_contract_standard.model import OpenDataContractStandard, Server
@@ -166,6 +166,7 @@ def apply_snowflake(
     include_quality: bool = False,
     create_tags: bool = False,
     tag_namespace: Optional[str] = None,
+    tag_namespace_filter: Optional[list[str]] = None,
     metric_schedule: str = "USING CRON 0 0 * * * UTC",
     strict: bool = False,
 ) -> dict[str, Any]:
@@ -185,6 +186,7 @@ def apply_snowflake(
         include_quality=include_quality,
         create_tags=create_tags,
         tag_namespace=tag_namespace,
+        tag_namespace_filter=tag_namespace_filter,
         metric_schedule=metric_schedule,
         server=server_name,
     )
@@ -248,6 +250,7 @@ def apply_snowflake_oauth(
     include_quality: bool = True,
     create_tags: bool = False,
     tag_namespace: Optional[str] = None,
+    tag_namespace_filter: Optional[list[str]] = None,
     metric_schedule: str = "USING CRON 0 0 * * * UTC",
     strict: bool = False,
 ) -> dict[str, Any]:
@@ -277,6 +280,7 @@ def apply_snowflake_oauth(
         include_quality=include_quality,
         create_tags=create_tags,
         tag_namespace=tag_namespace,
+        tag_namespace_filter=tag_namespace_filter,
         metric_schedule=metric_schedule,
         server=server_name,
     )
@@ -563,6 +567,14 @@ def apply_snowflake_command(
         Optional[str],
         typer.Option(help="Database.schema prefix for tag references."),
     ] = None,
+    tag_namespace_filter: Annotated[
+        Optional[List[str]],
+        typer.Option(
+            "--tag-namespace-filter",
+            help="Only emit tags whose namespace (DB.SCHEMA) is given. Repeatable; "
+            "un-namespaced tags are skipped. Useful to apply only the tags you own.",
+        ),
+    ] = None,
     metric_schedule: Annotated[
         str, typer.Option(help="DATA_METRIC_SCHEDULE clause to set on tables with DMFs."),
     ] = "USING CRON 0 0 * * * UTC",
@@ -597,6 +609,7 @@ def apply_snowflake_command(
             include_quality=include_quality,
             create_tags=create_tags,
             tag_namespace=tag_namespace,
+            tag_namespace_filter=tag_namespace_filter,
             metric_schedule=metric_schedule,
             strict=strict,
         )

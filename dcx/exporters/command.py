@@ -12,7 +12,7 @@ Imported for its side effects by `dcx.cli`.
 """
 
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import typer
 from datacontract.command_export import export_app
@@ -92,6 +92,14 @@ def _export_snowflake_full(
             help="Database.schema prefix for tag references (e.g. GOVERNANCE_DB.TAGS).",
         ),
     ] = None,
+    tag_namespace_filter: Annotated[
+        Optional[List[str]],
+        typer.Option(
+            "--tag-namespace-filter",
+            help="Only emit tags whose namespace (DB.SCHEMA) is given. Repeatable; "
+            "un-namespaced tags are skipped.",
+        ),
+    ] = None,
     metric_schedule: Annotated[
         str, typer.Option(help="DATA_METRIC_SCHEDULE clause to set on each table with DMFs."),
     ] = "USING CRON 0 0 * * * UTC",
@@ -119,6 +127,7 @@ def _export_snowflake_full(
         include_quality=include_quality,
         create_tags=create_tags,
         tag_namespace=tag_namespace,
+        tag_namespace_filter=tag_namespace_filter,
         metric_schedule=metric_schedule,
     )
 
@@ -169,6 +178,14 @@ def _export_dbt(
             "(db.schema.name, default), sanitized (db_schema_name), or short (name).",
         ),
     ] = DbtMetaKeyStyle.full,
+    tag_namespace_filter: Annotated[
+        Optional[List[str]],
+        typer.Option(
+            "--tag-namespace-filter",
+            help="Only include tags whose namespace (DB.SCHEMA) is given. Repeatable; "
+            "un-namespaced tags are skipped.",
+        ),
+    ] = None,
     json_schema: Annotated[
         Optional[str], typer.Option(help="Validate the contract against this JSON Schema URL."),
     ] = None,
@@ -197,6 +214,7 @@ def _export_dbt(
         schema_name=schema_name,
         kind=kind.value,
         meta_key_style=meta_key_style.value,
+        tag_namespace_filter=tag_namespace_filter,
     )
 
     capture = _export_capture_var.get()

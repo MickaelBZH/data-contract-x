@@ -105,6 +105,7 @@ class SnowflakeFullExporter(Exporter):
             include_quality=bool(export_args.get("include_quality", False)),
             create_tags=bool(export_args.get("create_tags", False)),
             tag_namespace=export_args.get("tag_namespace"),
+            tag_namespace_filter=export_args.get("tag_namespace_filter"),
             metric_schedule=export_args.get("metric_schedule", "USING CRON 0 0 * * * UTC"),
             server=server,
         )
@@ -269,6 +270,16 @@ def _qualify_ddl_tables(
     return ddl
 
 
+def _object_kind(schema_obj: SchemaObject) -> str:
+    """Snowflake object keyword for ALTER/COMMENT statements, from `physicalType`.
+
+    A `view` physicalType yields `VIEW` (so governance emits `ALTER VIEW` /
+    `COMMENT ON VIEW`); everything else defaults to `TABLE`. Materialized/external
+    tables are currently governed as tables.
+    """
+    return "VIEW" if (schema_obj.physicalType or "").strip().lower() == "view" else "TABLE"
+
+
 def to_snowflake_full_sql(
     contract: OpenDataContractStandard,
     *,
@@ -280,6 +291,7 @@ def to_snowflake_full_sql(
     include_quality: bool = False,
     create_tags: bool = False,
     tag_namespace: Optional[str] = None,
+    tag_namespace_filter: Optional[list[str]] = None,
     metric_schedule: str = "USING CRON 0 0 * * * UTC",
     server: Optional[str] = None,
 ) -> str:
@@ -307,23 +319,32 @@ def to_snowflake_full_sql(
     prefix = _snowflake_table_prefix(contract, server)
 
     # DDL — reuse upstream, with apostrophe-safe escaping for Snowflake's
-    # single-quoted COMMENT '...' clauses, then qualify table names.
+    # single-quoted COMMENT '...' clauses, then qualify table names. Views carry no
+    # `CREATE` (the contract has no view definition), so DDL covers tables only.
     if include_ddl:
         if structured_types:
             _pin_structured_types(contract)
         _pin_unmapped_snowflake_types(contract)
-        with _snowflake_correct_escape():
-            ddl = to_sql_ddl(contract, server_type="snowflake", server=server).strip()
-        ddl = _qualify_ddl_tables(ddl, prefix, contract, if_not_exists=ddl_if_not_exists)
+        all_objs = contract.schema_
+        contract.schema_ = [o for o in (all_objs or []) if _object_kind(o) == "TABLE"]
+        try:
+            with _snowflake_correct_escape():
+                ddl = to_sql_ddl(contract, server_type="snowflake", server=server).strip()
+            ddl = _qualify_ddl_tables(ddl, prefix, contract, if_not_exists=ddl_if_not_exists)
+        finally:
+            contract.schema_ = all_objs
         if ddl:
             sections.append("-- ===== DDL =====")
             sections.append(ddl)
 
-    # Emit standalone COMMENT ON unless this is a plain CREATE TABLE (which carries
-    # comments inline). In alter-only and IF NOT EXISTS modes we emit them so
-    # descriptions reach tables that already exist.
-    if include_comments and not (include_ddl and not ddl_if_not_exists):
-        comment_sql = _generate_comment_sql(contract, table_prefix=prefix)
+    # Standalone COMMENT ON. A plain `CREATE TABLE` (always mode) carries table+column
+    # comments inline, so those are skipped here; views and IF-NOT-EXISTS/alter-only
+    # tables always need standalone comments to reach objects that already exist.
+    if include_comments:
+        comment_sql = _generate_comment_sql(
+            contract, table_prefix=prefix,
+            inline_table_comments=(include_ddl and not ddl_if_not_exists),
+        )
         if comment_sql:
             sections.append("\n-- ===== Comments =====")
             sections.append(comment_sql)
@@ -333,6 +354,7 @@ def to_snowflake_full_sql(
             contract,
             create_tags=create_tags,
             tag_namespace=tag_namespace,
+            tag_namespace_filter=tag_namespace_filter,
             table_prefix=prefix,
         )
         if tag_sql:
@@ -384,20 +406,48 @@ def _parse_tag(tag_str: str) -> tuple[str, str]:
     return tag_str, tag_str
 
 
-def _collect_all_tag_names(contract: OpenDataContractStandard) -> set[str]:
+def _tag_namespace(tag: str) -> Optional[str]:
+    """The `DB.SCHEMA` namespace of a tag — everything before the last dot of its
+    name — or None for an un-namespaced tag. `GOV.TAGS.NAME=VALUE` → `GOV.TAGS`;
+    `sensitive` → None."""
+    name = _parse_tag(tag)[0]
+    return name.rsplit(".", 1)[0] if "." in name else None
+
+
+def _filter_tags_by_namespace(tags, namespaces) -> list:
+    """Keep only tags whose namespace is in `namespaces` (a strict allow-list).
+
+    With no `namespaces`, returns the tags unchanged. Un-namespaced tags have no
+    namespace to match, so they're dropped when a filter is active.
+    """
+    if not namespaces:
+        return list(tags or [])
+    allowed = set(namespaces)
+    return [t for t in (tags or []) if _tag_namespace(t) in allowed]
+
+
+def _collect_all_tag_names(
+    contract: OpenDataContractStandard,
+    *,
+    tag_namespace_filter: Optional[list[str]] = None,
+) -> set[str]:
     """Distinct Snowflake tag *names* used in the contract (for CREATE TAG IF NOT EXISTS).
 
     Only the TAG_NAME side of each entry is collected — multiple TAG_VALUEs for the
-    same TAG_NAME (the normal case) result in a single CREATE TAG statement.
+    same TAG_NAME (the normal case) result in a single CREATE TAG statement. When a
+    `tag_namespace_filter` is given, only tags in those namespaces are counted, so the
+    emitted CREATE TAGs match the SET TAGs. `classification` is exempt (not a namespaced
+    tag), like in `_generate_tag_sql`.
     """
+    flt = lambda tags: _filter_tags_by_namespace(tags, tag_namespace_filter)  # noqa: E731
     names: set[str] = set()
-    for tag in contract.tags or []:
+    for tag in flt(contract.tags):
         names.add(_parse_tag(tag)[0])
     for schema_obj in contract.schema_ or []:
-        for tag in schema_obj.tags or []:
+        for tag in flt(schema_obj.tags):
             names.add(_parse_tag(tag)[0])
         for prop in schema_obj.properties or []:
-            for tag in prop.tags or []:
+            for tag in flt(prop.tags):
                 names.add(_parse_tag(tag)[0])
             if prop.classification:
                 names.add("classification")
@@ -408,24 +458,29 @@ def _generate_comment_sql(
     contract: OpenDataContractStandard,
     *,
     table_prefix: str = "",
+    inline_table_comments: bool = False,
 ) -> str:
-    """`COMMENT ON TABLE/COLUMN` statements for table + top-level column descriptions.
+    """`COMMENT ON TABLE|VIEW/COLUMN` statements for object + top-level column descriptions.
 
     Idempotent (Snowflake `COMMENT ON ... IS` overwrites), so it is safe to (re-)run
-    against tables that already exist — the alter-only path for governing tables you
-    didn't create from this contract. Nested struct fields have no Snowflake column
-    of their own, so only top-level column descriptions are applied here; they remain
-    captured in the contract's nested `properties`.
+    against objects that already exist. When `inline_table_comments` is set (plain
+    `CREATE TABLE` mode), table objects are skipped here because the CREATE carries
+    their comments inline — but views (which have no CREATE) are always emitted. Nested
+    struct fields have no Snowflake column of their own, so only top-level column
+    descriptions are applied here; they remain captured in the contract's `properties`.
     """
     lines: list[str] = []
     for schema_obj in contract.schema_ or []:
         table = schema_obj.name
         if not table:
             continue
+        kind = _object_kind(schema_obj)
+        if kind == "TABLE" and inline_table_comments:
+            continue  # carried inline by the plain CREATE TABLE
         qualified = f"{table_prefix}{table}"
         if schema_obj.description:
             lines.append(
-                f"COMMENT ON TABLE {qualified} IS '{_sql_escape(schema_obj.description)}';"
+                f"COMMENT ON {kind} {qualified} IS '{_sql_escape(schema_obj.description)}';"
             )
         for prop in schema_obj.properties or []:
             col = prop.physicalName or prop.name
@@ -442,12 +497,13 @@ def _generate_tag_sql(
     *,
     create_tags: bool,
     tag_namespace: Optional[str],
+    tag_namespace_filter: Optional[list[str]] = None,
     table_prefix: str = "",
 ) -> str:
     lines: list[str] = []
 
     if create_tags:
-        for name in sorted(_collect_all_tag_names(contract)):
+        for name in sorted(_collect_all_tag_names(contract, tag_namespace_filter=tag_namespace_filter)):
             lines.append(f"CREATE TAG IF NOT EXISTS {_qualify_tag(name, tag_namespace)};")
         if lines:
             lines.append("")
@@ -456,11 +512,12 @@ def _generate_tag_sql(
         table = schema_obj.name
         if not table:
             continue
+        kind = _object_kind(schema_obj)
         qualified = f"{table_prefix}{table}"
-        for tag in schema_obj.tags or []:
+        for tag in _filter_tags_by_namespace(schema_obj.tags, tag_namespace_filter):
             name, value = _parse_tag(tag)
             lines.append(
-                f"ALTER TABLE {qualified} SET TAG "
+                f"ALTER {kind} {qualified} SET TAG "
                 f"{_qualify_tag(name, tag_namespace)} = '{_sql_escape(value)}';"
             )
         for prop in schema_obj.properties or []:
@@ -469,14 +526,14 @@ def _generate_tag_sql(
                 continue
             if prop.classification:
                 lines.append(
-                    f"ALTER TABLE {qualified} MODIFY COLUMN {col} "
+                    f"ALTER {kind} {qualified} MODIFY COLUMN {col} "
                     f"SET TAG {_qualify_tag('classification', tag_namespace)} = "
                     f"'{_sql_escape(prop.classification)}';"
                 )
-            for tag in prop.tags or []:
+            for tag in _filter_tags_by_namespace(prop.tags, tag_namespace_filter):
                 name, value = _parse_tag(tag)
                 lines.append(
-                    f"ALTER TABLE {qualified} MODIFY COLUMN {col} "
+                    f"ALTER {kind} {qualified} MODIFY COLUMN {col} "
                     f"SET TAG {_qualify_tag(name, tag_namespace)} = '{_sql_escape(value)}';"
                 )
 
@@ -535,13 +592,14 @@ def _generate_quality_sql(
         entries = list(_quality_iter(schema_obj))
         if not entries:
             continue
+        kind = _object_kind(schema_obj)
         qualified = f"{table_prefix}{table}"
-        lines.append(f"ALTER TABLE {qualified} SET DATA_METRIC_SCHEDULE = '{metric_schedule}';")
+        lines.append(f"ALTER {kind} {qualified} SET DATA_METRIC_SCHEDULE = '{metric_schedule}';")
         for column, q in entries:
             dmf = _dmf_for_quality(q, column=column)
             label = q.name or _quality_metric(q) or "unnamed"
             if dmf:
-                lines.append(f"ALTER TABLE {qualified} ADD DATA METRIC FUNCTION {dmf};")
+                lines.append(f"ALTER {kind} {qualified} ADD DATA METRIC FUNCTION {dmf};")
             else:
                 target = f" on column {column}" if column else ""
                 lines.append(f"-- TODO: unmappable quality rule '{label}'{target} (type={q.type})")

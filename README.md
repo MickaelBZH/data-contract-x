@@ -92,7 +92,7 @@ Every command is `dcx <command>`, and most are mirrored to a REST endpoint when 
 
 | Sub-command | Source |
 |---|---|
-| `dcx import snowflake` | A live Snowflake schema (columns, primary keys, comments, tags) |
+| `dcx import snowflake` | A live Snowflake schema — tables **and views** (columns, primary keys, comments, tags; `physicalType` records the asset type) |
 | `dcx import kafka` | A Kafka topic's value schema (Confluent Schema Registry) |
 | `dcx import <format>` | A file/document — `sql`, `avro`, `dbml`, `glue`, `bigquery`, `unity`, `jsonschema`, `json`, `odcs`, `parquet`, `csv`, `protobuf`, `spark`, `iceberg`, `excel`, `dbt` |
 
@@ -137,9 +137,9 @@ dcx enrich all     contract.yaml --catalog tags_catalog.yaml --output contract.f
 | `dcx export dbt` | dbt `models` / `sources` / `staging`, with ODCS governance mapped to `config.meta` / `config.tags` |
 | `dcx export <format>` | Any upstream format — `sql`, `jsonschema`, `html`, `markdown`, `mermaid`, `dbt-*`, `avro`, `protobuf`, `bigquery`, `spark`, `sqlalchemy`, `iceberg`, `sodacl`, `great-expectations`, `dbml`, `pydantic-model`, `odcs`, `rdf`, `go`, `excel`, … |
 
-`snowflake-full` shares [`apply`](#apply)'s SQL-generation knobs, so it emits the exact same script `apply --dry-run` would: `--ddl-mode auto\|always\|never` (default `auto` → `CREATE TABLE IF NOT EXISTS` + govern), `--structured-types`, `--comments`, `--include-tags`, `--include-quality`, `--create-tags`, `--tag-namespace DB.SCHEMA`. (`apply`'s `--strict` drift check has no export equivalent — it needs a live connection.)
+`snowflake-full` shares [`apply`](#apply)'s SQL-generation knobs, so it emits the exact same script `apply --dry-run` would: `--ddl-mode auto\|always\|never` (default `auto` → `CREATE TABLE IF NOT EXISTS` + govern), `--structured-types`, `--comments`, `--include-tags`, `--include-quality`, `--create-tags`, `--tag-namespace DB.SCHEMA`, `--tag-namespace-filter DB.SCHEMA` (repeatable — emit only tags from these namespaces, e.g. to skip centrally-managed/inherited ones). (`apply`'s `--strict` drift check has no export equivalent — it needs a live connection.)
 
-`dbt` unifies upstream's `dbt-models` / `dbt-sources` / `dbt-staging-sql` under one command via `--kind models\|sources\|staging` (default `models`), and maps ODCS governance the idiomatic dbt way: `NAME=VALUE` tags plus `classification` / `businessName` / `criticalDataElement` go to **`config.meta`** (key/value metadata for docs + catalogs), while bare tags become **`config.tags`** (dbt selection labels). Schema-level tags — dropped by the upstream models exporter — land on the model's `config`. Tags imported from Snowflake are fully qualified (`DB.SCHEMA.NAME`); `--meta-key-style full\|sanitized\|short` controls how that namespace appears in the meta key (`db.schema.name` · `db_schema_name` · `name`). (The upstream `dbt-models` / `dbt-sources` / `dbt-staging-sql` commands remain available, unchanged.)
+`dbt` unifies upstream's `dbt-models` / `dbt-sources` / `dbt-staging-sql` under one command via `--kind models\|sources\|staging` (default `models`), and maps ODCS governance the idiomatic dbt way: `NAME=VALUE` tags plus `classification` / `businessName` / `criticalDataElement` go to **`config.meta`** (key/value metadata for docs + catalogs), while bare tags become **`config.tags`** (dbt selection labels). Schema-level tags — dropped by the upstream models exporter — land on the model's `config`. Tags imported from Snowflake are fully qualified (`DB.SCHEMA.NAME`); `--meta-key-style full\|sanitized\|short` controls how that namespace appears in the meta key (`db.schema.name` · `db_schema_name` · `name`), and `--tag-namespace-filter DB.SCHEMA` (repeatable) restricts output to tags from the given namespaces. (The upstream `dbt-models` / `dbt-sources` / `dbt-staging-sql` commands remain available, unchanged.)
 
 ```bash
 dcx export snowflake-full contract.yaml --include-quality --create-tags --output setup.sql
@@ -159,12 +159,15 @@ dcx export html contract.yaml --output contract.html
 
 With the default `--ddl-mode auto` you don't need to know whether the table exists: **missing tables are created** (`CREATE TABLE IF NOT EXISTS`) and **existing ones are governed** — column/table comments, tags, and (with `--include-quality`) data-quality metrics. For existing tables, dcx also **compares the live schema to the contract** and reports drift as warnings — or, with `--strict`, an error that aborts before any change (the check uses `DESCRIBE TABLE`, so it needs no active warehouse).
 
+Objects with `physicalType: view` are **governed as views** — no `CREATE` (the contract has no view definition), and comments/tags/DQ use `COMMENT ON VIEW` / `ALTER VIEW`. This holds for both `apply snowflake` and `export snowflake-full`. (Materialized/external tables are imported with their real `physicalType` but currently governed as tables.)
+
 | Option | Effect |
 |---|---|
 | `--ddl-mode auto\|always\|never` | create-if-missing-then-govern (default) · always `CREATE TABLE` · govern existing only |
 | `--strict` | fail instead of warn on schema drift |
 | `--structured-types` | typed nested `OBJECT(...)` / `ARRAY(...)` |
 | `--include-quality` · `--create-tags` · `--tag-namespace` | data-metric functions · `CREATE TAG IF NOT EXISTS` · qualify *bare* tag refs (already-namespaced `DB.SCHEMA.NAME` tags are left as-is) |
+| `--tag-namespace-filter DB.SCHEMA` | repeatable — apply only tags from these namespaces (skip centrally-managed/inherited ones); un-namespaced tags are skipped |
 | `--dry-run` | print the SQL without connecting |
 
 ```bash
@@ -173,7 +176,7 @@ dcx apply snowflake contract.yaml --include-quality    # create-or-govern
 ```
 
 **API**
-- `POST /apply/snowflake` — authenticated by the caller's Snowflake OAuth token. Supports `dry_run`, `ddl_mode`, `strict`, `structured_types`, … and returns the executed SQL plus any drift `warnings`.
+- `POST /apply/snowflake` — authenticated by the caller's Snowflake OAuth token. Supports `dry_run`, `ddl_mode`, `strict`, `structured_types`, `tag_namespace_filter`, … (all under `options`) and returns the executed SQL plus any drift `warnings`.
 
 ### `target` — bind a contract to a platform
 

@@ -218,7 +218,11 @@ def _fake_data():
             ("CUSTOMER", "EMAIL", "TEXT", "NO", None, 255, None, None),
             ("ORDERS", "ID", "NUMBER", "NO", None, None, 38, 0),
         ],
-        "tables": [("CUSTOMER", "Customers"), ("ORDERS", None)],
+        # (TABLE_NAME, COMMENT, TABLE_TYPE)
+        "tables": [
+            ("CUSTOMER", "Customers", "BASE TABLE"),
+            ("ORDERS", None, "VIEW"),
+        ],
         # SHOW PRIMARY KEYS rows in description order
         "pks": [
             ("t", "DB", "SCH", "CUSTOMER", "ID", 1),
@@ -238,7 +242,7 @@ def _fake_data():
 
 def test_fetch_metadata_shapes():
     conn = _FakeConn(_fake_data())
-    columns, pks, comments = _fetch_metadata(conn, "db", "sch", None)
+    columns, pks, comments, types = _fetch_metadata(conn, "db", "sch", None)
     assert len(columns) == 3
     assert columns[0] == {
         "table": "CUSTOMER", "name": "ID", "data_type": "NUMBER", "nullable": False,
@@ -246,11 +250,21 @@ def test_fetch_metadata_shapes():
     }
     assert pks == {"CUSTOMER": {"ID"}, "ORDERS": {"ID"}}
     assert comments == {"CUSTOMER": "Customers", "ORDERS": None}
+    assert types == {"CUSTOMER": "BASE TABLE", "ORDERS": "VIEW"}
+
+
+def test_import_sets_physical_type_from_table_type(monkeypatch):
+    import dcx.importers.snowflake as si
+    monkeypatch.setattr(si, "_connect", lambda import_args: _FakeConn(_fake_data()))
+    contract = import_snowflake({"database": "DB", "schema": "SCH", "account": "ACME"})
+    by_name = {o.name: o for o in contract.schema_}
+    assert by_name["CUSTOMER"].physicalType == "table"
+    assert by_name["ORDERS"].physicalType == "view"
 
 
 def test_fetch_metadata_table_filter():
     conn = _FakeConn(_fake_data())
-    columns, _, _ = _fetch_metadata(conn, "db", "sch", ["customer"])
+    columns, _, _, _ = _fetch_metadata(conn, "db", "sch", ["customer"])
     assert {c["table"] for c in columns} == {"CUSTOMER"}
 
 
