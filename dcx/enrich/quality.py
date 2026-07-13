@@ -10,7 +10,11 @@ from pathlib import Path
 from typing import Any, Optional
 
 import typer
-from open_data_contract_standard.model import DataQuality, OpenDataContractStandard
+from open_data_contract_standard.model import (
+    CustomProperty,
+    DataQuality,
+    OpenDataContractStandard,
+)
 from typing_extensions import Annotated
 
 from dcx.enrich import base
@@ -42,7 +46,45 @@ _DIMENSION_SYNONYMS = {
     "integrity": "consistency",
     "volume": "coverage",
 }
-LIBRARY_METRICS = {"nullValues", "missingValues", "invalidValues", "duplicateValues", "rowCount"}
+# Bronze scope: the minimum set of checks for streaming/bronze
+# assets, split by how the CONTRACT represents them so the output stays valid
+# against the UNMODIFIED ODCS schema (no schema patching) and stays engine-neutral:
+#
+# * STANDARD_LIBRARY_METRICS — names in the ODCS `quality.metric` enum. Authored as
+#   `type: library`; portable and understood by any ODCS consumer.
+# * CHECK_METRICS — checks with no ODCS metric name (blankCount, freshness).
+#   Authored as `type: sql` (a portable query) plus a `{property: "check", value:
+#   <name>}` tag. Any SQL engine can run the query; an adapter that recognises the
+#   name may accelerate it into a native check (e.g. a Snowflake DMF). No engine
+#   specifics live here — that mapping belongs to each exporter/adapter.
+STANDARD_LIBRARY_METRICS = {
+    "rowCount",            # volume / coverage (table)
+    "nullValues",          # completeness (column)
+    "duplicateValues",     # uniqueness — duplicate values (column)
+    "invalidValues",       # conformity — value outside an allowed set (column; arguments.validValues)
+}
+
+# customProperties key naming the abstract check a `type: sql` rule implements. This
+# engine-neutral name is the ONLY contract between enrich and an adapter; adapters
+# read it to upgrade the sql check to a native one (see dcx/exporters/snowflake.py).
+CHECK_PROPERTY = "check"
+
+# Portable `type: sql` query for each check metric (returns one comparable number).
+# `${table}`/`${column}` are the ODCS placeholders. The set of keys defines the
+# extended (non-ODCS-enum) checks the model may pick from.
+_CHECK_QUERY = {
+    "blankCount": (
+        "SELECT COUNT(*) FROM ${table} "
+        "WHERE ${column} IS NOT NULL AND TRIM(CAST(${column} AS STRING)) = ''"
+    ),
+    "freshness": (
+        "SELECT TIMEDIFF(second, MAX(last_altered), CURRENT_TIMESTAMP()) "
+        "FROM information_schema.tables WHERE table_name = UPPER('${table}')"
+    ),
+}
+CHECK_METRICS = set(_CHECK_QUERY)  # {"blankCount", "freshness"}
+# The full vocabulary the model may pick from (drives the tool-schema `metric` enum).
+LIBRARY_METRICS = STANDARD_LIBRARY_METRICS | CHECK_METRICS
 QUALITY_OPERATORS = {
     "mustBe", "mustNotBe", "mustBeGreaterThan", "mustBeGreaterOrEqualTo",
     "mustBeLessThan", "mustBeLessOrEqualTo", "mustBeBetween", "mustNotBeBetween",
@@ -56,46 +98,63 @@ QUALITY_SEVERITIES = {"info", "warning", "error"}
 _QUALITY_TOOL_NAME = "submit_quality_suite"
 
 _QUALITY_SYSTEM_PROMPT = """\
-You are a senior data quality engineer authoring an EXECUTABLE, portable data
-quality test suite for an Open Data Contract Standard (ODCS) schema.
+You are a senior data quality engineer authoring an EXECUTABLE data quality test
+suite for an Open Data Contract Standard (ODCS) schema, scoped to the
+"bronze" standard for streaming/ingested assets.
 
-Produce a COMPLETE suite covering every relevant ODCS quality dimension:
-- completeness: required columns must not be null (metric `nullValues` mustBe 0).
-- uniqueness: keys / unique columns must have no duplicates (`duplicateValues` mustBe 0).
-- conformity & accuracy: values must match their domain — allowed value sets,
-  formats (email, uuid, ISO codes), patterns, and numeric/length ranges.
-- consistency: cross-column invariants (e.g. created_at <= updated_at).
-- timeliness: freshness of event/audit timestamps.
-- coverage: table volume / expected cardinality (metric `rowCount`).
+Cover ONLY the bronze dimensions below. Do NOT propose accuracy or consistency
+library checks — steer those to `type: sql` if truly needed.
+- completeness:         required columns must not be null (`nullValues` mustBe 0);
+                        string columns must not be blank/empty (`blankCount` mustBe 0).
+- conformity (types):   categorical/enum columns must hold only allowed values
+                        (`invalidValues` mustBe 0, with the allowed set in
+                        `arguments.validValues`).
+- uniqueness:           columns expected to be unique must not have duplicates
+                        (`duplicateValues` mustBe 0).
+- coverage (volume):    table must have data (`rowCount` mustBeGreaterThan 0).
+- timeliness (freshness): the table must have been updated recently (`freshness`,
+                        TABLE-level, mustBeLessThan a threshold in seconds since the
+                        last DML on the table).
 
 Rule construction (best practices):
-- PREFER `type: library` with a predefined `metric` (nullValues, missingValues,
-  invalidValues, duplicateValues, rowCount) — these are portable and exportable.
-  For allowed-value/format checks use `metric: invalidValues` with `arguments`
-  (e.g. {"validValues": ["FR","DE"]} or {"format": "email"}) and `mustBe` 0.
-- Use `type: sql` ONLY when no library metric fits (cross-column consistency,
-  freshness, complex regex). Write portable SQL using the placeholders
-  `${table}` and `${column}`; the query MUST return a single comparable number.
+- PREFER `type: library` with a supported `metric`. Library metrics are portable and
+  directly executable by dcx engine adapters (e.g. Snowflake DMFs).
+  You may ONLY use these bronze library metrics (anything else MUST be `type: sql`):
+    Volume:      rowCount            (table)
+    Freshness:   freshness           (table; seconds since last DML)
+    Completeness (per column):  nullValues, blankCount
+    Conformity/types (per column):  invalidValues
+    Uniqueness (per column):  duplicateValues
+- `invalidValues` checks a column against a fixed allowed set (it counts rows whose
+  value is OUTSIDE the set). ONLY use it when the
+  metadata makes the set explicit (logicalTypeOptions.enum, an enum-like tag, or a
+  short, well-known categorical from examples). Put the allowed set in
+  `arguments.validValues` as an array (e.g. {"validValues": ["Pending", "Dispatched"]});
+  use mustBe 0 (rows outside the set). Do NOT guess the set for free-text columns.
+- Do NOT invent metric names. Length checks, regex/format checks, and cross-column
+  consistency have NO bronze DMF — use
+  `type: sql` for those (only when genuinely required). Write portable SQL using
+  the placeholders `${table}` and `${column}`; the query MUST return a single
+  comparable number.
 - Every rule MUST include exactly one `operator` describing the PASS condition:
   one of mustBe, mustNotBe, mustBeGreaterThan, mustBeGreaterOrEqualTo,
   mustBeLessThan, mustBeLessOrEqualTo, mustBeBetween, mustNotBeBetween.
   For mustBeBetween/mustNotBeBetween, value is a 2-number array [min, max].
-- Set `dimension` (accuracy, completeness, conformity, consistency, coverage,
-  timeliness, uniqueness), a clear unique `name`, a precise `description`,
-  `severity` (error for keys/required/critical data, warning otherwise), and
-  `unit` ("rows" or "percent") where meaningful.
+- Set `dimension` (one of: completeness, conformity, coverage, timeliness,
+  uniqueness), a clear unique `name`, a precise `description`, `severity` (error
+  for required/critical data, warning otherwise), and `unit` where meaningful.
 
 Placement:
-- Put COLUMN-level rules under each column id (nullValues, duplicateValues,
-  invalidValues, per-column sql checks).
-- Put TABLE-level rules in `table_rules` (rowCount, cross-column sql checks).
+- Put COLUMN-level rules under each column id (nullValues, blankCount,
+  duplicateValues, invalidValues, plus per-column sql).
+- Put TABLE-level rules in `table_rules` (rowCount, freshness).
 
 Ground every rule in the provided metadata (logicalType, examples, required,
 unique, logicalTypeOptions such as minimum/maximum/pattern/format, tags). Do not
-invent constraints with no basis. Aim for completeness: a nullValues check for
-every required column, a duplicateValues check for every unique/key column,
-validity checks wherever a domain is known, a rowCount check for the table, and
-obvious consistency/timeliness checks.
+invent constraints with no basis. Stay within the bronze scope: a nullValues
+check for every required column, a blankCount check for required string columns,
+a rowCount check for the table, and a
+table-level freshness check (seconds since last DML).
 """
 
 
@@ -213,10 +272,21 @@ def _build_quality_rule(raw: Any) -> Optional[DataQuality]:
             return None
         return DataQuality(type="sql", query=query, **operator_kwargs, **common)
 
-    # default: library
+    # library-family: the model picked one of the offered metric names.
     metric = raw.get("metric")
     if metric not in LIBRARY_METRICS:
         return None
+    if metric in CHECK_METRICS:
+        # Extended check → portable `type: sql` + a neutral `check` tag naming the
+        # metric. Valid against the unmodified ODCS schema; an engine adapter may
+        # upgrade it to a native check.
+        return DataQuality(
+            type="sql",
+            query=_CHECK_QUERY[metric],
+            customProperties=[CustomProperty(property=CHECK_PROPERTY, value=metric)],
+            **operator_kwargs,
+            **common,
+        )
     arguments = raw.get("arguments") if isinstance(raw.get("arguments"), dict) else None
     return DataQuality(
         type="library", metric=metric, arguments=arguments, **operator_kwargs, **common,
@@ -379,10 +449,12 @@ def enrich_quality_command(
 ) -> None:
     """Generate an executable ODCS data quality suite across all dimensions.
 
-    Prefers portable `library` metrics (nullValues, duplicateValues, rowCount,
-    invalidValues, ...) and falls back to `sql` (with ${table}/${column}
-    placeholders) for consistency/freshness/regex checks. Existing quality rules
-    are preserved unless you pass --overwrite. API key read from the environment.
+    Prefers portable `library` metrics that map to Snowflake system DMFs
+    (nullValues, duplicateValues, rowCount, freshness, uniqueCount, nullPercent,
+    ...) and falls back to `sql` (with ${table}/${column} placeholders) for
+    allowed-value/regex/consistency checks that have no DMF. Existing quality
+    rules are preserved unless you pass --overwrite. API key read from the
+    environment.
     """
     settings = EnrichSettings(
         model=model,
