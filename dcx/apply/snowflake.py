@@ -17,6 +17,7 @@ to build the script, then runs it via `snowflake-connector-python`.
 
 import logging
 import os
+import re
 from typing import Any, List, Optional
 
 import typer
@@ -76,6 +77,55 @@ def _first(*candidates: Optional[str]) -> Optional[str]:
         if c is not None and c != "":
             return c
     return None
+
+
+# Matches a `CREATE TABLE IF NOT EXISTS <name>` statement (optionally
+# TRANSIENT/TEMPORARY) and captures the qualified table name. Used to skip the
+# no-op create for tables that already exist — see `_connect_apply`.
+_CREATE_IF_NOT_EXISTS_RE = re.compile(
+    r"^\s*CREATE\s+(?:TRANSIENT\s+|TEMPORARY\s+|TEMP\s+)?TABLE\s+"
+    r"IF\s+NOT\s+EXISTS\s+([A-Za-z0-9_.\"$]+)",
+    re.IGNORECASE,
+)
+
+# Our generated `ADD DATA METRIC FUNCTION <dmf> ON (<cols>) EXPECTATION <name> (<expr>)`.
+# When the DMF is already on the column (Snowflake allows one per column), this is
+# re-issued as `MODIFY ... ADD EXPECTATION` so extra thresholds are added additively,
+# like Snowsight. The `ON` group stops at the first `)`, so only the simple
+# signatures we emit (`ON ()` / `ON (col)`) match; lambda forms surface unchanged.
+_ADD_DMF_RE = re.compile(
+    r"^(?P<head>ALTER\s+(?:TABLE|VIEW)\s+\S+)\s+"
+    r"ADD\s+DATA\s+METRIC\s+FUNCTION\s+(?P<assoc>\S+\s+ON\s+\([^)]*\))"
+    r"\s+EXPECTATION\s+(?P<exp>.+)$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _add_dmf_to_modify_expectation(stmt: str) -> Optional[str]:
+    """Rewrite one of our `ADD DATA METRIC FUNCTION ... EXPECTATION ...` statements as
+    `MODIFY DATA METRIC FUNCTION ... ADD EXPECTATION ...`, or None if it carries no
+    expectation (a bare DMF that is simply already present) or doesn't match."""
+    m = _ADD_DMF_RE.match(stmt.strip())
+    if not m:
+        return None
+    return (
+        f"{m.group('head')} MODIFY DATA METRIC FUNCTION "
+        f"{m.group('assoc')} ADD EXPECTATION {m.group('exp')}"
+    )
+
+
+def _table_exists(conn, qualified_name: str) -> bool:
+    """Best-effort existence check via DESCRIBE TABLE (needs no active warehouse)."""
+    cur = conn.cursor()
+    try:
+        cur.execute(f"DESCRIBE TABLE {qualified_name}")
+        cur.fetchall()
+        return True
+    except Exception:
+        return False
+    finally:
+        cur.close()
+
 
 
 def _find_snowflake_server(
@@ -453,11 +503,52 @@ def _connect_apply(
                 + "\n- ".join(real_drift)
             )
 
-        # `Connection.execute_string` parses & runs each `;`-separated statement
-        # and returns one cursor per statement. (Note: `execute_string` lives on
-        # the Connection, not the Cursor.)
+        # Execute each `;`-separated statement individually via cursor.execute().
+        # execute_string() uses the connector's internal split_statements parser
+        # which can mishandle certain constructs (e.g. ON (col) in DMF clauses),
+        # causing spurious "unexpected ')'" errors. Splitting manually and calling
+        # cursor.execute() once per statement avoids this entirely.
         try:
-            cursors = list(conn.execute_string(sql))
+            cursors = []
+            for raw_stmt in sql.split(";"):
+                # Drop `--` comment lines and surrounding whitespace.
+                lines = [
+                    line for line in raw_stmt.splitlines()
+                    if not line.strip().startswith("--")
+                ]
+                stmt = "\n".join(lines).strip()
+                if not stmt:
+                    continue
+                # A `CREATE TABLE IF NOT EXISTS` for a table that already exists is a
+                # no-op — but Snowflake still parses the DDL first. A contract imported
+                # from a live table can carry types that don't round-trip into valid
+                # CREATE DDL (e.g. a bare `VECTOR` with no dimension), which would fail
+                # parsing. Skip the redundant create so governance of the existing table
+                # still succeeds; genuinely-missing tables are still created.
+                m = _CREATE_IF_NOT_EXISTS_RE.match(stmt)
+                if m and _table_exists(conn, m.group(1)):
+                    continue
+                cur = conn.cursor()
+                try:
+                    cur.execute(stmt)
+                except Exception as exc:
+                    if "already has the data metric function" not in str(exc).lower():
+                        raise
+                    # The DMF is already on the column (Snowflake allows one per
+                    # column). Re-issue as MODIFY ... ADD EXPECTATION so a new
+                    # threshold is added additively (Snowsight style). A bare DMF with
+                    # no expectation is simply already present — nothing more to do.
+                    modify = _add_dmf_to_modify_expectation(stmt)
+                    if modify is not None:
+                        try:
+                            cur.execute(modify)
+                        except Exception as exc2:
+                            # Same expectation name already present (re-applying an
+                            # unchanged rule). Snowflake has no ADD EXPECTATION IF NOT
+                            # EXISTS, so treat the duplicate as an idempotent no-op.
+                            if "already has an expectation" not in str(exc2).lower():
+                                raise
+                cursors.append(cur)
         except Exception as exc:
             raise ApplyError(f"Snowflake execution failed: {exc}")
         return len(cursors), warnings
