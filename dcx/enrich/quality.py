@@ -2,7 +2,8 @@
 
 Library metrics are preferred (portable + exportable to DMFs etc.); SQL with
 `${table}`/`${column}` placeholders covers what library can't (consistency,
-freshness, regex).
+blank counts, regex). Freshness is an SLA in ODCS, not a quality rule — see
+`slaProperties` and the exporter's SLA handling.
 """
 
 import json
@@ -52,11 +53,21 @@ _DIMENSION_SYNONYMS = {
 #
 # * STANDARD_LIBRARY_METRICS — names in the ODCS `quality.metric` enum. Authored as
 #   `type: library`; portable and understood by any ODCS consumer.
-# * CHECK_METRICS — checks with no ODCS metric name (blankCount, freshness).
-#   Authored as `type: sql` (a portable query) plus a `{property: "check", value:
-#   <name>}` tag. Any SQL engine can run the query; an adapter that recognises the
-#   name may accelerate it into a native check (e.g. a Snowflake DMF). No engine
-#   specifics live here — that mapping belongs to each exporter/adapter.
+# * CHECK_METRICS — checks with no ODCS metric name (blankCount). Authored as
+#   `type: sql` (a portable query) plus a `{property: "check", value: <name>}` tag.
+#   Any SQL engine can run the query; an adapter that recognises the name may
+#   accelerate it into a native check (e.g. a Snowflake DMF). No engine specifics
+#   live here — that mapping belongs to each exporter/adapter.
+#
+# ODCS also offers `type: custom` with `engine` + `implementation` for engine-specific
+# rules. We deliberately use the `check` tag instead: a `custom` rule is executable
+# ONLY on the named engine, whereas a `sql` rule still runs anywhere and merely gets
+# accelerated where an adapter knows better.
+#
+# Freshness/latency is NOT here. ODCS models it as an SLA (`slaProperties`, property
+# `latency`), not a quality rule, and the exporter reads it from there — see
+# `dcx/exporters/snowflake.py`. Expressing it as a quality rule required a query that
+# was Snowflake-specific in all but name.
 STANDARD_LIBRARY_METRICS = {
     "rowCount",            # volume / coverage (table)
     "nullValues",          # completeness (column)
@@ -77,12 +88,8 @@ _CHECK_QUERY = {
         "SELECT COUNT(*) FROM ${table} "
         "WHERE ${column} IS NOT NULL AND TRIM(CAST(${column} AS STRING)) = ''"
     ),
-    "freshness": (
-        "SELECT TIMEDIFF(second, MAX(last_altered), CURRENT_TIMESTAMP()) "
-        "FROM information_schema.tables WHERE table_name = UPPER('${table}')"
-    ),
 }
-CHECK_METRICS = set(_CHECK_QUERY)  # {"blankCount", "freshness"}
+CHECK_METRICS = set(_CHECK_QUERY)  # {"blankCount"}
 # The full vocabulary the model may pick from (drives the tool-schema `metric` enum).
 LIBRARY_METRICS = STANDARD_LIBRARY_METRICS | CHECK_METRICS
 QUALITY_OPERATORS = {
@@ -112,16 +119,15 @@ library checks — steer those to `type: sql` if truly needed.
 - uniqueness:           columns expected to be unique must not have duplicates
                         (`duplicateValues` mustBe 0).
 - coverage (volume):    table must have data (`rowCount` mustBeGreaterThan 0).
-- timeliness (freshness): the table must have been updated recently (`freshness`,
-                        TABLE-level, mustBeLessThan a threshold in seconds since the
-                        last DML on the table).
+
+Do NOT author freshness/timeliness rules. ODCS models freshness as an SLA
+(`slaProperties`), not a quality rule; it is handled outside this suite.
 
 Rule construction (best practices):
 - PREFER `type: library` with a supported `metric`. Library metrics are portable and
   directly executable by dcx engine adapters (e.g. Snowflake DMFs).
   You may ONLY use these bronze library metrics (anything else MUST be `type: sql`):
     Volume:      rowCount            (table)
-    Freshness:   freshness           (table; seconds since last DML)
     Completeness (per column):  nullValues, blankCount
     Conformity/types (per column):  invalidValues
     Uniqueness (per column):  duplicateValues
@@ -140,21 +146,20 @@ Rule construction (best practices):
   one of mustBe, mustNotBe, mustBeGreaterThan, mustBeGreaterOrEqualTo,
   mustBeLessThan, mustBeLessOrEqualTo, mustBeBetween, mustNotBeBetween.
   For mustBeBetween/mustNotBeBetween, value is a 2-number array [min, max].
-- Set `dimension` (one of: completeness, conformity, coverage, timeliness,
-  uniqueness), a clear unique `name`, a precise `description`, `severity` (error
+- Set `dimension` (one of: completeness, conformity, coverage, uniqueness),
+  a clear unique `name`, a precise `description`, `severity` (error
   for required/critical data, warning otherwise), and `unit` where meaningful.
 
 Placement:
 - Put COLUMN-level rules under each column id (nullValues, blankCount,
   duplicateValues, invalidValues, plus per-column sql).
-- Put TABLE-level rules in `table_rules` (rowCount, freshness).
+- Put TABLE-level rules in `table_rules` (rowCount, table-scope sql).
 
 Ground every rule in the provided metadata (logicalType, examples, required,
 unique, logicalTypeOptions such as minimum/maximum/pattern/format, tags). Do not
 invent constraints with no basis. Stay within the bronze scope: a nullValues
 check for every required column, a blankCount check for required string columns,
-a rowCount check for the table, and a
-table-level freshness check (seconds since last DML).
+and a rowCount check for the table.
 """
 
 
@@ -447,14 +452,13 @@ def enrich_quality_command(
         typer.Option(help="Write the contract with quality rules here. Default: stdout."),
     ] = None,
 ) -> None:
-    """Generate an executable ODCS data quality suite across all dimensions.
+    """Generate an executable ODCS data quality suite.
 
-    Prefers portable `library` metrics that map to Snowflake system DMFs
-    (nullValues, duplicateValues, rowCount, freshness, uniqueCount, nullPercent,
-    ...) and falls back to `sql` (with ${table}/${column} placeholders) for
-    allowed-value/regex/consistency checks that have no DMF. Existing quality
-    rules are preserved unless you pass --overwrite. API key read from the
-    environment.
+    Prefers portable ODCS `library` metrics (nullValues, duplicateValues,
+    invalidValues, rowCount) and falls back to `sql` with ${table}/${column}
+    placeholders for checks the spec has no metric name for. Freshness is an SLA
+    in ODCS and is not authored here. Existing quality rules are preserved unless
+    you pass --overwrite. API key read from the environment.
     """
     settings = EnrichSettings(
         model=model,
