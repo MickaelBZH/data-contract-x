@@ -281,21 +281,10 @@ def _accepted_values_from_condition(condition: Optional[str]) -> Optional[list[s
 # too, but only for expectations dcx wrote. Parsing `VALUE <= 4` also recovers the
 # operator from an expectation a user created in Snowsight.
 #
-# NOTE: Snowflake exposes NO readable source for a metric's EXPECTATION. Confirmed on a
-# live account by attaching one (`ALTER TABLE ... MODIFY DATA METRIC FUNCTION ... ADD
-# EXPECTATION EXP__DCX__PROBE (VALUE = 0)`) and re-checking every candidate — the
-# expectation exists and is enforced, yet nothing reports it:
-#   DATA_METRIC_FUNCTION_REFERENCES  no such column; PROPERTIES byte-identical
-#                                    before and after (anomaly-detection and
-#                                    notification settings only)
-#   SHOW EXPECTATIONS                does not exist
-#   ACCOUNT_USAGE                    no matching view
-#   GET_DDL                          byte-identical before and after; renders no DMF
-#                                    associations at all
-# So thresholds cannot round-trip: the contract is the source of truth for intent, and
-# import reports what is ATTACHED. The mapping below is kept because it is the exact
-# inverse of what the exporter writes and costs nothing — wire `expectation` in
-# `_fetch_dmf_references` if Snowflake ever surfaces one.
+# Expectations live in their OWN table function, INFORMATION_SCHEMA.
+# DATA_METRIC_FUNCTION_EXPECTATIONS — not on the reference row, which is why nothing in
+# DATA_METRIC_FUNCTION_REFERENCES, GET_DDL or SHOW output ever mentions them. The two
+# are joined on `ref_id`, which both report.
 _NUM = r"-?\d+(?:\.\d+)?"
 
 _SQL_OP_TO_ODCS: dict[str, str] = {
@@ -427,8 +416,8 @@ def _quality_from_dmf_references(
             sla.element = ".".join(p for p in (database, schema, table) if p)
             if seconds is None:
                 sla.description = (
-                    "Imported from an attached SNOWFLAKE.CORE.FRESHNESS metric with no "
-                    "readable expectation; set the threshold here."
+                    "Imported from an attached SNOWFLAKE.CORE.FRESHNESS metric that "
+                    "carries no expectation; set the threshold here."
                 )
             if schedule:
                 sla.schedule, sla.scheduler = schedule, "cron"
@@ -488,13 +477,12 @@ def _quality_from_dmf_references(
             by_table.setdefault(table, []).append(rule)
 
     if missing_operator:
-        # One summary line, not one per rule: with no metadata source for expectations
-        # this is the normal case, and per-rule noise would train people to ignore it.
+        # One summary line rather than one per rule: a metric with no expectation is a
+        # legitimate Snowflake state (it computes a value nothing is compared against).
         _warn(
-            f"{len(missing_operator)} quality rule(s) imported without a pass condition. "
-            "Snowflake exposes no readable source for a metric's EXPECTATION, so "
-            "thresholds cannot be recovered — keep them in the contract, which stays "
-            "the source of truth for intent."
+            f"{len(missing_operator)} quality rule(s) imported without a pass condition "
+            "(the metric carries no expectation in Snowflake): "
+            f"{', '.join(missing_operator)}."
         )
     if unmapped:
         _warn(
@@ -873,6 +861,7 @@ def _fetch_dmf_references(conn, database: str, schema: str, table_names: list[st
     db = database.upper()
     sch = schema.upper()
     references: list[dict] = []
+    expectations: dict[str, list[str]] = {}
     errors: list[str] = []
 
     cur = conn.cursor()
@@ -907,12 +896,46 @@ def _fetch_dmf_references(conn, database: str, schema: str, table_names: list[st
                         "columns": _dmf_ref_columns(ref_arguments),
                         "condition": _dmf_ref_condition(ref_arguments),
                         "schedule": _col(row, "schedule"),
-                        "expectation": _col(row, "expectation"),
+                        "ref_id": _col(row, "ref_id"),
                     })
+            except Exception as exc:  # noqa: BLE001 — graceful degradation
+                errors.append(str(exc))
+
+            # Expectations live in a separate table function, joined on ref_id.
+            try:
+                cur.execute(
+                    f'SELECT * FROM TABLE("{db}".INFORMATION_SCHEMA.'
+                    f"DATA_METRIC_FUNCTION_EXPECTATIONS("
+                    f"REF_ENTITY_NAME => '{fq}', REF_ENTITY_DOMAIN => 'TABLE'))"
+                )
+                idx = {c[0].lower(): i for i, c in enumerate(cur.description)}
+                for row in cur.fetchall():
+                    ref_id = row[idx["ref_id"]] if "ref_id" in idx else None
+                    expression = (
+                        row[idx["expectation_expression"]]
+                        if "expectation_expression" in idx else None
+                    )
+                    if ref_id and expression:
+                        expectations.setdefault(ref_id, []).append(str(expression))
+            except Exception as exc:  # noqa: BLE001 — graceful degradation
+                errors.append(str(exc))
             except Exception as exc:  # noqa: BLE001 — graceful degradation
                 errors.append(str(exc))
     finally:
         cur.close()
+
+    # Attach each association's expectation. An association may carry several; ODCS has
+    # room for exactly one operator, so the first parseable one wins and the rest are
+    # reported rather than dropped silently.
+    for ref in references:
+        found = expectations.get(ref.get("ref_id")) or []
+        ref["expectation"] = found[0] if found else None
+        if len(found) > 1:
+            _warn(
+                f"{ref['table']}: metric {ref.get('qualified')} has {len(found)} "
+                f"expectations; ODCS holds one operator, so {found[0]!r} was used "
+                f"and {found[1:]} ignored."
+            )
 
     if errors and not references:
         _warn(
