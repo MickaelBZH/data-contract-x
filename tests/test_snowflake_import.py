@@ -889,3 +889,45 @@ def test_expectations_query_failure_is_not_fatal(monkeypatch):
     rule = {p.name: p for p in _obj(contract).properties}["ID"].quality[0]
     assert rule.metric == "nullValues"
     assert rule.mustBe is None
+
+
+def test_real_expectation_expressions_parse_verbatim():
+    """Snowflake returns expectation_expression exactly as written — no normalising,
+    no substituting the metric name for VALUE. Strings captured from a live account."""
+    from dcx.importers.snowflake import _operator_from_expectation
+    assert _operator_from_expectation("VALUE = 0") == ("mustBe", 0)
+    assert _operator_from_expectation("VALUE < 86400") == ("mustBeLessThan", 86400)
+
+
+def test_second_expectation_on_one_association_is_reported(monkeypatch, capsys):
+    """Real state on a live table: one association carried both a hand-made
+    EXP__CUSTOMER_ID__NONULLS and a second expectation. ODCS holds one operator."""
+    import dcx.importers.snowflake as si
+
+    class _Cur(_FakeCursor):
+        def execute(self, sql, params=None):
+            mine = ".CUSTOMER'" in sql.upper()
+            if "DATA_METRIC_FUNCTION_EXPECTATIONS" in sql:
+                self.description = [(c,) for c in _EXPECTATION_COLUMNS]
+                self._rows = [
+                    ("523a27cf", "EXP__CUSTOMER_ID__NONULLS", "VALUE = 0"),
+                    ("523a27cf", "EXP__DCX__PROBE", "VALUE = 0"),
+                ] if mine else []
+                return
+            if "DATA_METRIC_FUNCTION_REFERENCES" in sql:
+                self.description = [(c,) for c in _DMF_COLUMNS]
+                self._rows = [("SNOWFLAKE", "CORE", "NULL_COUNT", "TABLE(NUMBER)",
+                               "CUSTOMER", '[{"domain":"COLUMN","name":"ID"}]',
+                               None, "523a27cf")] if mine else []
+                return
+            return super().execute(sql, params)
+
+    class _Conn(_FakeConn):
+        def cursor(self):
+            return _Cur(self.data)
+
+    monkeypatch.setattr(si, "_connect", lambda import_args: _Conn(_fake_data()))
+    contract = import_snowflake({"database": "DB", "schema": "SCH", "account": "ACME"})
+    rule = {p.name: p for p in _obj(contract).properties}["ID"].quality[0]
+    assert rule.mustBe == 0
+    assert "2 expectations" in capsys.readouterr().err
