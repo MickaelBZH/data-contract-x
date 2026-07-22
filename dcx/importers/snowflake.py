@@ -188,19 +188,32 @@ _CHECK_QUERY: dict[str, str] = {
 }
 
 
-def _dmf_short_name(metric_name: Optional[str]) -> str:
-    """Last dotted segment of a DMF name, upper-cased (`SNOWFLAKE.CORE.ROW_COUNT` →
-    `ROW_COUNT`)."""
-    return str(metric_name or "").strip().rstrip("()").split(".")[-1].upper()
+# Built-in DMFs live in SNOWFLAKE.CORE. A user is free to define their own
+# `NULL_COUNT` elsewhere, so the namespace is part of the identity — only
+# SNOWFLAKE.CORE metrics map to ODCS constructs.
+_CORE_DMF_NAMESPACE = ("SNOWFLAKE", "CORE")
 
 
-def _dmf_ref_columns(ref_arguments: Any) -> list[str]:
-    """Column names a DMF is attached to, from a reference's `REF_ARGUMENTS` payload.
+def _dmf_identity(database: Any, schema: Any, name: Any) -> tuple[str, str]:
+    """`(short_name, fully_qualified_name)` for a DMF reference.
 
-    Snowflake returns a JSON array of argument descriptors; a table-scope DMF has an
-    empty list. Anything unparseable yields `[]`, which downgrades the rule to
-    table-level rather than losing it.
+    `METRIC_NAME` is the bare name (`NULL_COUNT`); the namespace arrives in the
+    separate `METRIC_DATABASE_NAME` / `METRIC_SCHEMA_NAME` columns. The short name
+    drives the mapping only when the namespace is SNOWFLAKE.CORE; the qualified name
+    is what a `type: custom` rule records.
     """
+    short = str(name or "").strip().upper()
+    parts = [str(p).strip() for p in (database, schema, name) if p]
+    qualified = ".".join(parts) if parts else short
+    is_core = (
+        str(database or "").strip().upper(),
+        str(schema or "").strip().upper(),
+    ) == _CORE_DMF_NAMESPACE
+    return (short if is_core else "", qualified)
+
+
+def _parse_ref_arguments(ref_arguments: Any) -> list[dict]:
+    """`REF_ARGUMENTS` as a list of dicts; `[]` for anything unparseable."""
     if isinstance(ref_arguments, str):
         try:
             ref_arguments = json.loads(ref_arguments)
@@ -208,58 +221,79 @@ def _dmf_ref_columns(ref_arguments: Any) -> list[str]:
             return []
     if not isinstance(ref_arguments, list):
         return []
-    columns: list[str] = []
-    for arg in ref_arguments:
-        if isinstance(arg, dict):
-            name = arg.get("columnName") or arg.get("column_name") or arg.get("name")
-            if name:
-                columns.append(str(name))
-        elif isinstance(arg, str) and arg:
-            columns.append(arg)
-    return columns
+    return [a for a in ref_arguments if isinstance(a, dict)]
 
 
-# `IN ('A', 'B')` inside an ACCEPTED_VALUES association, whose allowed set is carried
-# in the argument signature rather than as a separate field.
-_ACCEPTED_VALUES_RE = re.compile(r"\bIN\s*\((?P<values>.+?)\)\s*\)?\s*$", re.IGNORECASE | re.DOTALL)
+def _dmf_ref_columns(ref_arguments: Any) -> list[str]:
+    """Column names a DMF is attached to, from its `REF_ARGUMENTS`.
 
-
-def _accepted_values_from_signature(signature: Optional[str]) -> Optional[list[str]]:
-    """Allowed-value set parsed out of an ACCEPTED_VALUES argument signature, or None.
-
-    Without it the rule would import as an `invalidValues` with no `arguments`, which
-    the exporter then refuses to re-emit — a silently lossy round trip. Returning None
-    is reported to the caller rather than swallowed.
+    Entries are domain-tagged and the array MIXES domains — an ACCEPTED_VALUES
+    reference carries both a `COLUMN` entry and a `VALUES` entry holding the
+    condition — so filtering on `domain` is required. Taking every `name` would
+    treat the condition text as a column name. A table-scope DMF has `[]`.
     """
-    if not signature:
+    return [
+        str(arg["name"])
+        for arg in _parse_ref_arguments(ref_arguments)
+        if str(arg.get("domain", "")).upper() == "COLUMN" and arg.get("name")
+    ]
+
+
+def _dmf_ref_condition(ref_arguments: Any) -> Optional[str]:
+    """The `VALUES`-domain predicate of an ACCEPTED_VALUES reference, e.g.
+    `AGE BETWEEN 0 AND 150` or `STATUS IN ('A', 'B')`. None when absent."""
+    for arg in _parse_ref_arguments(ref_arguments):
+        if str(arg.get("domain", "")).upper() == "VALUES" and arg.get("name"):
+            return str(arg["name"])
+    return None
+
+
+# `IN ('A', 'B')` within an ACCEPTED_VALUES condition. Only an IN-list maps onto ODCS
+# `invalidValues` + `arguments.validValues`; any other predicate (BETWEEN, LIKE, ...)
+# has no ODCS equivalent and is preserved as an engine-specific rule instead.
+_ACCEPTED_VALUES_RE = re.compile(r"\bIN\s*\((?P<values>.+)\)\s*$", re.IGNORECASE | re.DOTALL)
+
+
+def _accepted_values_from_condition(condition: Optional[str]) -> Optional[list[str]]:
+    """Allowed-value set parsed out of an ACCEPTED_VALUES condition, or None if the
+    predicate is not a plain `IN` list."""
+    if not condition:
         return None
-    match = _ACCEPTED_VALUES_RE.search(signature)
+    match = _ACCEPTED_VALUES_RE.search(condition.strip())
     if not match:
         return None
     values = [v.strip() for v in match.group("values").split(",")]
     unquoted = [
-        v[1:-1].replace("''", "'") if len(v) >= 2 and v.startswith("'") and v.endswith("'") else v
+        v[1:-1].replace("\'\'", "\'") if len(v) >= 2 and v.startswith("\'") and v.endswith("\'") else v
         for v in values
         if v
     ]
     return unquoted or None
 
 
+# A trailing timezone on a cron schedule (`UTC`, `America/Los_Angeles`) — anything
+# that is not a cron field. Cron fields only ever contain digits and `*,-/?LW#`.
+_CRON_TIMEZONE_RE = re.compile(r"\s+(?P<tz>[A-Za-z][A-Za-z0-9_+\-/]*)$")
+
+
 def _bare_cron(schedule: Optional[str]) -> Optional[str]:
-    """Snowflake's `DATA_METRIC_SCHEDULE` clause reduced to the bare cron the contract
-    stores (`USING CRON 0 6 * * * UTC` → `0 6 * * *`), or the value unchanged if it
-    isn't a cron clause. Inverse of the exporter's `_to_dmf_schedule`.
+    """Reduce a Snowflake schedule to the bare cron the contract stores.
+
+    `DATA_METRIC_FUNCTION_REFERENCES.SCHEDULE` reports `0 */1 * * * UTC` — the cron
+    plus a timezone, WITHOUT the `USING CRON` prefix that `ALTER ... SET
+    DATA_METRIC_SCHEDULE` requires. Both forms are accepted here so this is the exact
+    inverse of the exporter's `_to_dmf_schedule`. Non-cron schedules (`5 MINUTE`,
+    `TRIGGER_ON_CHANGES`) pass through untouched.
     """
     if not schedule:
         return None
     text = str(schedule).strip()
-    upper = text.upper()
-    if not upper.startswith("USING CRON"):
+    if text.upper().startswith("USING CRON"):
+        text = text[len("USING CRON"):].strip()
+    elif text.upper().endswith("MINUTE") or text.upper() == "TRIGGER_ON_CHANGES":
         return text
-    body = text[len("USING CRON"):].strip()
-    if body.upper().endswith(" UTC"):
-        body = body[: -len(" UTC")].strip()
-    return body or None
+    text = _CRON_TIMEZONE_RE.sub("", text).strip()
+    return text or None
 
 
 def _quality_from_dmf_references(
@@ -292,9 +326,9 @@ def _quality_from_dmf_references(
             # A DMF this adapter has no ODCS equivalent for — typically a user-defined
             # one. ODCS models exactly this with `type: custom`, which is honest: it is
             # executable only on Snowflake, so there is no portable query to invent.
-            unmapped.add(ref.get("dmf") or "?")
+            unmapped.add(ref.get("qualified") or "?")
             rule = DataQuality(
-                type="custom", engine="snowflake", implementation=ref.get("dmf"),
+                type="custom", engine="snowflake", implementation=ref.get("qualified"),
             )
             if schedule:
                 rule.schedule, rule.scheduler = schedule, "cron"
@@ -322,18 +356,37 @@ def _quality_from_dmf_references(
                 customProperties=[CustomProperty(property=_CHECK_PROPERTY, value=name)],
             )
         else:
-            rule = DataQuality(type="library", metric=name)
             if name == "invalidValues":
-                values = _accepted_values_from_signature(ref.get("signature"))
-                if values:
-                    rule.arguments = {"validValues": values}
-                else:
-                    _warn(
-                        f"{table}: ACCEPTED_VALUES on "
-                        f"{columns[0] if columns else '?'} imported without its allowed "
-                        "set (not recoverable from the reference); add "
-                        "`arguments.validValues` before re-applying."
+                # ACCEPTED_VALUES stores an arbitrary predicate. Only a plain IN-list
+                # maps onto ODCS `invalidValues` + `arguments.validValues`; anything
+                # else (BETWEEN, LIKE, ...) has no ODCS equivalent, so it is preserved
+                # verbatim as an engine-specific rule rather than silently flattened
+                # into a rule that means something different.
+                condition = ref.get("condition")
+                values = _accepted_values_from_condition(condition)
+                if values is None:
+                    rule = DataQuality(
+                        type="custom",
+                        engine="snowflake",
+                        implementation={
+                            "metric": ref.get("qualified"),
+                            "column": columns[0] if columns else None,
+                            "condition": condition,
+                        },
                     )
+                    _warn(
+                        f"{table}: ACCEPTED_VALUES on {columns[0] if columns else '?'} "
+                        f"uses a predicate ODCS cannot express ({condition!r}); "
+                        "imported as `type: custom`."
+                    )
+                    if schedule:
+                        rule.schedule, rule.scheduler = schedule, "cron"
+                    (by_column.setdefault((table, columns[0]), []) if columns
+                     else by_table.setdefault(table, [])).append(rule)
+                    continue
+                rule = DataQuality(type="library", metric=name, arguments={"validValues": values})
+            else:
+                rule = DataQuality(type="library", metric=name)
         if schedule:
             rule.schedule, rule.scheduler = schedule, "cron"
 
@@ -740,12 +793,19 @@ def _fetch_dmf_references(conn, database: str, schema: str, table_names: list[st
                     return None
 
                 for row in cur.fetchall():
+                    ref_arguments = _col(row, "ref_arguments")
+                    short, qualified = _dmf_identity(
+                        _col(row, "metric_database_name"),
+                        _col(row, "metric_schema_name"),
+                        _col(row, "metric_name"),
+                    )
                     references.append({
                         "table": table,
-                        "dmf": _dmf_short_name(_col(row, "metric_name")),
-                        "columns": _dmf_ref_columns(_col(row, "ref_arguments")),
+                        "dmf": short,
+                        "qualified": qualified,
+                        "columns": _dmf_ref_columns(ref_arguments),
+                        "condition": _dmf_ref_condition(ref_arguments),
                         "schedule": _col(row, "schedule"),
-                        "signature": _col(row, "argument_signature", "metric_signature"),
                     })
             except Exception as exc:  # noqa: BLE001 — graceful degradation
                 errors.append(str(exc))
