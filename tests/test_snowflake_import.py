@@ -225,6 +225,7 @@ def _fake_data():
             ("CUSTOMER", "EMAIL", "TEXT", "NO", None, 255, None, None),
             ("ORDERS", "ID", "NUMBER", "NO", None, None, 38, 0),
             ("CUSTOMER", "EMBEDDING", "VECTOR", "YES", None, None, None, None),
+            ("CUSTOMER", "EMBEDDING_I", "VECTOR", "YES", None, None, None, None),
         ],
         # (TABLE_NAME, COMMENT, TABLE_TYPE)
         "tables": [
@@ -233,11 +234,21 @@ def _fake_data():
         ],
         # (TABLE_NAME, VIEW_DEFINITION) for views
         "views": [("ORDERS", "SELECT id FROM raw_orders")],
-        # SHOW COLUMNS rows: the only place a VECTOR's element type + dimension appear
+        # SHOW COLUMNS rows: the only place a VECTOR's element type + dimension appear.
+        # Payloads captured verbatim from Snowflake — note the element type is nested
+        # under `vectorElementType` and uses internal names (REAL=FLOAT, FIXED=INT).
         "show_columns": [
             ("CUSTOMER", "SCH", "EMBEDDING",
-             '{"type":"VECTOR","dimension":256,"elementType":"FLOAT","nullable":true}'),
-            ("CUSTOMER", "SCH", "EMAIL", '{"type":"TEXT","length":255}'),
+             '{"type":"VECTOR","nullable":true,'
+             '"vectorElementType":{"type":"REAL","nullable":false},"dimension":256}'),
+            ("CUSTOMER", "SCH", "EMBEDDING_I",
+             '{"type":"VECTOR","nullable":true,'
+             '"vectorElementType":{"type":"FIXED","precision":38,"scale":0,'
+             '"nullable":false},"dimension":3}'),
+            ("CUSTOMER", "SCH", "EMAIL",
+             '{"type":"TEXT","length":64,"byteLength":256,"nullable":true,"fixed":false}'),
+            ("CUSTOMER", "SCH", "ID",
+             '{"type":"FIXED","precision":38,"scale":0,"nullable":true}'),
         ],
         # SHOW PRIMARY KEYS rows in description order
         "pks": [
@@ -259,7 +270,7 @@ def _fake_data():
 def test_fetch_metadata_shapes():
     conn = _FakeConn(_fake_data())
     columns, pks, comments, types, vdefs, full_types = _fetch_metadata(conn, "db", "sch", None)
-    assert len(columns) == 4
+    assert len(columns) == 5
     assert columns[0] == {
         "table": "CUSTOMER", "name": "ID", "data_type": "NUMBER", "nullable": False,
         "comment": "key", "char_len": None, "precision": 38, "scale": 0,
@@ -269,7 +280,10 @@ def test_fetch_metadata_shapes():
     assert types == {"CUSTOMER": "BASE TABLE", "ORDERS": "VIEW"}
     assert vdefs == {"ORDERS": "SELECT id FROM raw_orders"}
     # Only types INFORMATION_SCHEMA can't express are captured; TEXT is left alone.
-    assert full_types == {("CUSTOMER", "EMBEDDING"): "VECTOR(FLOAT, 256)"}
+    assert full_types == {
+        ("CUSTOMER", "EMBEDDING"): "VECTOR(FLOAT, 256)",
+        ("CUSTOMER", "EMBEDDING_I"): "VECTOR(INT, 3)",
+    }
 
 
 def test_import_sets_physical_type_from_table_type(monkeypatch):
@@ -577,9 +591,12 @@ def test_vector_column_round_trips_into_valid_ddl(monkeypatch):
     monkeypatch.setattr(si, "_connect", lambda import_args: _FakeConn(_fake_data()))
     contract = import_snowflake({"database": "DB", "schema": "SCH", "account": "ACME"})
 
-    embedding = {p.name: p for p in contract.schema_[0].properties}["EMBEDDING"]
-    assert embedding.physicalType == "VECTOR(FLOAT, 256)"
-    assert "VECTOR(FLOAT, 256)" in to_snowflake_full_sql(contract)
+    props = {p.name: p for p in contract.schema_[0].properties}
+    assert props["EMBEDDING"].physicalType == "VECTOR(FLOAT, 256)"
+    assert props["EMBEDDING_I"].physicalType == "VECTOR(INT, 3)"
+    ddl = to_snowflake_full_sql(contract)
+    assert "VECTOR(FLOAT, 256)" in ddl
+    assert "VECTOR(INT, 3)" in ddl
 
 
 def test_show_columns_failure_is_not_fatal(monkeypatch):
