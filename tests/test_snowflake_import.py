@@ -622,25 +622,35 @@ def test_show_columns_failure_is_not_fatal(monkeypatch):
 
 # === Data quality round trip ================================================
 
+# Column subset of DATA_METRIC_FUNCTION_REFERENCES that the importer reads. Lookup is
+# by name, so the real view's remaining columns (METRIC_DATA_TYPE, REF_ID,
+# SCHEDULE_STATUS, PROPERTIES, ...) are irrelevant here.
+_DMF_COLUMNS = [
+    "metric_database_name", "metric_schema_name", "metric_name",
+    "metric_signature", "ref_entity_name", "ref_arguments", "schedule",
+]
 
-def _dmf_data(references):
-    data = _fake_data()
-    data["dmf_refs"] = references
-    return data
+# Rows captured verbatim from a live account (SNOWFLAKE.CORE metrics on LOAD.CUSTOMERS).
+# Note REF_ARGUMENTS mixes COLUMN and VALUES domains, and SCHEDULE carries a trailing
+# timezone with no `USING CRON` prefix.
+_REAL_ROWS = [
+    ("SNOWFLAKE", "CORE", "ACCEPTED_VALUES", "TABLE(NUMBER)", "CUSTOMER",
+     '[{"domain":"COLUMN","id":"591995302","name":"EMAIL"},'
+     '{"domain":"VALUES","name":"EMAIL IN (\'a\', \'b\')"}]', "0 */1 * * * UTC"),
+    ("SNOWFLAKE", "CORE", "FRESHNESS", "", "CUSTOMER", "[]", "0 */1 * * * UTC"),
+    ("SNOWFLAKE", "CORE", "NULL_COUNT", "TABLE(NUMBER)", "CUSTOMER",
+     '[{"domain":"COLUMN","id":"591995298","name":"ID"}]', "0 */1 * * * UTC"),
+]
 
 
-def _import_with_dmfs(monkeypatch, references):
+def _import_with_dmfs(monkeypatch, rows):
     import dcx.importers.snowflake as si
 
     class _Cur(_FakeCursor):
         def execute(self, sql, params=None):
             if "DATA_METRIC_FUNCTION_REFERENCES" in sql:
-                self.description = [
-                    ("metric_name",), ("ref_arguments",), ("schedule",), ("argument_signature",),
-                ]
-                self._rows = [
-                    r for r in self.data["dmf_refs"] if f"{r[4]}'" in sql or r[4] is None
-                ]
+                self.description = [(c,) for c in _DMF_COLUMNS]
+                self._rows = [r for r in rows if f".{r[4]}'" in sql.upper()]
                 return
             return super().execute(sql, params)
 
@@ -648,70 +658,84 @@ def _import_with_dmfs(monkeypatch, references):
         def cursor(self):
             return _Cur(self.data)
 
-    monkeypatch.setattr(si, "_connect", lambda import_args: _Conn(_dmf_data(references)))
+    monkeypatch.setattr(si, "_connect", lambda import_args: _Conn(_fake_data()))
     return import_snowflake({"database": "DB", "schema": "SCH", "account": "ACME"})
 
 
-def test_library_dmfs_import_as_quality_rules(monkeypatch):
-    contract = _import_with_dmfs(monkeypatch, [
-        # (metric_name, ref_arguments, schedule, signature, table)
-        ("SNOWFLAKE.CORE.ROW_COUNT", "[]", "USING CRON 0 6 * * * UTC", None, "CUSTOMER"),
-        ("SNOWFLAKE.CORE.NULL_COUNT", '[{"columnName":"ID"}]', None, None, "CUSTOMER"),
-    ])
-    customer = {o.name: o for o in contract.schema_}["CUSTOMER"]
-    assert customer.quality[0].type == "library"
-    assert customer.quality[0].metric == "rowCount"
-    # The Snowflake clause is reduced to the bare cron the contract stores.
-    assert customer.quality[0].schedule == "0 6 * * *"
-    assert customer.quality[0].scheduler == "cron"
+def _obj(contract, name="CUSTOMER"):
+    return {o.name: o for o in contract.schema_}[name]
 
-    id_col = {p.name: p for p in customer.properties}["ID"]
-    assert id_col.quality[0].metric == "nullValues"
+
+def test_core_dmfs_import_as_quality_rules(monkeypatch):
+    contract = _import_with_dmfs(monkeypatch, _REAL_ROWS)
+    customer = _obj(contract)
+
+    id_rule = {p.name: p for p in customer.properties}["ID"].quality[0]
+    assert id_rule.type == "library"
+    assert id_rule.metric == "nullValues"
+    # `0 */1 * * * UTC` has no USING CRON prefix and a trailing timezone.
+    assert id_rule.schedule == "0 */1 * * *"
+    assert id_rule.scheduler == "cron"
+
+
+def test_accepted_values_recovers_its_allowed_set(monkeypatch):
+    contract = _import_with_dmfs(monkeypatch, _REAL_ROWS)
+    rule = {p.name: p for p in _obj(contract).properties}["EMAIL"].quality[0]
+    assert rule.metric == "invalidValues"
+    assert rule.arguments == {"validValues": ["a", "b"]}
+
+
+def test_values_domain_entry_is_not_mistaken_for_a_column(monkeypatch):
+    """REF_ARGUMENTS mixes domains; taking every `name` would treat the predicate text
+    as a column name."""
+    contract = _import_with_dmfs(monkeypatch, _REAL_ROWS)
+    columns_with_quality = [p.name for p in _obj(contract).properties if p.quality]
+    assert columns_with_quality == ["ID", "EMAIL"]
+
+
+def test_non_in_predicate_is_preserved_as_custom(monkeypatch):
+    """`AGE BETWEEN 0 AND 150` has no ODCS equivalent — flattening it into a bare
+    `invalidValues` would assert something different from what Snowflake enforces."""
+    contract = _import_with_dmfs(monkeypatch, [
+        ("SNOWFLAKE", "CORE", "ACCEPTED_VALUES", "TABLE(NUMBER)", "CUSTOMER",
+         '[{"domain":"COLUMN","name":"EMAIL"},'
+         '{"domain":"VALUES","name":"AGE BETWEEN 0 AND 150"}]', None),
+    ])
+    rule = {p.name: p for p in _obj(contract).properties}["EMAIL"].quality[0]
+    assert rule.type == "custom"
+    assert rule.engine == "snowflake"
+    assert rule.implementation["condition"] == "AGE BETWEEN 0 AND 150"
 
 
 def test_freshness_imports_as_an_sla_not_a_quality_rule(monkeypatch):
-    contract = _import_with_dmfs(monkeypatch, [
-        ("SNOWFLAKE.CORE.FRESHNESS", "[]", None, None, "CUSTOMER"),
-    ])
+    contract = _import_with_dmfs(monkeypatch, _REAL_ROWS)
     assert contract.slaProperties[0].property == "latency"
     assert contract.slaProperties[0].element == "DB.SCH.CUSTOMER"
-    customer = {o.name: o for o in contract.schema_}["CUSTOMER"]
-    assert not customer.quality
+    assert not _obj(contract).quality
 
 
 def test_blank_count_imports_as_a_check_tagged_sql_rule(monkeypatch):
     contract = _import_with_dmfs(monkeypatch, [
-        ("SNOWFLAKE.CORE.BLANK_COUNT", '[{"columnName":"EMAIL"}]', None, None, "CUSTOMER"),
+        ("SNOWFLAKE", "CORE", "BLANK_COUNT", "TABLE(NUMBER)", "CUSTOMER",
+         '[{"domain":"COLUMN","name":"EMAIL"}]', None),
     ])
-    customer = {o.name: o for o in contract.schema_}["CUSTOMER"]
-    rule = {p.name: p for p in customer.properties}["EMAIL"].quality[0]
+    rule = {p.name: p for p in _obj(contract).properties}["EMAIL"].quality[0]
     assert rule.type == "sql"
     assert rule.customProperties[0].property == "check"
     assert rule.customProperties[0].value == "blankCount"
     assert "TRIM(CAST(${column} AS STRING)) = ''" in rule.query
 
 
-def test_accepted_values_recovers_its_allowed_set(monkeypatch):
+def test_user_defined_metric_imports_as_odcs_custom(monkeypatch):
+    """A DMF outside SNOWFLAKE.CORE is engine-specific — including one that shadows a
+    built-in name, which is why the namespace is part of the identity."""
     contract = _import_with_dmfs(monkeypatch, [
-        ("SNOWFLAKE.CORE.ACCEPTED_VALUES", '[{"columnName":"EMAIL"}]', None,
-         "(EMAIL VARCHAR, EMAIL -> EMAIL IN ('A', 'B'))", "CUSTOMER"),
+        ("MY_DB", "GOV", "NULL_COUNT", "TABLE(NUMBER)", "CUSTOMER", "[]", None),
     ])
-    customer = {o.name: o for o in contract.schema_}["CUSTOMER"]
-    rule = {p.name: p for p in customer.properties}["EMAIL"].quality[0]
-    assert rule.metric == "invalidValues"
-    assert rule.arguments == {"validValues": ["A", "B"]}
-
-
-def test_unknown_dmf_imports_as_odcs_custom(monkeypatch):
-    """A user-defined DMF has no portable equivalent, so ODCS `type: custom` with an
-    `engine` is the honest representation rather than a fabricated sql query."""
-    contract = _import_with_dmfs(monkeypatch, [
-        ("MY_DB.GOV.WEIRD_METRIC", "[]", None, None, "CUSTOMER"),
-    ])
-    customer = {o.name: o for o in contract.schema_}["CUSTOMER"]
-    assert customer.quality[0].type == "custom"
-    assert customer.quality[0].engine == "snowflake"
-    assert customer.quality[0].implementation == "WEIRD_METRIC"
+    rule = _obj(contract).quality[0]
+    assert rule.type == "custom"
+    assert rule.engine == "snowflake"
+    assert rule.implementation == "MY_DB.GOV.NULL_COUNT"
 
 
 def test_no_quality_flag_skips_the_dmf_query(monkeypatch):
@@ -737,16 +761,13 @@ def test_applied_quality_survives_a_full_round_trip(monkeypatch):
     """export → (Snowflake) → import must reproduce the same ODCS constructs."""
     from dcx.exporters.snowflake import to_snowflake_full_sql
 
-    contract = _import_with_dmfs(monkeypatch, [
-        ("SNOWFLAKE.CORE.ROW_COUNT", "[]", None, None, "CUSTOMER"),
-        ("SNOWFLAKE.CORE.NULL_COUNT", '[{"columnName":"ID"}]', None, None, "CUSTOMER"),
-        ("SNOWFLAKE.CORE.FRESHNESS", "[]", None, None, "CUSTOMER"),
-    ])
+    contract = _import_with_dmfs(monkeypatch, _REAL_ROWS)
     contract.slaProperties[0].value = 4
     contract.slaProperties[0].unit = "h"
 
     sql = to_snowflake_full_sql(contract, include_quality=True, include_ddl=False)
-    assert "SNOWFLAKE.CORE.ROW_COUNT ON ()" in sql
     assert "SNOWFLAKE.CORE.NULL_COUNT ON (ID)" in sql
     assert "SNOWFLAKE.CORE.FRESHNESS ON ()" in sql
     assert "VALUE <= 14400" in sql
+    assert "SNOWFLAKE.CORE.ACCEPTED_VALUES ON (EMAIL, EMAIL -> EMAIL IN ('a', 'b'))" in sql
+    assert "SET DATA_METRIC_SCHEDULE = 'USING CRON 0 */1 * * * UTC';" in sql
