@@ -20,6 +20,8 @@ from typing import Any, Optional
 
 from datacontract.imports.importer import Importer
 from open_data_contract_standard.model import (
+    CustomProperty,
+    DataQuality,
     OpenDataContractStandard,
     SchemaObject,
     SchemaProperty,
@@ -79,6 +81,22 @@ _TABLE_TYPE_TO_PHYSICAL: dict[str, str] = {
     "EXTERNAL TABLE": "external table",
 }
 
+# Fully-qualified Snowflake system DMF → ODCS library metric name.
+# Mirrors _LIBRARY_METRIC_TO_DMF in dcx.exporters.snowflake (inverted).
+_LIBRARY_DMF_TO_METRIC: dict[str, str] = {
+    "SNOWFLAKE.CORE.ROW_COUNT":       "rowCount",
+    "SNOWFLAKE.CORE.NULL_COUNT":      "nullValues",
+    "SNOWFLAKE.CORE.DUPLICATE_COUNT": "duplicateValues",
+    "SNOWFLAKE.CORE.ACCEPTED_VALUES": "invalidValues",
+}
+
+# DMFs that map to engine-neutral check names (type: custom with a `check` property).
+# Mirrors _CHECK_TO_DMF in dcx.exporters.snowflake (inverted).
+_CHECK_DMF_TO_NAME: dict[str, str] = {
+    "SNOWFLAKE.CORE.BLANK_COUNT": "blankCount",
+    "SNOWFLAKE.CORE.FRESHNESS":   "freshness",
+}
+
 
 def _physical_object_type(table_type: Optional[str]) -> str:
     """Map a Snowflake TABLE_TYPE to an ODCS `physicalType` (defaults to `table`)."""
@@ -114,6 +132,8 @@ def build_snowflake_contract(
     column_tags: Optional[dict] = None,
     table_tags: Optional[dict] = None,
     table_types: Optional[dict] = None,
+    table_quality: Optional[dict] = None,
+    column_quality: Optional[dict] = None,
     server_name: str = "production",
 ) -> OpenDataContractStandard:
     """Build an ODCS contract from already-fetched Snowflake metadata.
@@ -125,11 +145,15 @@ def build_snowflake_contract(
     `column_tags`: (table, column) → list of `DB.SCHEMA.NAME=VALUE` tag strings.
     `table_tags`: table → list of `DB.SCHEMA.NAME=VALUE` tag strings.
     `table_types`: table → Snowflake TABLE_TYPE (e.g. `VIEW`) → sets `physicalType`.
+    `table_quality`: table_name → list[DataQuality] (table-scope DMF rules).
+    `column_quality`: (table, column) → list[DataQuality] (column-scope DMF rules).
     `server_info`: account, database, schema, warehouse.
     """
     column_tags = column_tags or {}
     table_tags = table_tags or {}
     table_types = table_types or {}
+    table_quality = table_quality or {}
+    column_quality = column_quality or {}
     # Group columns by table, preserving first-seen order.
     tables: dict[str, list[dict]] = {}
     for col in columns:
@@ -172,6 +196,10 @@ def build_snowflake_contract(
             if ctags:
                 prop.tags = ctags
 
+            cquality = column_quality.get((table_name, col["name"]))
+            if cquality:
+                prop.quality = cquality
+
             props.append(prop)
 
         obj = SchemaObject(
@@ -184,6 +212,9 @@ def build_snowflake_contract(
         ttags = table_tags.get(table_name)
         if ttags:
             obj.tags = ttags
+        tquality = table_quality.get(table_name)
+        if tquality:
+            obj.quality = tquality
         schema_objects.append(obj)
 
     database = server_info.get("database")
@@ -403,6 +434,94 @@ def _fetch_tags(conn, database: str, schema: str, table_names: list[str]):
     return column_tags, table_tags
 
 
+def _col_from_ref_args(ref_args) -> Optional[str]:
+    """Extract the measured column name from a REF_ARGUMENTS VARIANT, or None for table-scope DMFs."""
+    if not ref_args:
+        return None
+    if isinstance(ref_args, list) and ref_args:
+        first = ref_args[0]
+        if isinstance(first, dict):
+            return first.get("name") or first.get("column_name")
+        if isinstance(first, str):
+            return first
+    return None
+
+
+def _dmf_to_quality(full_dmf: str) -> DataQuality:
+    """Map a fully-qualified Snowflake DMF name to an ODCS DataQuality object.
+
+    Known system DMFs produce `library` or `custom` rules matching the exporter
+    convention so import → apply round-trips cleanly. Unknown DMFs are preserved
+    as `type: custom` with a `snowflakeDmf` hint so the UI can still show them.
+    """
+    metric = _LIBRARY_DMF_TO_METRIC.get(full_dmf)
+    if metric:
+        return DataQuality(type="library", metric=metric)
+    check = _CHECK_DMF_TO_NAME.get(full_dmf)
+    if check:
+        return DataQuality(
+            type="custom",
+            customProperties=[CustomProperty(property="check", value=check)],
+        )
+    return DataQuality(
+        type="custom",
+        customProperties=[CustomProperty(property="snowflakeDmf", value=full_dmf)],
+    )
+
+
+def _fetch_dmf_rules(conn, database: str, schema: str, table_names: list[str]):
+    """Read DMF associations via INFORMATION_SCHEMA.DATA_METRIC_FUNCTION_REFERENCES.
+
+    Returns (table_quality, column_quality):
+    - table_quality:  table_name → list[DataQuality]  (table-scope DMFs)
+    - column_quality: (table_name, column_name) → list[DataQuality]  (column-scope DMFs)
+
+    Requires Snowflake Enterprise tier. On any failure warns and returns empty dicts
+    (graceful degradation — identical pattern to _fetch_tags).
+    """
+    db = database.upper()
+    sch = schema.upper()
+    table_quality: dict[str, list] = {}
+    column_quality: dict[tuple, list] = {}
+    errors: list[str] = []
+
+    cur = conn.cursor()
+    try:
+        for table in table_names:
+            fq = f"{db}.{sch}.{table.upper()}"
+            try:
+                cur.execute(
+                    f'SELECT * FROM TABLE("{db}".INFORMATION_SCHEMA.'
+                    f"DATA_METRIC_FUNCTION_REFERENCES("
+                    f"REF_ENTITY_NAME => '{fq}', REF_ENTITY_DOMAIN => 'table'))"
+                )
+                idx = {c[0].lower(): i for i, c in enumerate(cur.description)}
+                for row in cur.fetchall():
+                    dmf_db  = str(row[idx["metric_database_name"]]).upper()
+                    dmf_sch = str(row[idx["metric_schema_name"]]).upper()
+                    dmf_fn  = str(row[idx["metric_name"]]).upper()
+                    full_dmf = f"{dmf_db}.{dmf_sch}.{dmf_fn}"
+                    ref_args = row[idx["ref_arguments"]] if "ref_arguments" in idx else None
+                    col_name = _col_from_ref_args(ref_args)
+
+                    quality = _dmf_to_quality(full_dmf)
+                    if col_name:
+                        column_quality.setdefault((table, col_name), []).append(quality)
+                    else:
+                        table_quality.setdefault(table, []).append(quality)
+            except Exception as exc:  # noqa: BLE001 — graceful degradation
+                errors.append(str(exc))
+    finally:
+        cur.close()
+
+    if errors and not table_quality and not column_quality:
+        _warn(
+            "Could not read Snowflake DMF rules (Enterprise tier required, or role "
+            f"lacks access to INFORMATION_SCHEMA): {errors[0]}"
+        )
+    return table_quality, column_quality
+
+
 def _contract_from_connection(
     conn,
     *,
@@ -423,11 +542,14 @@ def _contract_from_connection(
             + (f" for tables {tables}." if tables else ".")
         )
 
+    table_names = list(dict.fromkeys(c["table"] for c in columns))
+
     column_tags: dict = {}
     table_tags: dict = {}
     if fetch_tags:
-        table_names = list(dict.fromkeys(c["table"] for c in columns))
         column_tags, table_tags = _fetch_tags(conn, database, schema, table_names)
+
+    table_quality, column_quality = _fetch_dmf_rules(conn, database, schema, table_names)
 
     return build_snowflake_contract(
         server_info=server_info,
@@ -437,6 +559,8 @@ def _contract_from_connection(
         column_tags=column_tags,
         table_tags=table_tags,
         table_types=table_types,
+        table_quality=table_quality,
+        column_quality=column_quality,
         server_name=server_name,
     )
 
