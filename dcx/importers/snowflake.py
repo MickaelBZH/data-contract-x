@@ -14,6 +14,8 @@ server would import using its own single set of credentials for every caller —
 multi-tenant data-access concern. Live importers are CLI-only for v1.
 """
 
+import json
+import logging
 import os
 import sys
 from typing import Any, Optional
@@ -35,6 +37,8 @@ from dcx.apply.snowflake import (
     SNOWFLAKE_NETWORK_TIMEOUT,
 )
 from dcx.exporters.snowflake import _view_select_body
+
+logger = logging.getLogger(__name__)
 
 
 class SnowflakeImportError(Exception):
@@ -90,8 +94,39 @@ def _physical_object_type(table_type: Optional[str]) -> str:
     return _TABLE_TYPE_TO_PHYSICAL.get(tt, tt.lower())
 
 
-def _physical_type(data_type: Optional[str], char_len, prec, scale) -> str:
-    """Reconstruct a canonical Snowflake type string for `physicalType`."""
+def _vector_type_from_show_columns(payload: Any) -> Optional[str]:
+    """Reconstruct `VECTOR(<element>, <dim>)` from a `SHOW COLUMNS` data_type payload.
+
+    `INFORMATION_SCHEMA.COLUMNS.DATA_TYPE` reports a bare `VECTOR` for vector columns —
+    the element type and dimension appear nowhere in that view — and a bare `VECTOR` is
+    not valid DDL. A contract imported from such a table therefore produced a
+    `CREATE TABLE` Snowflake refuses to parse. `SHOW COLUMNS` carries the complete type
+    as a JSON payload, so we recover it from there.
+
+    Returns None for anything that is not a confidently-reconstructable VECTOR, leaving
+    the INFORMATION_SCHEMA-derived type untouched — this only ever adds precision.
+    """
+    try:
+        info = json.loads(payload)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(info, dict) or str(info.get("type", "")).upper() != "VECTOR":
+        return None
+    element = info.get("elementType") or info.get("element_type")
+    dimension = info.get("dimension")
+    if not element or not isinstance(dimension, int) or isinstance(dimension, bool):
+        return None
+    return f"VECTOR({str(element).upper()}, {dimension})"
+
+
+def _physical_type(data_type: Optional[str], char_len, prec, scale, full_type=None) -> str:
+    """Reconstruct a canonical Snowflake type string for `physicalType`.
+
+    `full_type` (from `SHOW COLUMNS`) wins when present: it is the only source for types
+    INFORMATION_SCHEMA cannot express, such as `VECTOR(FLOAT, 256)`.
+    """
+    if full_type:
+        return full_type
     dt = (data_type or "").upper()
     if dt in ("TEXT", "STRING", "VARCHAR", "CHAR", "CHARACTER"):
         return f"VARCHAR({char_len})" if char_len else "VARCHAR"
@@ -117,6 +152,7 @@ def build_snowflake_contract(
     table_tags: Optional[dict] = None,
     table_types: Optional[dict] = None,
     view_definitions: Optional[dict] = None,
+    full_types: Optional[dict] = None,
     server_name: str = "production",
 ) -> OpenDataContractStandard:
     """Build an ODCS contract from already-fetched Snowflake metadata.
@@ -129,12 +165,15 @@ def build_snowflake_contract(
     `table_tags`: table → list of `DB.SCHEMA.NAME=VALUE` tag strings.
     `table_types`: table → Snowflake TABLE_TYPE (e.g. `VIEW`) → sets `physicalType`.
     `view_definitions`: view → SELECT body → stored as a `viewDefinition` customProperty.
+    `full_types`: (table, column) → complete Snowflake type, for types INFORMATION_SCHEMA
+    cannot express (e.g. `VECTOR(FLOAT, 256)`); overrides the reconstructed type.
     `server_info`: account, database, schema, warehouse.
     """
     column_tags = column_tags or {}
     table_tags = table_tags or {}
     table_types = table_types or {}
     view_definitions = view_definitions or {}
+    full_types = full_types or {}
     # Group columns by table, preserving first-seen order.
     tables: dict[str, list[dict]] = {}
     for col in columns:
@@ -151,6 +190,7 @@ def build_snowflake_contract(
                 physicalType=_physical_type(
                     col.get("data_type"), col.get("char_len"),
                     col.get("precision"), col.get("scale"),
+                    full_types.get((table_name, col["name"])),
                 ),
                 logicalType=logical,
             )
@@ -338,10 +378,25 @@ def _fetch_metadata(conn, database: str, schema: str, tables: Optional[list[str]
             tname = row[idx["table_name"]]
             cname = row[idx["column_name"]]
             primary_keys.setdefault(tname, set()).add(cname)
+
+        # --- full types INFORMATION_SCHEMA can't express (VECTOR's element/dimension) ---
+        # Best-effort: SHOW COLUMNS needs its own privileges, and the contract is still
+        # correct without it for every type INFORMATION_SCHEMA does describe.
+        full_types: dict[tuple[str, str], str] = {}
+        try:
+            cur.execute(f'SHOW COLUMNS IN SCHEMA "{db}"."{sch}"')
+            idx = {c[0].lower(): i for i, c in enumerate(cur.description)}
+            for row in cur.fetchall():
+                rendered = _vector_type_from_show_columns(row[idx["data_type"]])
+                if rendered:
+                    full_types[(row[idx["table_name"]], row[idx["column_name"]])] = rendered
+        except Exception:
+            logger.debug("SHOW COLUMNS unavailable; parameterised types may be incomplete",
+                         exc_info=True)
     finally:
         cur.close()
 
-    return columns, primary_keys, table_comments, table_types, view_definitions
+    return columns, primary_keys, table_comments, table_types, view_definitions, full_types
 
 
 def _fq_tag(row: tuple, idx: dict) -> str:
@@ -432,7 +487,7 @@ def _contract_from_connection(
     server_name: str,
 ) -> OpenDataContractStandard:
     """Read metadata over an open connection and build the contract (caller closes conn)."""
-    columns, primary_keys, table_comments, table_types, view_definitions = _fetch_metadata(
+    columns, primary_keys, table_comments, table_types, view_definitions, full_types = _fetch_metadata(
         conn, database, schema, tables,
     )
     if not columns:
@@ -456,6 +511,7 @@ def _contract_from_connection(
         table_tags=table_tags,
         table_types=table_types,
         view_definitions=view_definitions,
+        full_types=full_types,
         server_name=server_name,
     )
 
