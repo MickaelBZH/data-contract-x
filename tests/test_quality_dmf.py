@@ -490,3 +490,62 @@ def test_cursors_are_always_closed(failures):
     conn = _Conn(failures=list(failures))
     _execute_statement(conn, _ADD)
     assert conn.open_cursors == 0
+
+
+# === Table-scope metrics authored under a column ============================
+
+
+_COLUMN_LEVEL_ROWCOUNT = """
+schema:
+  - name: T
+    physicalType: table
+    properties:
+      - name: a
+        physicalType: STRING
+        quality:
+          - type: library
+            metric: rowCount
+            mustBeGreaterThan: 0
+      - name: b
+        physicalType: STRING
+        quality:
+          - type: library
+            metric: rowCount
+            mustBeGreaterThan: 0
+"""
+
+
+def test_table_scope_metric_is_not_named_after_a_column():
+    """`rowCount` binds to the table (`ON ()`) even when authored under a column, so
+    naming its expectation after that column would misdescribe what is enforced."""
+    sql = _quality_sql(_COLUMN_LEVEL_ROWCOUNT)
+    assert "EXPECTATION EXP__DCX__ROW_COUNT__GREATERTHAN0 (VALUE > 0);" in sql
+    assert "EXP__DCX__A__ROW_COUNT" not in sql
+
+
+def test_repeated_table_scope_rules_collapse_to_one_statement():
+    """Two columns carrying the same rowCount rule produce one association, not two —
+    Snowflake would treat the second as already-present anyway."""
+    sql = _quality_sql(_COLUMN_LEVEL_ROWCOUNT)
+    assert sql.count("ADD DATA METRIC FUNCTION SNOWFLAKE.CORE.ROW_COUNT ON ()") == 1
+
+
+def test_distinct_thresholds_on_one_metric_are_both_emitted():
+    """Deduplication must key on the whole statement: different thresholds are
+    genuinely different expectations."""
+    sql = _quality_sql(
+        """
+        schema:
+          - name: T
+            physicalType: table
+            quality:
+              - type: library
+                metric: rowCount
+                mustBeGreaterThan: 0
+              - type: library
+                metric: rowCount
+                mustBeLessThan: 1000
+        """
+    )
+    assert "EXP__DCX__ROW_COUNT__GREATERTHAN0 (VALUE > 0)" in sql
+    assert "EXP__DCX__ROW_COUNT__LESSTHAN1000 (VALUE < 1000)" in sql
