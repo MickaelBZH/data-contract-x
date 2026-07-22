@@ -627,9 +627,12 @@ def test_show_columns_failure_is_not_fatal(monkeypatch):
 # SCHEDULE_STATUS, PROPERTIES, ...) are irrelevant here.
 _DMF_COLUMNS = [
     "metric_database_name", "metric_schema_name", "metric_name",
-    "metric_signature", "ref_entity_name", "ref_arguments", "schedule",
-    "expectation",
+    "metric_signature", "ref_entity_name", "ref_arguments", "schedule", "ref_id",
 ]
+# Expectations come from their own table function, joined on ref_id. Fixture rows
+# declare the expectation inline as a last element and the fake connection splits it
+# across the two calls, exactly as Snowflake reports it.
+_EXPECTATION_COLUMNS = ["ref_id", "expectation_name", "expectation_expression"]
 
 # Rows captured verbatim from a live account (SNOWFLAKE.CORE metrics on LOAD.CUSTOMERS).
 # Note REF_ARGUMENTS mixes COLUMN and VALUES domains, and SCHEDULE carries a trailing
@@ -649,9 +652,18 @@ def _import_with_dmfs(monkeypatch, rows):
 
     class _Cur(_FakeCursor):
         def execute(self, sql, params=None):
+            matching = [
+                (f"ref{i}", r) for i, r in enumerate(rows) if f".{r[4]}'" in sql.upper()
+            ]
             if "DATA_METRIC_FUNCTION_REFERENCES" in sql:
                 self.description = [(c,) for c in _DMF_COLUMNS]
-                self._rows = [r for r in rows if f".{r[4]}'" in sql.upper()]
+                self._rows = [tuple(r[:7]) + (ref_id,) for ref_id, r in matching]
+                return
+            if "DATA_METRIC_FUNCTION_EXPECTATIONS" in sql:
+                self.description = [(c,) for c in _EXPECTATION_COLUMNS]
+                self._rows = [
+                    (ref_id, "EXP__DCX__X", r[7]) for ref_id, r in matching if len(r) > 7 and r[7]
+                ]
                 return
             return super().execute(sql, params)
 
@@ -837,3 +849,43 @@ def test_operators_survive_a_full_round_trip(monkeypatch):
     assert "EXPECTATION EXP__DCX__ID__NONULLS (VALUE = 0);" in sql
     assert "EXPECTATION EXP__DCX__ROW_COUNT__GREATERTHAN0 (VALUE > 0);" in sql
     assert "EXPECTATION EXP__DCX__FRESHNESS__LESSTHANOREQUALTO14400 (VALUE <= 14400);" in sql
+
+
+def test_expectation_is_joined_on_ref_id(monkeypatch):
+    """Two metrics on the same table must each get their own expectation — the join key
+    is ref_id, not the table."""
+    contract = _import_with_dmfs(monkeypatch, [
+        ("SNOWFLAKE", "CORE", "NULL_COUNT", "TABLE(NUMBER)", "CUSTOMER",
+         '[{"domain":"COLUMN","name":"ID"}]', None, "VALUE = 0"),
+        ("SNOWFLAKE", "CORE", "ROW_COUNT", "", "CUSTOMER", "[]", None, "VALUE > 100"),
+    ])
+    customer = _obj(contract)
+    assert {p.name: p for p in customer.properties}["ID"].quality[0].mustBe == 0
+    assert customer.quality[0].mustBeGreaterThan == 100
+
+
+def test_expectations_query_failure_is_not_fatal(monkeypatch):
+    """The expectations table function needs its own privileges; without it the metrics
+    must still import, just without thresholds."""
+    import dcx.importers.snowflake as si
+
+    class _Cur(_FakeCursor):
+        def execute(self, sql, params=None):
+            if "DATA_METRIC_FUNCTION_EXPECTATIONS" in sql:
+                raise RuntimeError("Insufficient privileges")
+            if "DATA_METRIC_FUNCTION_REFERENCES" in sql:
+                self.description = [(c,) for c in _DMF_COLUMNS]
+                self._rows = [("SNOWFLAKE", "CORE", "NULL_COUNT", "TABLE(NUMBER)",
+                               "CUSTOMER", '[{"domain":"COLUMN","name":"ID"}]', None, "r0")]
+                return
+            return super().execute(sql, params)
+
+    class _Conn(_FakeConn):
+        def cursor(self):
+            return _Cur(self.data)
+
+    monkeypatch.setattr(si, "_connect", lambda import_args: _Conn(_fake_data()))
+    contract = import_snowflake({"database": "DB", "schema": "SCH", "account": "ACME"})
+    rule = {p.name: p for p in _obj(contract).properties}["ID"].quality[0]
+    assert rule.metric == "nullValues"
+    assert rule.mustBe is None
