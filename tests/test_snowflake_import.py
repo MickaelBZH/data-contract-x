@@ -628,6 +628,7 @@ def test_show_columns_failure_is_not_fatal(monkeypatch):
 _DMF_COLUMNS = [
     "metric_database_name", "metric_schema_name", "metric_name",
     "metric_signature", "ref_entity_name", "ref_arguments", "schedule",
+    "expectation",
 ]
 
 # Rows captured verbatim from a live account (SNOWFLAKE.CORE metrics on LOAD.CUSTOMERS).
@@ -636,10 +637,10 @@ _DMF_COLUMNS = [
 _REAL_ROWS = [
     ("SNOWFLAKE", "CORE", "ACCEPTED_VALUES", "TABLE(NUMBER)", "CUSTOMER",
      '[{"domain":"COLUMN","id":"591995302","name":"EMAIL"},'
-     '{"domain":"VALUES","name":"EMAIL IN (\'a\', \'b\')"}]', "0 */1 * * * UTC"),
-    ("SNOWFLAKE", "CORE", "FRESHNESS", "", "CUSTOMER", "[]", "0 */1 * * * UTC"),
+     '{"domain":"VALUES","name":"EMAIL IN (\'a\', \'b\')"}]', "0 */1 * * * UTC", "VALUE = 0"),
+    ("SNOWFLAKE", "CORE", "FRESHNESS", "", "CUSTOMER", "[]", "0 */1 * * * UTC", "VALUE <= 14400"),
     ("SNOWFLAKE", "CORE", "NULL_COUNT", "TABLE(NUMBER)", "CUSTOMER",
-     '[{"domain":"COLUMN","id":"591995298","name":"ID"}]', "0 */1 * * * UTC"),
+     '[{"domain":"COLUMN","id":"591995298","name":"ID"}]', "0 */1 * * * UTC", "VALUE = 0"),
 ]
 
 
@@ -699,7 +700,7 @@ def test_non_in_predicate_is_preserved_as_custom(monkeypatch):
     contract = _import_with_dmfs(monkeypatch, [
         ("SNOWFLAKE", "CORE", "ACCEPTED_VALUES", "TABLE(NUMBER)", "CUSTOMER",
          '[{"domain":"COLUMN","name":"EMAIL"},'
-         '{"domain":"VALUES","name":"AGE BETWEEN 0 AND 150"}]', None),
+         '{"domain":"VALUES","name":"AGE BETWEEN 0 AND 150"}]', None, None),
     ])
     rule = {p.name: p for p in _obj(contract).properties}["EMAIL"].quality[0]
     assert rule.type == "custom"
@@ -717,7 +718,7 @@ def test_freshness_imports_as_an_sla_not_a_quality_rule(monkeypatch):
 def test_blank_count_imports_as_a_check_tagged_sql_rule(monkeypatch):
     contract = _import_with_dmfs(monkeypatch, [
         ("SNOWFLAKE", "CORE", "BLANK_COUNT", "TABLE(NUMBER)", "CUSTOMER",
-         '[{"domain":"COLUMN","name":"EMAIL"}]', None),
+         '[{"domain":"COLUMN","name":"EMAIL"}]', None, None),
     ])
     rule = {p.name: p for p in _obj(contract).properties}["EMAIL"].quality[0]
     assert rule.type == "sql"
@@ -730,7 +731,7 @@ def test_user_defined_metric_imports_as_odcs_custom(monkeypatch):
     """A DMF outside SNOWFLAKE.CORE is engine-specific — including one that shadows a
     built-in name, which is why the namespace is part of the identity."""
     contract = _import_with_dmfs(monkeypatch, [
-        ("MY_DB", "GOV", "NULL_COUNT", "TABLE(NUMBER)", "CUSTOMER", "[]", None),
+        ("MY_DB", "GOV", "NULL_COUNT", "TABLE(NUMBER)", "CUSTOMER", "[]", None, None),
     ])
     rule = _obj(contract).quality[0]
     assert rule.type == "custom"
@@ -762,12 +763,77 @@ def test_applied_quality_survives_a_full_round_trip(monkeypatch):
     from dcx.exporters.snowflake import to_snowflake_full_sql
 
     contract = _import_with_dmfs(monkeypatch, _REAL_ROWS)
-    contract.slaProperties[0].value = 4
-    contract.slaProperties[0].unit = "h"
-
     sql = to_snowflake_full_sql(contract, include_quality=True, include_ddl=False)
     assert "SNOWFLAKE.CORE.NULL_COUNT ON (ID)" in sql
     assert "SNOWFLAKE.CORE.FRESHNESS ON ()" in sql
     assert "VALUE <= 14400" in sql
     assert "SNOWFLAKE.CORE.ACCEPTED_VALUES ON (EMAIL, EMAIL -> EMAIL IN ('a', 'b'))" in sql
     assert "SET DATA_METRIC_SCHEDULE = 'USING CRON 0 */1 * * * UTC';" in sql
+
+
+# === Expectations → ODCS operators ==========================================
+
+
+@pytest.mark.parametrize("expression,expected", [
+    ("VALUE = 0", ("mustBe", 0)),
+    ("VALUE <> 5", ("mustNotBe", 5)),
+    ("VALUE > 0", ("mustBeGreaterThan", 0)),
+    ("VALUE >= 10", ("mustBeGreaterOrEqualTo", 10)),
+    ("VALUE < 3", ("mustBeLessThan", 3)),
+    ("VALUE <= 14400", ("mustBeLessOrEqualTo", 14400)),
+    ("10 <= VALUE AND VALUE <= 20", ("mustBeBetween", [10, 20])),
+    ("VALUE < 1 OR VALUE > 9", ("mustNotBeBetween", [1, 9])),
+    ("(VALUE = 0)", ("mustBe", 0)),          # parenthesised, as Snowflake stores it
+    ("VALUE <= 4.5", ("mustBeLessOrEqualTo", 4.5)),
+    ("VALUE IS NOT NULL", None),             # unparseable predicate
+    (None, None),
+])
+def test_operator_parsed_from_expectation(expression, expected):
+    from dcx.importers.snowflake import _operator_from_expectation
+    assert _operator_from_expectation(expression) == expected
+
+
+def test_expectation_restores_the_rule_threshold(monkeypatch):
+    contract = _import_with_dmfs(monkeypatch, [
+        ("SNOWFLAKE", "CORE", "NULL_COUNT", "TABLE(NUMBER)", "CUSTOMER",
+         '[{"domain":"COLUMN","name":"ID"}]', None, "VALUE = 0"),
+    ])
+    rule = {p.name: p for p in _obj(contract).properties}["ID"].quality[0]
+    assert rule.metric == "nullValues"
+    assert rule.mustBe == 0
+
+
+def test_freshness_expectation_becomes_the_sla_value(monkeypatch):
+    contract = _import_with_dmfs(monkeypatch, [
+        ("SNOWFLAKE", "CORE", "FRESHNESS", "", "CUSTOMER", "[]", None, "VALUE <= 14400"),
+    ])
+    sla = contract.slaProperties[0]
+    assert (sla.property, sla.value, sla.unit) == ("latency", 14400, "s")
+
+
+def test_missing_expectation_leaves_the_rule_without_a_threshold(monkeypatch):
+    """Better than inventing one: the rule records what is attached, and the warning
+    says it cannot fail anything yet."""
+    contract = _import_with_dmfs(monkeypatch, [
+        ("SNOWFLAKE", "CORE", "NULL_COUNT", "TABLE(NUMBER)", "CUSTOMER",
+         '[{"domain":"COLUMN","name":"ID"}]', None, None),
+    ])
+    rule = {p.name: p for p in _obj(contract).properties}["ID"].quality[0]
+    assert rule.mustBe is None
+
+
+def test_operators_survive_a_full_round_trip(monkeypatch):
+    """The gap this closes: export → Snowflake → import → export must reproduce the
+    same EXPECTATION, not just the same metric."""
+    from dcx.exporters.snowflake import to_snowflake_full_sql
+
+    contract = _import_with_dmfs(monkeypatch, [
+        ("SNOWFLAKE", "CORE", "NULL_COUNT", "TABLE(NUMBER)", "CUSTOMER",
+         '[{"domain":"COLUMN","name":"ID"}]', None, "VALUE = 0"),
+        ("SNOWFLAKE", "CORE", "ROW_COUNT", "", "CUSTOMER", "[]", None, "VALUE > 0"),
+        ("SNOWFLAKE", "CORE", "FRESHNESS", "", "CUSTOMER", "[]", None, "VALUE <= 14400"),
+    ])
+    sql = to_snowflake_full_sql(contract, include_quality=True, include_ddl=False)
+    assert "EXPECTATION EXP__DCX__ID__NONULLS (VALUE = 0);" in sql
+    assert "EXPECTATION EXP__DCX__ROW_COUNT__GREATERTHAN0 (VALUE > 0);" in sql
+    assert "EXPECTATION EXP__DCX__FRESHNESS__LESSTHANOREQUALTO14400 (VALUE <= 14400);" in sql
