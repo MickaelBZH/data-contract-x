@@ -40,6 +40,7 @@ from open_data_contract_standard.model import OpenDataContractStandard
 from pydantic import BaseModel, ConfigDict, Field, create_model
 
 from dcx import enrich as enrich_module
+from dcx import yaml_style  # noqa: F401  multi-line strings dump as block scalars
 from dcx.apply.snowflake import DdlMode
 from dcx.target import command as target_module
 

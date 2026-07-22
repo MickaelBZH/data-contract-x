@@ -13,6 +13,7 @@ from dcx.enrich import enrich_app
 from dcx.exporters import command  # noqa: F401  registers `export snowflake-full` + its exporter
 from dcx.importers import registry  # noqa: F401  registers live importers + their CLI commands
 from dcx.target import target_app
+from dcx import yaml_style  # noqa: F401  multi-line strings dump as block scalars
 
 # Commands defined by dcx (not by upstream datacontract-cli). The migration
 # shim that rewrites flags like `--format` and `--schema` was written for

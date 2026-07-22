@@ -257,8 +257,12 @@ def test_view_governed_as_view_not_table():
     # View governance uses VIEW keywords
     assert "COMMENT ON VIEW CUSTOMERS_V IS 'Curated view';" in sql
     assert "ALTER VIEW CUSTOMERS_V MODIFY COLUMN id SET TAG GOV.TAGS.PII = 'high';" in sql
-    # Table still uses TABLE keywords
+    # Snowflake can't set view column comments via ALTER → skipped with a note
+    assert "COMMENT ON COLUMN CUSTOMERS_V" not in sql
+    assert "-- NOTE: column comments for view CUSTOMERS_V" in sql
+    # Table still uses TABLE keywords, including its column comment
     assert "COMMENT ON TABLE CUSTOMERS IS 'Base table';" in sql
+    assert "COMMENT ON COLUMN CUSTOMERS.id IS 'pk';" in sql
 
 
 def test_view_comments_emitted_even_in_always_mode():
@@ -269,6 +273,114 @@ def test_view_comments_emitted_even_in_always_mode():
     assert "COMMENT ON VIEW CUSTOMERS_V IS 'Curated view';" in sql
     # the base table's comment is inline in CREATE TABLE, not standalone
     assert "COMMENT ON TABLE CUSTOMERS IS" not in sql
+
+
+_VIEW_WITH_DEF = textwrap.dedent(
+    """\
+    apiVersion: v3.1.0
+    kind: DataContract
+    id: c
+    name: C
+    version: 1.0.0
+    status: draft
+    schema:
+      - name: CUSTOMERS_V
+        physicalType: view
+        description: Curated customers
+        customProperties:
+          - property: viewDefinition
+            value: "SELECT id, email FROM customers WHERE active = TRUE"
+        properties:
+          - name: id
+            physicalType: NUMBER
+            description: surrogate key
+          - name: email
+            physicalType: VARCHAR
+            description: "customer's email"
+    """
+)
+
+
+def test_view_select_body_strips_full_ddl_header():
+    from dcx.exporters.snowflake import _view_select_body
+
+    raw = (
+        "create or replace   view DEV_DP_DB.load.v_core   \n"
+        "\n"
+        "   as (\n"
+        "    select id, name   \n"
+        "    from raw   \n"
+        "  );"
+    )
+    body = _view_select_body(raw)
+    # header gone, trailing whitespace/blank edges trimmed
+    assert not body.lower().startswith("create")
+    assert body.startswith("(")
+    assert "select id, name" in body
+    assert "   \n" not in body  # no trailing whitespace on lines
+    # a bare body passes through unchanged
+    assert _view_select_body("select 1") == "select 1"
+
+
+def test_view_definition_full_ddl_in_contract_exports_cleanly():
+    """A contract storing the full CREATE statement (Snowflake's VIEW_DEFINITION form)
+    still exports valid SQL — the header is stripped, not double-wrapped."""
+    contract = OpenDataContractStandard.from_string(textwrap.dedent(
+        """\
+        apiVersion: v3.1.0
+        kind: DataContract
+        id: c
+        name: C
+        version: 1.0.0
+        status: draft
+        schema:
+          - name: V
+            physicalType: view
+            customProperties:
+              - property: viewDefinition
+                value: "create or replace view db.s.v as select id from raw;"
+            properties:
+              - name: id
+                physicalType: NUMBER
+                description: pk
+        """
+    ))
+    sql = to_snowflake_full_sql(contract, include_ddl=True, ddl_if_not_exists=False)
+    assert "CREATE OR REPLACE VIEW V (\n  id COMMENT 'pk'\n)\nAS\nselect id from raw;" in sql
+    # not double-wrapped
+    assert "AS\ncreate or replace view" not in sql
+
+
+def test_view_with_definition_always_create_or_replace():
+    contract = OpenDataContractStandard.from_string(_VIEW_WITH_DEF)
+    sql = to_snowflake_full_sql(contract, include_ddl=True, ddl_if_not_exists=False)  # always
+    assert "CREATE OR REPLACE VIEW CUSTOMERS_V (" in sql
+    # column comments embedded in the column list (apostrophe doubled)
+    assert "id COMMENT 'surrogate key'" in sql
+    assert "email COMMENT 'customer''s email'" in sql
+    # view-level comment via COMMENT =, then the stored SELECT body
+    assert "COMMENT = 'Curated customers'" in sql
+    assert "AS\nSELECT id, email FROM customers WHERE active = TRUE;" in sql
+    # comments are carried by the CREATE, so no standalone COMMENT ON for the view
+    assert "COMMENT ON VIEW CUSTOMERS_V" not in sql
+    assert "-- NOTE: column comments for view" not in sql
+
+
+def test_view_with_definition_auto_if_not_exists():
+    contract = OpenDataContractStandard.from_string(_VIEW_WITH_DEF)
+    sql = to_snowflake_full_sql(contract, include_ddl=True, ddl_if_not_exists=True)  # auto
+    assert "CREATE VIEW IF NOT EXISTS CUSTOMERS_V (" in sql
+    assert "CREATE OR REPLACE VIEW" not in sql
+
+
+def test_view_with_definition_never_falls_back_to_comment_on_view():
+    contract = OpenDataContractStandard.from_string(_VIEW_WITH_DEF)
+    sql = to_snowflake_full_sql(contract, include_ddl=False)  # never / alter-only
+    assert "CREATE OR REPLACE VIEW" not in sql
+    assert "CREATE VIEW IF NOT EXISTS" not in sql
+    # without a CREATE we can only set the view-level comment; columns get a note
+    assert "COMMENT ON VIEW CUSTOMERS_V IS 'Curated customers';" in sql
+    assert "-- NOTE: column comments for view CUSTOMERS_V" in sql
 
 
 def test_no_tags_when_disabled():

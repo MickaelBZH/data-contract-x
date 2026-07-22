@@ -27,9 +27,19 @@
 2. **Live import** — build a contract *from* a running system (its real columns, keys, comments, tags).
 3. **Apply** — push the contract's governance *back* to the platform (comments, tags, data-quality, and the table itself).
 
-It's **platform-extensible by design**: each platform is a small importer / exporter / apply module that plugs into datacontract-cli's factories. **Snowflake is the first end-to-end platform** (import → enrich → apply), with Kafka import today and more platforms built to slot in the same way.
+The pipeline:
 
-The pipeline is: **import** a live schema into an ODCS contract → **enrich** it (columns · tags · quality) → **apply** it back to the platform, or **export** it to SQL / docs / schemas. Everything is available both as a **CLI** and as a **REST API** (`dcx api`).
+```
+import  ──→  enrich  ──┬──→  apply     push governance back to the platform
+                       └──→  export    to SQL / docs / schemas
+
+  import   a live schema into an ODCS contract
+  enrich   columns · tags · quality
+```
+
+Everything is available both as a **CLI** and as a **REST API** (`dcx api`).
+
+It's **platform-extensible by design** — each platform is a small importer / exporter / apply module that plugs into datacontract-cli's factories. **Snowflake is the first end-to-end platform** (import → enrich → apply), with Kafka import today and more platforms built to slot in the same way.
 
 ## Why dcx?
 
@@ -92,7 +102,7 @@ Every command is `dcx <command>`, and most are mirrored to a REST endpoint when 
 
 | Sub-command | Source |
 |---|---|
-| `dcx import snowflake` | A live Snowflake schema — tables **and views** (columns, primary keys, comments, tags; `physicalType` records the asset type) |
+| `dcx import snowflake` | A live Snowflake schema — tables **and views** (columns, primary keys, comments, tags; `physicalType` records the asset type, and a view's SELECT body is captured as a `viewDefinition`) |
 | `dcx import kafka` | A Kafka topic's value schema (Confluent Schema Registry) |
 | `dcx import <format>` | A file/document — `sql`, `avro`, `dbml`, `glue`, `bigquery`, `unity`, `jsonschema`, `json`, `odcs`, `parquet`, `csv`, `protobuf`, `spark`, `iceberg`, `excel`, `dbt` |
 
@@ -116,7 +126,15 @@ dcx import sql --source schema.sql --dialect snowflake --output contract.yaml
 | `dcx enrich quality` | An executable data-quality suite across all ODCS dimensions |
 | `dcx enrich all` | columns → tags → quality, in that order so each stage grounds the next |
 
-Each sub-command is independent and idempotent (existing values are preserved unless you pass `--overwrite`). The provider key is read from the environment — there is no `--api-key` flag. Use `--model` for any litellm model and `--base-url` for a proxy / Azure / Ollama endpoint.
+Each sub-command is independent and **idempotent** — existing values are preserved unless you pass `--overwrite`.
+
+| Option | Effect |
+|---|---|
+| `--model` | any litellm model (`claude-opus-4-8`, `gpt-4o`, `ollama/llama3`, …) |
+| `--base-url` | a proxy / Azure / Ollama endpoint |
+| `--overwrite` | replace existing values instead of preserving them |
+
+The provider key is read from the environment — there is no `--api-key` flag.
 
 ```bash
 dcx enrich columns contract.yaml --output contract.enriched.yaml
@@ -137,9 +155,30 @@ dcx enrich all     contract.yaml --catalog tags_catalog.yaml --output contract.f
 | `dcx export dbt` | dbt `models` / `sources` / `staging`, with ODCS governance mapped to `config.meta` / `config.tags` |
 | `dcx export <format>` | Any upstream format — `sql`, `jsonschema`, `html`, `markdown`, `mermaid`, `dbt-*`, `avro`, `protobuf`, `bigquery`, `spark`, `sqlalchemy`, `iceberg`, `sodacl`, `great-expectations`, `dbml`, `pydantic-model`, `odcs`, `rdf`, `go`, `excel`, … |
 
-`snowflake-full` shares [`apply`](#apply)'s SQL-generation knobs, so it emits the exact same script `apply --dry-run` would: `--ddl-mode auto\|always\|never` (default `auto` → `CREATE TABLE IF NOT EXISTS` + govern), `--structured-types`, `--comments`, `--include-tags`, `--include-quality`, `--create-tags`, `--tag-namespace DB.SCHEMA`, `--tag-namespace-filter DB.SCHEMA` (repeatable — emit only tags from these namespaces, e.g. to skip centrally-managed/inherited ones). (`apply`'s `--strict` drift check has no export equivalent — it needs a live connection.)
+#### `snowflake-full`
 
-`dbt` unifies upstream's `dbt-models` / `dbt-sources` / `dbt-staging-sql` under one command via `--kind models\|sources\|staging` (default `models`), and maps ODCS governance the idiomatic dbt way: `NAME=VALUE` tags plus `classification` / `businessName` / `criticalDataElement` go to **`config.meta`** (key/value metadata for docs + catalogs), while bare tags become **`config.tags`** (dbt selection labels). Schema-level tags — dropped by the upstream models exporter — land on the model's `config`. Tags imported from Snowflake are fully qualified (`DB.SCHEMA.NAME`); `--meta-key-style full\|sanitized\|short` controls how that namespace appears in the meta key (`db.schema.name` · `db_schema_name` · `name`), and `--tag-namespace-filter DB.SCHEMA` (repeatable) restricts output to tags from the given namespaces. (The upstream `dbt-models` / `dbt-sources` / `dbt-staging-sql` commands remain available, unchanged.)
+Emits the exact script [`apply --dry-run`](#apply--push-governance-to-a-live-platform) would, and shares its SQL-generation knobs:
+
+`--ddl-mode` · `--structured-types` · `--comments` · `--include-tags` · `--include-quality` · `--create-tags` · `--tag-namespace` · `--tag-namespace-filter`
+
+See the `apply` option table below for what each does. Only `--strict` has no export equivalent — drift detection needs a live connection.
+
+#### `dbt`
+
+Unifies upstream's `dbt-models` / `dbt-sources` / `dbt-staging-sql` under one command via `--kind` (those upstream commands remain available, unchanged), and maps ODCS governance the idiomatic dbt way:
+
+| ODCS | → dbt | Why |
+|---|---|---|
+| `NAME=VALUE` tags | `config.meta` | key/value metadata for docs + catalogs |
+| `classification`, `businessName`, `criticalDataElement` | `config.meta` | same |
+| bare tags | `config.tags` | dbt selection labels |
+| schema-level tags | model `config` | upstream's models exporter drops these |
+
+| Option | Effect |
+|---|---|
+| `--kind models\|sources\|staging` | which artifact to emit (default `models`) |
+| `--meta-key-style full\|sanitized\|short` | how a qualified Snowflake tag `DB.SCHEMA.NAME` appears in the meta key: `db.schema.name` · `db_schema_name` · `name` |
+| `--tag-namespace-filter DB.SCHEMA` | repeatable — emit only tags from these namespaces |
 
 ```bash
 dcx export snowflake-full contract.yaml --include-quality --create-tags --output setup.sql
@@ -157,9 +196,12 @@ dcx export html contract.yaml --output contract.html
 |---|---|
 | `dcx apply snowflake` | A live Snowflake account |
 
-With the default `--ddl-mode auto` you don't need to know whether the table exists: **missing tables are created** (`CREATE TABLE IF NOT EXISTS`) and **existing ones are governed** — column/table comments, tags, and (with `--include-quality`) data-quality metrics. For existing tables, dcx also **compares the live schema to the contract** and reports drift as warnings — or, with `--strict`, an error that aborts before any change (the check uses `DESCRIBE TABLE`, so it needs no active warehouse).
+With the default `--ddl-mode auto` you don't need to know whether the table exists:
 
-Objects with `physicalType: view` are **governed as views** — no `CREATE` (the contract has no view definition), and comments/tags/DQ use `COMMENT ON VIEW` / `ALTER VIEW`. This holds for both `apply snowflake` and `export snowflake-full`. (Materialized/external tables are imported with their real `physicalType` but currently governed as tables.)
+- **missing** → created with `CREATE TABLE IF NOT EXISTS`
+- **existing** → governed: column/table comments, tags, and (with `--include-quality`) data-quality metrics
+
+For existing tables dcx also compares the live schema to the contract and reports **drift** as warnings — or, with `--strict`, an error that aborts before any change. The check uses `DESCRIBE TABLE`, so it needs no active warehouse.
 
 | Option | Effect |
 |---|---|
@@ -175,12 +217,30 @@ dcx apply snowflake contract.yaml --dry-run            # preview
 dcx apply snowflake contract.yaml --include-quality    # create-or-govern
 ```
 
+#### Views
+
+Objects with `physicalType: view` are governed as views — tags, comments and DQ use `ALTER VIEW` / `COMMENT ON VIEW`. This holds for both `apply snowflake` and `export snowflake-full`.
+
+Column comments are the catch. Snowflake persists them **only** inside the `CREATE VIEW` column list — there is no `ALTER` path (Snowsight uses the same trick). So dcx has to recreate the view, which needs the `viewDefinition` captured on `import`:
+
+| `--ddl-mode` | With a `viewDefinition` | Without one |
+|---|---|---|
+| `always` | `CREATE OR REPLACE VIEW` — **column comments updated** | view comment + column tags only |
+| `auto` (default) | `CREATE VIEW IF NOT EXISTS` — column comments land on first creation only | view comment + column tags only |
+| `never` | view comment + column tags only | view comment + column tags only |
+
+> **To update an existing view's column comments, use `--ddl-mode always`.** Every other combination leaves them as they are, and dcx notes each skip.
+
+Materialized and external tables are imported with their real `physicalType`, but are currently governed as tables.
+
 **API**
 - `POST /apply/snowflake` — authenticated by the caller's Snowflake OAuth token. Supports `dry_run`, `ddl_mode`, `strict`, `structured_types`, `tag_namespace_filter`, … (all under `options`) and returns the executed SQL plus any drift `warnings`.
 
 ### `target` — bind a contract to a platform
 
-`dcx target <type>` sets the contract's server block and resolves each column's `physicalType` for that platform. ~30 types: `snowflake`, `bigquery`, `databricks`, `postgres`, `redshift`, `mysql`, `sqlserver`, `oracle`, `s3`, `kafka`, `trino`, `athena`, `glue`, `duckdb`, `local`, …
+`dcx target <type>` does two things: sets the contract's **server block**, and resolves each column's **`physicalType`** for that platform.
+
+~30 types — `snowflake`, `bigquery`, `databricks`, `postgres`, `redshift`, `mysql`, `sqlserver`, `oracle`, `s3`, `kafka`, `trino`, `athena`, `glue`, `duckdb`, `local`, …
 
 ```bash
 dcx target snowflake contract.yaml --output contract.snowflake.yaml
@@ -215,7 +275,9 @@ dcx info                 # show dcx + datacontract-cli versions   (API: GET /inf
 
 ## The tag catalog
 
-`dcx enrich tags` does **controlled-vocabulary** tagging: instead of letting the model invent tags, you give it a catalog of allowed names and values, and it classifies each column into that vocabulary. The catalog is a small YAML (or JSON) file — the only extra input auto-tagging needs.
+`dcx enrich tags` does **controlled-vocabulary** tagging. Instead of letting the model invent tags, you give it a catalog of allowed names and values, and it classifies each column into that vocabulary.
+
+The catalog is a small YAML (or JSON) file — the only extra input auto-tagging needs.
 
 ```yaml
 # tags_catalog.yaml
@@ -275,7 +337,16 @@ Every command above is mirrored to an endpoint, with request **and** response sc
 
 ## How it fits with datacontract-cli
 
-dcx is a **separate package that depends on datacontract-cli as a library** — no fork. It registers new importers (`snowflake`, `kafka`) and the `snowflake-full` exporter into the upstream factories, adds `target` / `enrich` / `apply` sub-apps and live-import commands to the upstream Typer app, and mirrors every command to FastAPI for `dcx api`. So you keep all of upstream's importers, exporters, `lint`, `test`, and `changelog`, and gain the AI + platform layer on top.
+dcx is a **separate package that depends on datacontract-cli as a library** — no fork. It plugs into upstream's own extension points:
+
+| dcx adds | Where it plugs in |
+|---|---|
+| importers `snowflake`, `kafka` | upstream's `importer_factory` |
+| exporter `snowflake-full` | upstream's `exporter_factory` |
+| `target` / `enrich` / `apply` sub-apps | upstream's Typer app |
+| REST routes for every command | FastAPI, via `dcx api` |
+
+So you keep all of upstream's importers, exporters, `lint`, `test` and `changelog`, and gain the AI + platform layer on top.
 
 ## Development
 

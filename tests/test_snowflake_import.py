@@ -179,6 +179,8 @@ class _FakeCursor:
                 ("TAG_DATABASE",), ("TAG_SCHEMA",), ("TAG_NAME",), ("TAG_VALUE",), ("LEVEL",),
             ]
             self._rows = self._tags_for(sql)[1]
+        elif "INFORMATION_SCHEMA.VIEWS" in sql:
+            self._rows = self.data.get("views", [])
         elif "INFORMATION_SCHEMA.COLUMNS" in sql:
             self.description = []
             self._rows = self.data["columns"]
@@ -223,6 +225,8 @@ def _fake_data():
             ("CUSTOMER", "Customers", "BASE TABLE"),
             ("ORDERS", None, "VIEW"),
         ],
+        # (TABLE_NAME, VIEW_DEFINITION) for views
+        "views": [("ORDERS", "SELECT id FROM raw_orders")],
         # SHOW PRIMARY KEYS rows in description order
         "pks": [
             ("t", "DB", "SCH", "CUSTOMER", "ID", 1),
@@ -242,7 +246,7 @@ def _fake_data():
 
 def test_fetch_metadata_shapes():
     conn = _FakeConn(_fake_data())
-    columns, pks, comments, types = _fetch_metadata(conn, "db", "sch", None)
+    columns, pks, comments, types, vdefs = _fetch_metadata(conn, "db", "sch", None)
     assert len(columns) == 3
     assert columns[0] == {
         "table": "CUSTOMER", "name": "ID", "data_type": "NUMBER", "nullable": False,
@@ -251,6 +255,7 @@ def test_fetch_metadata_shapes():
     assert pks == {"CUSTOMER": {"ID"}, "ORDERS": {"ID"}}
     assert comments == {"CUSTOMER": "Customers", "ORDERS": None}
     assert types == {"CUSTOMER": "BASE TABLE", "ORDERS": "VIEW"}
+    assert vdefs == {"ORDERS": "SELECT id FROM raw_orders"}
 
 
 def test_import_sets_physical_type_from_table_type(monkeypatch):
@@ -262,9 +267,22 @@ def test_import_sets_physical_type_from_table_type(monkeypatch):
     assert by_name["ORDERS"].physicalType == "view"
 
 
+def test_import_captures_view_definition(monkeypatch):
+    import dcx.importers.snowflake as si
+    monkeypatch.setattr(si, "_connect", lambda import_args: _FakeConn(_fake_data()))
+    contract = import_snowflake({"database": "DB", "schema": "SCH", "account": "ACME"})
+    by_name = {o.name: o for o in contract.schema_}
+    view_cp = {cp.property: cp.value for cp in (by_name["ORDERS"].customProperties or [])}
+    assert view_cp["viewDefinition"] == "SELECT id FROM raw_orders"
+    # tables carry no viewDefinition
+    assert not any(
+        cp.property == "viewDefinition" for cp in (by_name["CUSTOMER"].customProperties or [])
+    )
+
+
 def test_fetch_metadata_table_filter():
     conn = _FakeConn(_fake_data())
-    columns, _, _, _ = _fetch_metadata(conn, "db", "sch", ["customer"])
+    columns, _, _, _, _ = _fetch_metadata(conn, "db", "sch", ["customer"])
     assert {c["table"] for c in columns} == {"CUSTOMER"}
 
 

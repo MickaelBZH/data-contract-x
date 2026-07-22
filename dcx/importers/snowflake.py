@@ -20,6 +20,7 @@ from typing import Any, Optional
 
 from datacontract.imports.importer import Importer
 from open_data_contract_standard.model import (
+    CustomProperty,
     OpenDataContractStandard,
     SchemaObject,
     SchemaProperty,
@@ -33,6 +34,7 @@ from dcx.apply.snowflake import (
     SNOWFLAKE_LOGIN_TIMEOUT,
     SNOWFLAKE_NETWORK_TIMEOUT,
 )
+from dcx.exporters.snowflake import _view_select_body
 
 
 class SnowflakeImportError(Exception):
@@ -114,6 +116,7 @@ def build_snowflake_contract(
     column_tags: Optional[dict] = None,
     table_tags: Optional[dict] = None,
     table_types: Optional[dict] = None,
+    view_definitions: Optional[dict] = None,
     server_name: str = "production",
 ) -> OpenDataContractStandard:
     """Build an ODCS contract from already-fetched Snowflake metadata.
@@ -125,11 +128,13 @@ def build_snowflake_contract(
     `column_tags`: (table, column) → list of `DB.SCHEMA.NAME=VALUE` tag strings.
     `table_tags`: table → list of `DB.SCHEMA.NAME=VALUE` tag strings.
     `table_types`: table → Snowflake TABLE_TYPE (e.g. `VIEW`) → sets `physicalType`.
+    `view_definitions`: view → SELECT body → stored as a `viewDefinition` customProperty.
     `server_info`: account, database, schema, warehouse.
     """
     column_tags = column_tags or {}
     table_tags = table_tags or {}
     table_types = table_types or {}
+    view_definitions = view_definitions or {}
     # Group columns by table, preserving first-seen order.
     tables: dict[str, list[dict]] = {}
     for col in columns:
@@ -184,6 +189,11 @@ def build_snowflake_contract(
         ttags = table_tags.get(table_name)
         if ttags:
             obj.tags = ttags
+        vdef = _view_select_body(view_definitions.get(table_name))
+        if vdef:
+            obj.customProperties = (obj.customProperties or []) + [
+                CustomProperty(property="viewDefinition", value=vdef)
+            ]
         schema_objects.append(obj)
 
     database = server_info.get("database")
@@ -273,7 +283,7 @@ def _connect(import_args: dict):
 
 
 def _fetch_metadata(conn, database: str, schema: str, tables: Optional[list[str]]):
-    """Read columns, primary keys, table comments and table types from Snowflake."""
+    """Read columns, primary keys, table comments, types and view definitions."""
     db = database.upper()
     sch = schema.upper()
     table_filter = [t.upper() for t in tables] if tables else None
@@ -312,6 +322,14 @@ def _fetch_metadata(conn, database: str, schema: str, tables: Optional[list[str]
             table_comments[row[0]] = row[1]
             table_types[row[0]] = row[2]
 
+        # --- view definitions (the SELECT body, so views can be (re)created) ---
+        cur.execute(
+            f'SELECT TABLE_NAME, VIEW_DEFINITION FROM "{db}".INFORMATION_SCHEMA.VIEWS '
+            f'WHERE TABLE_SCHEMA = %s',
+            (sch,),
+        )
+        view_definitions = {row[0]: row[1] for row in cur.fetchall() if row[1]}
+
         # --- primary keys ---
         primary_keys: dict[str, set] = {}
         cur.execute(f'SHOW PRIMARY KEYS IN SCHEMA "{db}"."{sch}"')
@@ -323,7 +341,7 @@ def _fetch_metadata(conn, database: str, schema: str, tables: Optional[list[str]
     finally:
         cur.close()
 
-    return columns, primary_keys, table_comments, table_types
+    return columns, primary_keys, table_comments, table_types, view_definitions
 
 
 def _fq_tag(row: tuple, idx: dict) -> str:
@@ -414,7 +432,7 @@ def _contract_from_connection(
     server_name: str,
 ) -> OpenDataContractStandard:
     """Read metadata over an open connection and build the contract (caller closes conn)."""
-    columns, primary_keys, table_comments, table_types = _fetch_metadata(
+    columns, primary_keys, table_comments, table_types, view_definitions = _fetch_metadata(
         conn, database, schema, tables,
     )
     if not columns:
@@ -437,6 +455,7 @@ def _contract_from_connection(
         column_tags=column_tags,
         table_tags=table_tags,
         table_types=table_types,
+        view_definitions=view_definitions,
         server_name=server_name,
     )
 
