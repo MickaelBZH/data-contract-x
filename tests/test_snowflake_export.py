@@ -99,14 +99,18 @@ def test_quality_section_when_enabled():
     assert "-- ===== Data Quality (Data Metric Functions) =====" in sql
     assert "Snowflake Enterprise feature" in sql
     assert "ALTER TABLE SALES_DB.SALES.orders SET DATA_METRIC_SCHEDULE" in sql
+    # The rule's ODCS operator becomes an enforced EXPECTATION, so the DMF is not
+    # merely computed — `mustBeGreaterThan: 0` is the pass condition.
     assert (
         "ALTER TABLE SALES_DB.SALES.orders ADD DATA METRIC FUNCTION "
-        "SNOWFLAKE.CORE.ROW_COUNT ON ();"
+        "SNOWFLAKE.CORE.ROW_COUNT ON ()\n"
+        "  EXPECTATION EXP__DCX__ROW_COUNT__GREATERTHAN0 (VALUE > 0);"
     ) in sql
-    # `nullValues` maps to NULL_COUNT
+    # `nullValues` maps to NULL_COUNT; `mustBe: 0` on a column uses the friendly alias
     assert (
         "ALTER TABLE SALES_DB.SALES.orders ADD DATA METRIC FUNCTION "
-        "SNOWFLAKE.CORE.NULL_COUNT ON (id);"
+        "SNOWFLAKE.CORE.NULL_COUNT ON (id)\n"
+        "  EXPECTATION EXP__DCX__ID__NONULLS (VALUE = 0);"
     ) in sql
 
 
@@ -614,7 +618,8 @@ def test_cli_export_snowflake_full_with_quality(tmp_path):
     assert result.exit_code == 0, result.output
     assert (
         "ALTER TABLE SALES_DB.SALES.orders ADD DATA METRIC FUNCTION "
-        "SNOWFLAKE.CORE.NULL_COUNT ON (id);"
+        "SNOWFLAKE.CORE.NULL_COUNT ON (id)\n"
+        "  EXPECTATION EXP__DCX__ID__NONULLS (VALUE = 0);"
     ) in result.output
 
 

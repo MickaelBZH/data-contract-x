@@ -171,25 +171,57 @@ def test_dry_run_with_tags_and_quality(tmp_path):
 
 
 class _MockCursor:
-    def __init__(self, sentinel="ok"):
-        self.sentinel = sentinel
+    def __init__(self, conn):
+        self._conn = conn
         self.closed = False
+
+    def execute(self, sql):
+        self._conn.record(sql)
+
+    def fetchall(self):
+        return []
 
     def close(self):
         self.closed = True
 
 
 class _MockConn:
-    def __init__(self, parsed_statements):
+    """Fake connection that records every statement dcx executes.
+
+    Deliberately does NOT implement `execute_string` — dcx splits the script itself
+    and runs one statement per cursor, so a call to it would be a regression.
+
+    `existing_tables` drives the `DESCRIBE TABLE` existence probe: a table not listed
+    raises the way Snowflake does for a missing object, so `CREATE TABLE IF NOT EXISTS`
+    is still emitted for it. `errors` maps a substring to an exception raised the first
+    time a matching statement runs, for exercising the idempotent DMF paths.
+    """
+
+    def __init__(self, parsed_statements, existing_tables=(), errors=None):
         self._parsed = parsed_statements
         self.closed = False
+        self.existing_tables = {t.upper() for t in existing_tables}
+        self.errors = dict(errors or {})
+        self.cursors: list[_MockCursor] = []
+        parsed_statements.setdefault("executed", [])
 
-    def execute_string(self, sql):
-        # Mirrors `SnowflakeConnection.execute_string`: parse `;`-separated
-        # statements and return one cursor per statement.
-        self._parsed["captured_sql"] = sql
-        stmts = [s for s in (s.strip() for s in sql.split(";")) if s and not s.startswith("--")]
-        return [_MockCursor() for _ in stmts]
+    def record(self, sql):
+        stmt = sql.strip()
+        if stmt.upper().startswith("DESCRIBE TABLE"):
+            if stmt.split()[-1].upper() not in self.existing_tables:
+                raise Exception(f"Object '{stmt.split()[-1]}' does not exist or not authorized.")
+            return
+        for needle, exc in list(self.errors.items()):
+            if needle.lower() in stmt.lower():
+                del self.errors[needle]
+                raise exc
+        self._parsed["executed"].append(stmt)
+        self._parsed["captured_sql"] = ";\n".join(self._parsed["executed"])
+
+    def cursor(self):
+        cur = _MockCursor(self)
+        self.cursors.append(cur)
+        return cur
 
     def close(self):
         self.closed = True
