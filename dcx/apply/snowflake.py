@@ -79,15 +79,6 @@ def _first(*candidates: Optional[str]) -> Optional[str]:
     return None
 
 
-# Matches a `CREATE TABLE IF NOT EXISTS <name>` statement (optionally
-# TRANSIENT/TEMPORARY) and captures the qualified table name. Used to skip the
-# no-op create for tables that already exist — see `_connect_apply`.
-_CREATE_IF_NOT_EXISTS_RE = re.compile(
-    r"^\s*CREATE\s+(?:TRANSIENT\s+|TEMPORARY\s+|TEMP\s+)?TABLE\s+"
-    r"IF\s+NOT\s+EXISTS\s+([A-Za-z0-9_.\"$]+)",
-    re.IGNORECASE,
-)
-
 # Head of our generated `ALTER ... ADD DATA METRIC FUNCTION <assoc> EXPECTATION <exp>`.
 # `rest` deliberately captures everything after the keyword: the association can be
 # `ON ()`, `ON (col)`, or ACCEPTED_VALUES' lambda form
@@ -196,19 +187,6 @@ def _execute_statement(conn, stmt: str) -> None:
                 # is treated as the no-op it is.
                 if _EXPECTATION_ALREADY_EXISTS not in str(exc2).lower():
                     raise
-    finally:
-        cur.close()
-
-
-def _table_exists(conn, qualified_name: str) -> bool:
-    """Best-effort existence check via DESCRIBE TABLE (needs no active warehouse)."""
-    cur = conn.cursor()
-    try:
-        cur.execute(f"DESCRIBE TABLE {qualified_name}")
-        cur.fetchall()
-        return True
-    except Exception:
-        return False
     finally:
         cur.close()
 
@@ -595,15 +573,6 @@ def _connect_apply(
         try:
             executed = 0
             for stmt in _split_sql_statements(sql):
-                # A `CREATE TABLE IF NOT EXISTS` for a table that already exists is a
-                # no-op — but Snowflake still parses the DDL first. A contract imported
-                # from a live table can carry types that don't round-trip into valid
-                # CREATE DDL (e.g. a bare `VECTOR` with no dimension), which would fail
-                # parsing. Skip the redundant create so governance of the existing table
-                # still succeeds; genuinely-missing tables are still created.
-                m = _CREATE_IF_NOT_EXISTS_RE.match(stmt)
-                if m and _table_exists(conn, m.group(1)):
-                    continue
                 _execute_statement(conn, stmt)
                 executed += 1
         except Exception as exc:

@@ -191,26 +191,19 @@ class _MockConn:
     Deliberately does NOT implement `execute_string` — dcx splits the script itself
     and runs one statement per cursor, so a call to it would be a regression.
 
-    `existing_tables` drives the `DESCRIBE TABLE` existence probe: a table not listed
-    raises the way Snowflake does for a missing object, so `CREATE TABLE IF NOT EXISTS`
-    is still emitted for it. `errors` maps a substring to an exception raised the first
-    time a matching statement runs, for exercising the idempotent DMF paths.
+    `errors` maps a substring to an exception raised the first time a matching
+    statement runs, for exercising the idempotent DMF paths.
     """
 
-    def __init__(self, parsed_statements, existing_tables=(), errors=None):
+    def __init__(self, parsed_statements, errors=None):
         self._parsed = parsed_statements
         self.closed = False
-        self.existing_tables = {t.upper() for t in existing_tables}
         self.errors = dict(errors or {})
         self.cursors: list[_MockCursor] = []
         parsed_statements.setdefault("executed", [])
 
     def record(self, sql):
         stmt = sql.strip()
-        if stmt.upper().startswith("DESCRIBE TABLE"):
-            if stmt.split()[-1].upper() not in self.existing_tables:
-                raise Exception(f"Object '{stmt.split()[-1]}' does not exist or not authorized.")
-            return
         for needle, exc in list(self.errors.items()):
             if needle.lower() in stmt.lower():
                 del self.errors[needle]

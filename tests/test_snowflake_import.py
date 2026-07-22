@@ -186,6 +186,11 @@ class _FakeCursor:
             self._rows = self.data["columns"]
         elif "INFORMATION_SCHEMA.TABLES" in sql:
             self._rows = self.data["tables"]
+        elif "SHOW COLUMNS" in sql:
+            self.description = [
+                ("table_name",), ("schema_name",), ("column_name",), ("data_type",),
+            ]
+            self._rows = self.data.get("show_columns", [])
         elif "SHOW PRIMARY KEYS" in sql:
             self.description = [
                 ("created_on",), ("database_name",), ("schema_name",),
@@ -219,6 +224,7 @@ def _fake_data():
             ("CUSTOMER", "ID", "NUMBER", "NO", "key", None, 38, 0),
             ("CUSTOMER", "EMAIL", "TEXT", "NO", None, 255, None, None),
             ("ORDERS", "ID", "NUMBER", "NO", None, None, 38, 0),
+            ("CUSTOMER", "EMBEDDING", "VECTOR", "YES", None, None, None, None),
         ],
         # (TABLE_NAME, COMMENT, TABLE_TYPE)
         "tables": [
@@ -227,6 +233,12 @@ def _fake_data():
         ],
         # (TABLE_NAME, VIEW_DEFINITION) for views
         "views": [("ORDERS", "SELECT id FROM raw_orders")],
+        # SHOW COLUMNS rows: the only place a VECTOR's element type + dimension appear
+        "show_columns": [
+            ("CUSTOMER", "SCH", "EMBEDDING",
+             '{"type":"VECTOR","dimension":256,"elementType":"FLOAT","nullable":true}'),
+            ("CUSTOMER", "SCH", "EMAIL", '{"type":"TEXT","length":255}'),
+        ],
         # SHOW PRIMARY KEYS rows in description order
         "pks": [
             ("t", "DB", "SCH", "CUSTOMER", "ID", 1),
@@ -246,8 +258,8 @@ def _fake_data():
 
 def test_fetch_metadata_shapes():
     conn = _FakeConn(_fake_data())
-    columns, pks, comments, types, vdefs = _fetch_metadata(conn, "db", "sch", None)
-    assert len(columns) == 3
+    columns, pks, comments, types, vdefs, full_types = _fetch_metadata(conn, "db", "sch", None)
+    assert len(columns) == 4
     assert columns[0] == {
         "table": "CUSTOMER", "name": "ID", "data_type": "NUMBER", "nullable": False,
         "comment": "key", "char_len": None, "precision": 38, "scale": 0,
@@ -256,6 +268,8 @@ def test_fetch_metadata_shapes():
     assert comments == {"CUSTOMER": "Customers", "ORDERS": None}
     assert types == {"CUSTOMER": "BASE TABLE", "ORDERS": "VIEW"}
     assert vdefs == {"ORDERS": "SELECT id FROM raw_orders"}
+    # Only types INFORMATION_SCHEMA can't express are captured; TEXT is left alone.
+    assert full_types == {("CUSTOMER", "EMBEDDING"): "VECTOR(FLOAT, 256)"}
 
 
 def test_import_sets_physical_type_from_table_type(monkeypatch):
@@ -282,7 +296,7 @@ def test_import_captures_view_definition(monkeypatch):
 
 def test_fetch_metadata_table_filter():
     conn = _FakeConn(_fake_data())
-    columns, _, _, _, _ = _fetch_metadata(conn, "db", "sch", ["customer"])
+    columns, _, _, _, _, _ = _fetch_metadata(conn, "db", "sch", ["customer"])
     assert {c["table"] for c in columns} == {"CUSTOMER"}
 
 
@@ -552,3 +566,38 @@ def test_api_snowflake_error_is_502(monkeypatch):
     )
     assert r.status_code == 502
     assert "bad token" in r.json()["detail"]
+
+
+def test_vector_column_round_trips_into_valid_ddl(monkeypatch):
+    """The regression this fixes: INFORMATION_SCHEMA reports a bare `VECTOR`, which is
+    not valid DDL, so the generated CREATE TABLE was one Snowflake refuses to parse."""
+    import dcx.importers.snowflake as si
+    from dcx.exporters.snowflake import to_snowflake_full_sql
+
+    monkeypatch.setattr(si, "_connect", lambda import_args: _FakeConn(_fake_data()))
+    contract = import_snowflake({"database": "DB", "schema": "SCH", "account": "ACME"})
+
+    embedding = {p.name: p for p in contract.schema_[0].properties}["EMBEDDING"]
+    assert embedding.physicalType == "VECTOR(FLOAT, 256)"
+    assert "VECTOR(FLOAT, 256)" in to_snowflake_full_sql(contract)
+
+
+def test_show_columns_failure_is_not_fatal(monkeypatch):
+    """SHOW COLUMNS needs its own privileges; without it the import must still succeed,
+    just with the less precise INFORMATION_SCHEMA type."""
+    import dcx.importers.snowflake as si
+
+    class _NoShowColumns(_FakeCursor):
+        def execute(self, sql, params=None):
+            if "SHOW COLUMNS" in sql:
+                raise RuntimeError("Insufficient privileges")
+            return super().execute(sql, params)
+
+    class _Conn(_FakeConn):
+        def cursor(self):
+            return _NoShowColumns(self.data)
+
+    monkeypatch.setattr(si, "_connect", lambda import_args: _Conn(_fake_data()))
+    contract = import_snowflake({"database": "DB", "schema": "SCH", "account": "ACME"})
+    embedding = {p.name: p for p in contract.schema_[0].properties}["EMBEDDING"]
+    assert embedding.physicalType == "VECTOR"
