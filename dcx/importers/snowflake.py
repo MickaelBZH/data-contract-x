@@ -271,6 +271,68 @@ def _accepted_values_from_condition(condition: Optional[str]) -> Optional[list[s
     return unquoted or None
 
 
+# --- Expectations → ODCS operators -------------------------------------------
+# Exact inverse of the exporter's `_OPERATOR_TO_EXPECTATION` /
+# `_RANGE_OPERATOR_TO_EXPECTATION`. An attached DMF carries no threshold — Snowflake
+# keeps the pass condition in a separate EXPECTATION — so without this an imported rule
+# says "count the nulls" but never "and there must be none".
+#
+# The expression is parsed rather than the expectation NAME: names encode the threshold
+# too, but only for expectations dcx wrote. Parsing `VALUE <= 4` also recovers the
+# operator from an expectation a user created in Snowsight.
+_NUM = r"-?\d+(?:\.\d+)?"
+
+_SQL_OP_TO_ODCS: dict[str, str] = {
+    "=":  "mustBe",
+    "<>": "mustNotBe",
+    "!=": "mustNotBe",
+    ">":  "mustBeGreaterThan",
+    ">=": "mustBeGreaterOrEqualTo",
+    "<":  "mustBeLessThan",
+    "<=": "mustBeLessOrEqualTo",
+}
+
+_EXPECTATION_SIMPLE_RE = re.compile(
+    rf"^\s*VALUE\s*(?P<op><=|>=|<>|!=|=|<|>)\s*(?P<v>{_NUM})\s*$", re.IGNORECASE,
+)
+_EXPECTATION_RANGE_RES: list[tuple[Any, str]] = [
+    (re.compile(rf"^\s*(?P<a>{_NUM})\s*<=\s*VALUE\s+AND\s+VALUE\s*<=\s*(?P<b>{_NUM})\s*$",
+                re.IGNORECASE), "mustBeBetween"),
+    (re.compile(rf"^\s*VALUE\s*<\s*(?P<a>{_NUM})\s+OR\s+VALUE\s*>\s*(?P<b>{_NUM})\s*$",
+                re.IGNORECASE), "mustNotBeBetween"),
+]
+
+
+def _as_number(text: str):
+    """`'0'` → `0`, `'4.5'` → `4.5` — integral values stay ints so contracts round-trip
+    without gaining a spurious `.0`."""
+    value = float(text)
+    return int(value) if value.is_integer() else value
+
+
+def _operator_from_expectation(expression: Optional[str]) -> Optional[tuple[str, Any]]:
+    """`(odcs_operator, value)` parsed from an expectation expression, or None.
+
+    `VALUE <= 14400`                   → ("mustBeLessOrEqualTo", 14400)
+    `10 <= VALUE AND VALUE <= 20`      → ("mustBeBetween", [10, 20])
+    """
+    if not expression:
+        return None
+    text = str(expression).strip()
+    if text.startswith("(") and text.endswith(")"):
+        text = text[1:-1].strip()
+    for pattern, operator in _EXPECTATION_RANGE_RES:
+        match = pattern.match(text)
+        if match:
+            return operator, [_as_number(match.group("a")), _as_number(match.group("b"))]
+    match = _EXPECTATION_SIMPLE_RE.match(text)
+    if match:
+        operator = _SQL_OP_TO_ODCS.get(match.group("op"))
+        if operator:
+            return operator, _as_number(match.group("v"))
+    return None
+
+
 # A trailing timezone on a cron schedule (`UTC`, `America/Los_Angeles`) — anything
 # that is not a cron field. Cron fields only ever contain digits and `*,-/?LW#`.
 _CRON_TIMEZONE_RE = re.compile(r"\s+(?P<tz>[A-Za-z][A-Za-z0-9_+\-/]*)$")
@@ -316,6 +378,7 @@ def _quality_from_dmf_references(
     by_table: dict[str, list] = {}
     slas: list = []
     unmapped: set[str] = set()
+    missing_operator: list[str] = []
 
     for ref in references:
         table = ref.get("table")
@@ -338,12 +401,19 @@ def _quality_from_dmf_references(
 
         kind, name, _scope = mapping
         if kind == "sla":
-            sla = ServiceLevelAgreementProperty(property=name, value=0, unit="s")
-            sla.element = ".".join(p for p in (database, schema, table) if p)
-            sla.description = (
-                "Imported from an attached SNOWFLAKE.CORE.FRESHNESS metric; the "
-                "threshold lives in its expectation and must be set here."
+            # FRESHNESS reports seconds, and its expectation is an upper bound, so
+            # `VALUE <= 14400` is exactly the SLA value in seconds.
+            operator = _operator_from_expectation(ref.get("expectation"))
+            seconds = operator[1] if operator and not isinstance(operator[1], list) else None
+            sla = ServiceLevelAgreementProperty(
+                property=name, value=seconds if seconds is not None else 0, unit="s",
             )
+            sla.element = ".".join(p for p in (database, schema, table) if p)
+            if seconds is None:
+                sla.description = (
+                    "Imported from an attached SNOWFLAKE.CORE.FRESHNESS metric with no "
+                    "readable expectation; set the threshold here."
+                )
             if schedule:
                 sla.schedule, sla.scheduler = schedule, "cron"
             slas.append(sla)
@@ -387,6 +457,11 @@ def _quality_from_dmf_references(
                 rule = DataQuality(type="library", metric=name, arguments={"validValues": values})
             else:
                 rule = DataQuality(type="library", metric=name)
+        operator = _operator_from_expectation(ref.get("expectation"))
+        if operator:
+            setattr(rule, operator[0], operator[1])
+        else:
+            missing_operator.append(f"{table}.{columns[0]}" if columns else str(table))
         if schedule:
             rule.schedule, rule.scheduler = schedule, "cron"
 
@@ -395,6 +470,12 @@ def _quality_from_dmf_references(
         else:
             by_table.setdefault(table, []).append(rule)
 
+    if missing_operator:
+        _warn(
+            "Imported quality rules without a pass condition (no readable expectation "
+            f"on the metric): {', '.join(missing_operator)}. Add an operator "
+            "(e.g. mustBe: 0) before these can fail anything."
+        )
     if unmapped:
         _warn(
             "Imported non-standard data metric functions as `type: custom` "
@@ -806,6 +887,7 @@ def _fetch_dmf_references(conn, database: str, schema: str, table_names: list[st
                         "columns": _dmf_ref_columns(ref_arguments),
                         "condition": _dmf_ref_condition(ref_arguments),
                         "schedule": _col(row, "schedule"),
+                        "expectation": _col(row, "expectation"),
                     })
             except Exception as exc:  # noqa: BLE001 — graceful degradation
                 errors.append(str(exc))
