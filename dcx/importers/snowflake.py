@@ -281,12 +281,21 @@ def _accepted_values_from_condition(condition: Optional[str]) -> Optional[list[s
 # too, but only for expectations dcx wrote. Parsing `VALUE <= 4` also recovers the
 # operator from an expectation a user created in Snowsight.
 #
-# NOTE: no source for `expectation` is currently known. Checked and ruled out:
-# DATA_METRIC_FUNCTION_REFERENCES (no such column, and its PROPERTIES payload carries
-# only anomaly-detection/notification settings), SHOW EXPECTATIONS (does not exist),
-# ACCOUNT_USAGE (no matching view), and GET_DDL (renders no DMF associations at all).
-# The mapping is kept because it is the exact inverse of what the exporter writes and
-# costs nothing: wire `expectation` in `_fetch_dmf_references` if a source appears.
+# NOTE: Snowflake exposes NO readable source for a metric's EXPECTATION. Confirmed on a
+# live account by attaching one (`ALTER TABLE ... MODIFY DATA METRIC FUNCTION ... ADD
+# EXPECTATION EXP__DCX__PROBE (VALUE = 0)`) and re-checking every candidate — the
+# expectation exists and is enforced, yet nothing reports it:
+#   DATA_METRIC_FUNCTION_REFERENCES  no such column; PROPERTIES byte-identical
+#                                    before and after (anomaly-detection and
+#                                    notification settings only)
+#   SHOW EXPECTATIONS                does not exist
+#   ACCOUNT_USAGE                    no matching view
+#   GET_DDL                          byte-identical before and after; renders no DMF
+#                                    associations at all
+# So thresholds cannot round-trip: the contract is the source of truth for intent, and
+# import reports what is ATTACHED. The mapping below is kept because it is the exact
+# inverse of what the exporter writes and costs nothing — wire `expectation` in
+# `_fetch_dmf_references` if Snowflake ever surfaces one.
 _NUM = r"-?\d+(?:\.\d+)?"
 
 _SQL_OP_TO_ODCS: dict[str, str] = {
