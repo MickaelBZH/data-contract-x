@@ -280,6 +280,13 @@ def _accepted_values_from_condition(condition: Optional[str]) -> Optional[list[s
 # The expression is parsed rather than the expectation NAME: names encode the threshold
 # too, but only for expectations dcx wrote. Parsing `VALUE <= 4` also recovers the
 # operator from an expectation a user created in Snowsight.
+#
+# NOTE: no source for `expectation` is currently known. Checked and ruled out:
+# DATA_METRIC_FUNCTION_REFERENCES (no such column, and its PROPERTIES payload carries
+# only anomaly-detection/notification settings), SHOW EXPECTATIONS (does not exist),
+# ACCOUNT_USAGE (no matching view), and GET_DDL (renders no DMF associations at all).
+# The mapping is kept because it is the exact inverse of what the exporter writes and
+# costs nothing: wire `expectation` in `_fetch_dmf_references` if a source appears.
 _NUM = r"-?\d+(?:\.\d+)?"
 
 _SQL_OP_TO_ODCS: dict[str, str] = {
@@ -462,6 +469,7 @@ def _quality_from_dmf_references(
             setattr(rule, operator[0], operator[1])
         else:
             missing_operator.append(f"{table}.{columns[0]}" if columns else str(table))
+        
         if schedule:
             rule.schedule, rule.scheduler = schedule, "cron"
 
@@ -471,10 +479,13 @@ def _quality_from_dmf_references(
             by_table.setdefault(table, []).append(rule)
 
     if missing_operator:
+        # One summary line, not one per rule: with no metadata source for expectations
+        # this is the normal case, and per-rule noise would train people to ignore it.
         _warn(
-            "Imported quality rules without a pass condition (no readable expectation "
-            f"on the metric): {', '.join(missing_operator)}. Add an operator "
-            "(e.g. mustBe: 0) before these can fail anything."
+            f"{len(missing_operator)} quality rule(s) imported without a pass condition. "
+            "Snowflake exposes no readable source for a metric's EXPECTATION, so "
+            "thresholds cannot be recovered — keep them in the contract, which stays "
+            "the source of truth for intent."
         )
     if unmapped:
         _warn(
