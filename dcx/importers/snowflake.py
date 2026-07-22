@@ -94,6 +94,11 @@ def _physical_object_type(table_type: Optional[str]) -> str:
     return _TABLE_TYPE_TO_PHYSICAL.get(tt, tt.lower())
 
 
+# Snowflake's INTERNAL element-type names (as they appear in a `SHOW COLUMNS` payload)
+# → the spelling `CREATE TABLE` requires. VECTOR permits only these two element types.
+_VECTOR_ELEMENT_TYPES: dict[str, str] = {"REAL": "FLOAT", "FIXED": "INT"}
+
+
 def _vector_type_from_show_columns(payload: Any) -> Optional[str]:
     """Reconstruct `VECTOR(<element>, <dim>)` from a `SHOW COLUMNS` data_type payload.
 
@@ -101,7 +106,15 @@ def _vector_type_from_show_columns(payload: Any) -> Optional[str]:
     the element type and dimension appear nowhere in that view — and a bare `VECTOR` is
     not valid DDL. A contract imported from such a table therefore produced a
     `CREATE TABLE` Snowflake refuses to parse. `SHOW COLUMNS` carries the complete type
-    as a JSON payload, so we recover it from there.
+    as JSON, so we recover it from there:
+
+        VECTOR(FLOAT, 256) -> {"type": "VECTOR", "dimension": 256,
+                               "vectorElementType": {"type": "REAL", ...}}
+        VECTOR(INT, 3)     -> {"type": "VECTOR", "dimension": 3,
+                               "vectorElementType": {"type": "FIXED", "precision": 38, ...}}
+
+    Note the element type is NESTED and uses Snowflake's internal names (`REAL`/`FIXED`),
+    which must be translated back to the `FLOAT`/`INT` that DDL accepts.
 
     Returns None for anything that is not a confidently-reconstructable VECTOR, leaving
     the INFORMATION_SCHEMA-derived type untouched — this only ever adds precision.
@@ -112,11 +125,15 @@ def _vector_type_from_show_columns(payload: Any) -> Optional[str]:
         return None
     if not isinstance(info, dict) or str(info.get("type", "")).upper() != "VECTOR":
         return None
-    element = info.get("elementType") or info.get("element_type")
     dimension = info.get("dimension")
-    if not element or not isinstance(dimension, int) or isinstance(dimension, bool):
+    if not isinstance(dimension, int) or isinstance(dimension, bool):
         return None
-    return f"VECTOR({str(element).upper()}, {dimension})"
+    element = info.get("vectorElementType")
+    internal = element.get("type") if isinstance(element, dict) else element
+    ddl_element = _VECTOR_ELEMENT_TYPES.get(str(internal or "").upper())
+    if not ddl_element:
+        return None
+    return f"VECTOR({ddl_element}, {dimension})"
 
 
 def _physical_type(data_type: Optional[str], char_len, prec, scale, full_type=None) -> str:
