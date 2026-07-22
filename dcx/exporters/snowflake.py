@@ -1046,18 +1046,32 @@ def _generate_quality_sql(
         lines.append(f"ALTER {kind} {qualified} SET DATA_METRIC_SCHEDULE = '{schedule_clause}';")
         for sla in slas:
             lines.append(_sla_dmf_line(sla, kind=kind, qualified=qualified))
+        emitted: set[str] = set()
         for column, q in entries:
             add_dmf = _dmf_binding(q, column=column)
             label = q.name or _quality_metric(q) or "unnamed"
             if add_dmf:
-                expectation = _expectation_for_quality(q, add_dmf, column)
+                # A table-scope metric (rowCount, ...) authored under a COLUMN still
+                # binds to the table: `ON ()`. Naming its expectation after that column
+                # would be a lie, and would make N column-level rowCount rules look like
+                # N distinct expectations on one metric.
+                effective_column = None if add_dmf.rstrip().endswith("ON ()") else column
+                expectation = _expectation_for_quality(q, add_dmf, effective_column)
                 clause = f"\n  {expectation}" if expectation else ""
                 # Emit a plain ADD with its value-named expectation. If the DMF is
                 # already on the column, `apply` re-issues this as MODIFY ... ADD
                 # EXPECTATION so a new threshold is added additively (Snowsight style).
-                lines.append(
+                statement = (
                     f"ALTER {kind} {qualified} ADD DATA METRIC FUNCTION {add_dmf}{clause};"
                 )
+                # Several rules can collapse onto one association+expectation — most
+                # often a `rowCount` repeated under every column. Snowflake would take
+                # the first and treat the rest as already-present, so emitting them adds
+                # only noise.
+                if statement in emitted:
+                    continue
+                emitted.add(statement)
+                lines.append(statement)
             else:
                 target = f" on column {column}" if column else ""
                 lines.append(f"-- TODO: unmappable quality rule '{label}'{target} (type={q.type})")
