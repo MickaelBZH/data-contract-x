@@ -524,7 +524,7 @@ def build_snowflake_contract(
     `full_types`: (table, column) → complete Snowflake type, for types INFORMATION_SCHEMA
     cannot express (e.g. `VECTOR(FLOAT, 256)`); overrides the reconstructed type.
     `dmf_references`: attached Data Metric Functions → `quality` rules and, for
-    FRESHNESS, an `slaProperties` entry.
+    FRESHNESS, an `slaProperties` entry. Empty unless the caller opted in.
     `server_info`: account, database, schema, warehouse.
     """
     column_tags = column_tags or {}
@@ -850,9 +850,10 @@ def _fetch_tags(conn, database: str, schema: str, table_names: list[str]):
 def _fetch_dmf_references(conn, database: str, schema: str, table_names: list[str]):
     """Read attached Data Metric Functions, so applied quality comes back on import.
 
-    Returns a list of dicts: `{table, dmf, columns, schedule, signature}`. The
-    reference table function is per-entity, so this costs one query per table — the
-    same shape as `_fetch_tags`, and the reason it sits behind `--quality`.
+    Returns a list of dicts, one per attached metric. Both the reference and the
+    expectation table functions are per-entity, so this costs TWO queries per table on
+    top of the base import — which is why it is opt-in via `--quality` rather than on
+    by default.
 
     DMFs are an Enterprise feature and visibility is role-dependent, so a failure
     degrades to "no quality imported" with a single warning rather than failing the
@@ -952,7 +953,7 @@ def _contract_from_connection(
     schema: str,
     tables: Optional[list[str]],
     fetch_tags: bool,
-    fetch_quality: bool = True,
+    fetch_quality: bool = False,
     server_info: dict,
     server_name: str,
 ) -> OpenDataContractStandard:
@@ -1010,7 +1011,7 @@ def import_snowflake(import_args: dict) -> OpenDataContractStandard:
             schema=schema,
             tables=import_args.get("tables"),
             fetch_tags=import_args.get("tags", True),
-            fetch_quality=import_args.get("quality", True),
+            fetch_quality=import_args.get("quality", False),
             server_info={
                 "account": _first(import_args.get("account"), os.environ.get(_ENV_VARS["account"])),
                 "database": database,
@@ -1033,7 +1034,7 @@ def import_snowflake_oauth(
     role: Optional[str] = None,
     warehouse: Optional[str] = None,
     tags: bool = True,
-    quality: bool = True,
+    quality: bool = False,
     server_name: str = "production",
 ) -> OpenDataContractStandard:
     """Import using a caller-supplied Snowflake **OAuth token** — no env, no ambient creds.

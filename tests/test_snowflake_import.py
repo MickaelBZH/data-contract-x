@@ -672,7 +672,7 @@ def _import_with_dmfs(monkeypatch, rows):
             return _Cur(self.data)
 
     monkeypatch.setattr(si, "_connect", lambda import_args: _Conn(_fake_data()))
-    return import_snowflake({"database": "DB", "schema": "SCH", "account": "ACME"})
+    return import_snowflake({"database": "DB", "schema": "SCH", "account": "ACME", "quality": True})
 
 
 def _obj(contract, name="CUSTOMER"):
@@ -749,6 +749,37 @@ def test_user_defined_metric_imports_as_odcs_custom(monkeypatch):
     assert rule.type == "custom"
     assert rule.engine == "snowflake"
     assert rule.implementation == "MY_DB.GOV.NULL_COUNT"
+
+
+@pytest.mark.parametrize("import_args,expected_queries", [
+    ({}, 0),                       # default: off, for import speed
+    ({"quality": False}, 0),       # explicit --no-quality
+    ({"quality": True}, 2),        # opt in: references + expectations, per table
+])
+def test_quality_queries_are_opt_in(monkeypatch, import_args, expected_queries):
+    """Quality import costs two extra per-table round trips, so it is off unless asked
+    for. `_fake_data` has one table, so the count is the per-table cost."""
+    import dcx.importers.snowflake as si
+    seen: list = []
+
+    class _Cur(_FakeCursor):
+        def execute(self, sql, params=None):
+            if "DATA_METRIC_FUNCTION_" in sql:
+                seen.append(sql)
+                self.description = [("ref_id",)]
+                self._rows = []
+                return
+            return super().execute(sql, params)
+
+    class _Conn(_FakeConn):
+        def cursor(self):
+            return _Cur(self.data)
+
+    monkeypatch.setattr(si, "_connect", lambda import_args: _Conn(_fake_data()))
+    base = {"database": "DB", "schema": "SCH", "account": "ACME"}
+    import_snowflake({**base, **import_args})
+    # _fake_data has CUSTOMER and ORDERS, so two tables x the per-table cost.
+    assert len(seen) == expected_queries * 2
 
 
 def test_no_quality_flag_skips_the_dmf_query(monkeypatch):
@@ -885,7 +916,7 @@ def test_expectations_query_failure_is_not_fatal(monkeypatch):
             return _Cur(self.data)
 
     monkeypatch.setattr(si, "_connect", lambda import_args: _Conn(_fake_data()))
-    contract = import_snowflake({"database": "DB", "schema": "SCH", "account": "ACME"})
+    contract = import_snowflake({"database": "DB", "schema": "SCH", "account": "ACME", "quality": True})
     rule = {p.name: p for p in _obj(contract).properties}["ID"].quality[0]
     assert rule.metric == "nullValues"
     assert rule.mustBe is None
@@ -927,7 +958,7 @@ def test_second_expectation_on_one_association_is_reported(monkeypatch, capsys):
             return _Cur(self.data)
 
     monkeypatch.setattr(si, "_connect", lambda import_args: _Conn(_fake_data()))
-    contract = import_snowflake({"database": "DB", "schema": "SCH", "account": "ACME"})
+    contract = import_snowflake({"database": "DB", "schema": "SCH", "account": "ACME", "quality": True})
     rule = {p.name: p for p in _obj(contract).properties}["ID"].quality[0]
     assert rule.mustBe == 0
     assert "2 expectations" in capsys.readouterr().err

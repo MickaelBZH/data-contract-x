@@ -85,9 +85,9 @@ def import_snowflake(
         typer.Option(
             "--quality/--no-quality",
             help="Import attached data metric functions as quality rules and SLAs "
-                 "(Enterprise; costs one extra query per table).",
+                 "(Enterprise; off by default — costs two extra queries per table).",
         ),
-    ] = True,
+    ] = False,
     output: output_option = None,
     owner: owner_option = None,
     id: id_option = None,
