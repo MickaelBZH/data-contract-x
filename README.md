@@ -102,12 +102,13 @@ Every command is `dcx <command>`, and most are mirrored to a REST endpoint when 
 
 | Sub-command | Source |
 |---|---|
-| `dcx import snowflake` | A live Snowflake schema — tables **and views** (columns, primary keys, comments, tags; `physicalType` records the asset type, and a view's SELECT body is captured as a `viewDefinition`) |
+| `dcx import snowflake` | A live Snowflake schema — tables **and views** (columns, primary keys, comments, tags; `physicalType` records the asset type, and a view's SELECT body is captured as a `viewDefinition`). `--quality` additionally reads attached data metric functions back into `quality` / `slaProperties` |
 | `dcx import kafka` | A Kafka topic's value schema (Confluent Schema Registry) |
 | `dcx import <format>` | A file/document — `sql`, `avro`, `dbml`, `glue`, `bigquery`, `unity`, `jsonschema`, `json`, `odcs`, `parquet`, `csv`, `protobuf`, `spark`, `iceberg`, `excel`, `dbt` |
 
 ```bash
 dcx import snowflake --database MY_DB --schema LOAD --authenticator externalbrowser --output contract.yaml
+dcx import snowflake --database MY_DB --schema LOAD --quality --output contract.yaml   # + attached DMFs
 dcx import kafka --schema-registry https://sr:8081 --topic orders --output contract.yaml
 dcx import sql --source schema.sql --dialect snowflake --output contract.yaml
 ```
