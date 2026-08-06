@@ -564,6 +564,27 @@ def test_api_snowflake_works(monkeypatch):
     assert captured["account"] == "ACME"
     assert captured["schema"] == "SCH"       # body "schema" → schema_ → schema kwarg
     assert captured["tables"] == ["T"]
+    assert captured["quality"] is False      # opt-in; off unless requested
+
+
+def test_api_snowflake_quality_flag_passes_through(monkeypatch):
+    import dcx.importers.snowflake as si
+    captured = {}
+
+    def fake(**kw):
+        captured.update(kw)
+        return OpenDataContractStandard(
+            apiVersion="v3.1.0", kind="DataContract", id="x", name="X", version="1.0.0",
+        )
+
+    monkeypatch.setattr(si, "import_snowflake_oauth", fake)
+    r = _client().post(
+        "/import/snowflake",
+        headers={"Authorization": "Bearer tok"},
+        json={"account": "A", "database": "D", "schema": "S", "quality": True},
+    )
+    assert r.status_code == 200, r.text
+    assert captured["quality"] is True
 
 
 def test_api_snowflake_error_is_502(monkeypatch):
