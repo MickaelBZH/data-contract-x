@@ -68,6 +68,15 @@ exclude = ["tests*"]
 line-length = 120
 target-version = "py310"
 
+[tool.ruff.lint]
+# Pin the rule set explicitly. Without this, ruff applies whatever its *default*
+# selection happens to be, and CI installs ruff unpinned (`ruff>=0.6`) — so a ruff
+# release that widens the defaults turns CI red on branches that changed nothing.
+# That is exactly what 0.16 did by adding UP/B/I/SIM/RUF to the defaults.
+# These four are ruff's long-standing defaults: pyflakes plus the pycodestyle
+# errors that catch real breakage. Widening this is a deliberate, separate change.
+select = ["E4", "E7", "E9", "F"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 filterwarnings = [
