@@ -983,3 +983,82 @@ def test_second_expectation_on_one_association_is_reported(monkeypatch, capsys):
     rule = {p.name: p for p in _obj(contract).properties}["ID"].quality[0]
     assert rule.mustBe == 0
     assert "2 expectations" in capsys.readouterr().err
+
+
+# === Query failures surface as SnowflakeImportError, not a 500 ==============
+# `import_snowflake_oauth` wrapped only `connect()`, so anything that failed during
+# the metadata queries escaped as a raw ProgrammingError and the API answered 500
+# with a traceback. Snowflake's own message is passed through unchanged.
+
+
+class _RaisingCursor:
+    def __init__(self, exc):
+        self.exc = exc
+        self.description = []
+
+    def execute(self, sql, params=None):
+        raise self.exc
+
+    def fetchall(self):
+        return []
+
+    def close(self):
+        pass
+
+
+class _RaisingConn:
+    def __init__(self, exc):
+        self.exc = exc
+        self.closed = False
+
+    def cursor(self):
+        return _RaisingCursor(self.exc)
+
+    def close(self):
+        self.closed = True
+
+
+NO_WAREHOUSE = (
+    "000606 (57P03): 01c66fcb-0002-800c: No active warehouse selected in the "
+    "current session.  Select an active warehouse with the 'use warehouse' command."
+)
+
+
+def test_metadata_failure_becomes_import_error_not_raw_exception():
+    from dcx.importers.snowflake import _contract_from_connection
+
+    conn = _RaisingConn(RuntimeError(NO_WAREHOUSE))
+    with pytest.raises(SnowflakeImportError) as excinfo:
+        _contract_from_connection(
+            conn, database="DB", schema="SCH", tables=None, fetch_tags=False,
+            server_info={"account": "A", "database": "DB", "schema": "SCH", "warehouse": None},
+            server_name="production",
+        )
+    assert NO_WAREHOUSE in str(excinfo.value)   # Snowflake's own text, unaltered
+
+
+def test_metadata_failure_closes_the_connection(monkeypatch):
+    """The `finally: conn.close()` in the import entry points must survive the raise."""
+    import dcx.importers.snowflake as si
+
+    conn = _RaisingConn(RuntimeError(NO_WAREHOUSE))
+    monkeypatch.setattr(si, "_connect", lambda import_args: conn)
+    with pytest.raises(SnowflakeImportError):
+        si.import_snowflake({"database": "DB", "schema": "SCH", "account": "A"})
+    assert conn.closed is True
+
+
+def test_api_returns_502_with_snowflake_text_not_500(monkeypatch):
+    import dcx.importers.snowflake as si
+
+    def boom(**kw):
+        raise SnowflakeImportError(f"Snowflake metadata query failed: {NO_WAREHOUSE}")
+
+    monkeypatch.setattr(si, "import_snowflake_oauth", boom)
+    r = _client().post(
+        "/import/snowflake",
+        headers={"Authorization": "Bearer tok"},
+        json={"account": "A", "database": "D", "schema": "S"},
+    )
+    assert r.status_code == 502
+    assert "No active warehouse selected" in r.json()["detail"]

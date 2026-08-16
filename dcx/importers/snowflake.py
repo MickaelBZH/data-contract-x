@@ -958,9 +958,19 @@ def _contract_from_connection(
     server_name: str,
 ) -> OpenDataContractStandard:
     """Read metadata over an open connection and build the contract (caller closes conn)."""
-    columns, primary_keys, table_comments, table_types, view_definitions, full_types = _fetch_metadata(
-        conn, database, schema, tables,
-    )
+    # The base metadata queries are the only ones allowed to fail the import — tags and
+    # DMFs degrade to a warning below. Snowflake's own text is passed through verbatim;
+    # wrapping it in SnowflakeImportError is what stops a raw ProgrammingError from
+    # reaching the API as an unhandled 500.
+    try:
+        columns, primary_keys, table_comments, table_types, view_definitions, full_types = _fetch_metadata(
+            conn, database, schema, tables,
+        )
+    except SnowflakeImportError:
+        raise
+    except Exception as exc:
+        raise SnowflakeImportError(f"Snowflake metadata query failed: {exc}")
+
     if not columns:
         raise SnowflakeImportError(
             f"No columns found in {database}.{schema}"
