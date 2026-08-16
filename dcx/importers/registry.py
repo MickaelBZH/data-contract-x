@@ -80,6 +80,14 @@ def import_snowflake(
             help="Import object tags as NAME=VALUE (Enterprise; needs tag read access).",
         ),
     ] = True,
+    quality: Annotated[
+        bool,
+        typer.Option(
+            "--quality/--no-quality",
+            help="Import attached data metric functions as quality rules and SLAs "
+                 "(Enterprise; off by default — costs two extra queries per table).",
+        ),
+    ] = False,
     output: output_option = None,
     owner: owner_option = None,
     id: id_option = None,
@@ -106,6 +114,7 @@ def import_snowflake(
         authenticator=authenticator,
         connection_name=connection_name,
         tags=tags,
+        quality=quality,
         server_name=server_name,
         owner=owner,
         id=id,

@@ -35,7 +35,7 @@ import logging
 import re
 from contextlib import contextmanager
 from enum import Enum
-from typing import Iterable, Optional
+from typing import Any, Iterable, Optional
 
 import datacontract.export.sql_exporter as _upstream_sql_exporter
 from datacontract.export.exporter import Exporter
@@ -47,17 +47,62 @@ from open_data_contract_standard.model import (
     DataQuality,
     OpenDataContractStandard,
     SchemaObject,
+    ServiceLevelAgreementProperty,
 )
 
-# ODCS `metric` value → Snowflake CORE DMF name (and where it applies).
+# ODCS-standard `library` metrics → Snowflake CORE DMF (and where it applies).
 # Each entry: metric_name → (snowflake_dmf, scope) where scope is "column" or "table".
-# Keys are the metric names allowed by the ODCS spec for library-type quality.
+#
+# These names are part of the ODCS spec's `quality.metric` enum, so a `type: library`
+# rule using them validates against the UNMODIFIED ODCS schema (no schema patching)
+# and is understood by other ODCS consumers (e.g. Collate). Non-standard checks that
+# still map to a DMF are handled via `_CHECK_TO_DMF` / the `check` tag below,
+# keeping the contract portable while dcx still emits a native DMF.
 _LIBRARY_METRIC_TO_DMF: dict[str, tuple[str, str]] = {
     "rowCount":        ("SNOWFLAKE.CORE.ROW_COUNT", "table"),
     "nullValues":      ("SNOWFLAKE.CORE.NULL_COUNT", "column"),
     "missingValues":   ("SNOWFLAKE.CORE.NULL_COUNT", "column"),
     "duplicateValues": ("SNOWFLAKE.CORE.DUPLICATE_COUNT", "column"),
-    # `invalidValues` has no direct Snowflake CORE DMF — falls through to TODO.
+    # `invalidValues` counts rows whose value is NOT in the allowed set supplied in
+    # the rule's `arguments.validValues`; it maps to SNOWFLAKE.CORE.ACCEPTED_VALUES.
+    # See `_dmf_binding` for the `ON (col, col -> col IN (...))` association form.
+    "invalidValues":   ("SNOWFLAKE.CORE.ACCEPTED_VALUES", "column"),
+}
+
+# customProperties key naming the abstract check a `type: sql` rule implements (see
+# dcx.enrich.quality.CHECK_PROPERTY). Held locally so this adapter has no dependency
+# on the enricher — the shared contract is just the engine-neutral check name.
+_CHECK_PROPERTY = "check"
+
+# Checks this adapter can accelerate into a native Snowflake DMF, keyed by the
+# engine-neutral name carried in a rule's `check` tag. name -> (dmf, scope). Checks
+# not listed here simply run as their portable `sql` query.
+_CHECK_TO_DMF: dict[str, tuple[str, str]] = {
+    "blankCount": ("SNOWFLAKE.CORE.BLANK_COUNT", "column"),
+}
+
+# ODCS `slaProperties[].property` values this adapter enforces natively. ODCS models
+# freshness as an SLA, not a quality rule, so it is read from `slaProperties` rather
+# than from `quality` — expressing it as a quality rule needs a query that is
+# Snowflake-specific in all but name.
+#
+# `SNOWFLAKE.CORE.FRESHNESS ON ()` measures seconds since the last DML on the table.
+# The column form (`ON (col)`) accepts only DATE/TIMESTAMP_LTZ/TIMESTAMP_TZ — not
+# TIMESTAMP_NTZ, Snowflake's default TIMESTAMP — so the table form is used, matching
+# Snowsight's "last table update" freshness.
+_SLA_PROPERTY_TO_DMF: dict[str, tuple[str, str]] = {
+    "latency":   ("SNOWFLAKE.CORE.FRESHNESS", "table"),
+    "freshness": ("SNOWFLAKE.CORE.FRESHNESS", "table"),
+}
+
+# ODCS SLA `unit` → seconds. FRESHNESS reports seconds, so an SLA expressed in hours
+# or days is converted rather than rejected. ISO-ish abbreviations per the ODCS field
+# description; unknown units are skipped (with a `-- TODO`) rather than guessed.
+_SLA_UNIT_SECONDS: dict[str, int] = {
+    "s": 1, "sec": 1, "secs": 1, "second": 1, "seconds": 1,
+    "m": 60, "min": 60, "mins": 60, "minute": 60, "minutes": 60,
+    "h": 3600, "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600,
+    "d": 86400, "day": 86400, "days": 86400,
 }
 
 
@@ -659,22 +704,183 @@ def _quality_metric(q: DataQuality) -> Optional[str]:
     return q.metric or q.rule
 
 
-def _dmf_for_quality(q: DataQuality, *, column: Optional[str]) -> Optional[str]:
-    """Return the Snowflake DMF call (e.g. `SNOWFLAKE.CORE.NULL_COUNT ON (col)`), or None."""
-    if (q.type or "").lower() != "library":
+def _render_sql_literal(v: Any) -> str:
+    """Render a Python value as a Snowflake SQL literal for an IN (...) list.
+
+    Backslash is escaped as well as the quote: Snowflake interprets backslash escape
+    sequences inside string literals by default, so a raw `\\` would corrupt the value.
+    """
+    if isinstance(v, bool):
+        return "TRUE" if v else "FALSE"
+    if isinstance(v, (int, float)):
+        return _fmt_num(v)
+    return "'" + str(v).replace("\\", "\\\\").replace("'", "''") + "'"
+
+
+def _accepted_values_list(q: DataQuality) -> Optional[str]:
+    """Render the allowed-value set for `acceptedValues` from the rule's
+    `arguments` (`validValues` / `acceptedValues` / `values`) as a comma-separated
+    SQL literal list, or None if no non-empty set is present."""
+    args = q.arguments or {}
+    vals = None
+    for key in ("validValues", "acceptedValues", "values"):
+        candidate = args.get(key)
+        if isinstance(candidate, (list, tuple)) and candidate:
+            vals = candidate
+            break
+    if not vals:
         return None
+    rendered = [_render_sql_literal(v) for v in vals if v is not None]
+    return ", ".join(rendered) if rendered else None
+
+
+def _check_name(q: DataQuality) -> Optional[str]:
+    """Return the engine-neutral check name from the rule's `check` customProperties
+    tag, or None.
+
+    Lets a `type: sql`/`custom` rule that models a known check (e.g. blankCount,
+    freshness) upgrade to a native DMF while the CONTRACT stays portable and
+    engine-neutral (no Snowflake specifics stored in it)."""
+    for cp in (q.customProperties or []):
+        if getattr(cp, "property", None) == _CHECK_PROPERTY:
+            val = getattr(cp, "value", None)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+    return None
+
+
+def _dmf_binding(
+    q: DataQuality, *, column: Optional[str]
+) -> Optional[str]:
+    """Return the `<dmf> ON (...)` association for `ADD DATA METRIC FUNCTION`, or None.
+
+    A DMF is resolved from EITHER an ODCS-standard `type: library` metric
+    (`_LIBRARY_METRIC_TO_DMF`) OR the engine-neutral `check` tag on a `type: sql`/
+    `custom` rule (`_check_name` → `_CHECK_TO_DMF`) — the latter keeps the contract
+    portable while still emitting a native DMF for non-standard checks. For
+    `acceptedValues` the form includes the `col -> col IN (...)` lambda.
+    """
     metric = _quality_metric(q)
-    if not metric:
-        return None
-    mapping = _LIBRARY_METRIC_TO_DMF.get(metric)
-    if mapping is None:
-        return None
-    dmf, scope = mapping
+    is_library = (q.type or "").lower() == "library"
+    mapping = _LIBRARY_METRIC_TO_DMF.get(metric) if (is_library and metric) else None
+    if mapping is not None:
+        dmf, scope = mapping
+        if metric == "invalidValues":
+            values = _accepted_values_list(q)
+            if not column or not values:
+                # Without a column + allowed set there is nothing to check.
+                return None
+            return f"{dmf} ON ({column}, {column} -> {column} IN ({values}))"
+    else:
+        # Non-standard check carrying a `check` tag (type: sql/custom). Resolve the
+        # DMF + scope from this adapter's capability map; unknown checks stay as sql.
+        check = _check_name(q)
+        binding = _CHECK_TO_DMF.get(check) if check else None
+        if binding is None:
+            return None
+        dmf, scope = binding
     if scope == "table":
+        # Table-scope DMFs (ROW_COUNT, FRESHNESS) are added with an empty column
+        # list. `ON ()` is the documented syntax for both ALTER TABLE and ALTER VIEW.
         return f"{dmf} ON ()"
     if scope == "column" and column:
         return f"{dmf} ON ({column})"
     return None
+
+
+# ODCS operator field -> (SQL comparison template, Snowsight operator label). `VALUE`
+# is the placeholder Snowflake substitutes with the DMF result; the expression must
+# be TRUE when the data PASSES the check (matching ODCS semantics). Labels mirror
+# Snowsight's expectation-name vocabulary (EQUALTO, GREATERTHANOREQUALTO, ...).
+_OPERATOR_TO_EXPECTATION: dict[str, tuple[str, str]] = {
+    "mustBe":                 ("VALUE = {v}",  "EQUALTO"),
+    "mustNotBe":              ("VALUE <> {v}", "NOTEQUALTO"),
+    "mustBeGreaterThan":      ("VALUE > {v}",  "GREATERTHAN"),
+    "mustBeGreaterOrEqualTo": ("VALUE >= {v}", "GREATERTHANOREQUALTO"),
+    "mustBeLessThan":         ("VALUE < {v}",  "LESSTHAN"),
+    "mustBeLessOrEqualTo":    ("VALUE <= {v}", "LESSTHANOREQUALTO"),
+}
+_RANGE_OPERATOR_TO_EXPECTATION: dict[str, tuple[str, str]] = {
+    "mustBeBetween":    ("{a} <= VALUE AND VALUE <= {b}", "BETWEEN"),
+    "mustNotBeBetween": ("VALUE < {a} OR VALUE > {b}",     "NOTBETWEEN"),
+}
+
+# Snowsight friendly aliases for the common "= 0" completeness/uniqueness checks on a
+# column, keyed by DMF short name. Used only when the rule is `mustBe 0`.
+_ZERO_COUNT_ALIAS: dict[str, str] = {
+    "NULL_COUNT":      "NONULLS",
+    "BLANK_COUNT":     "NOBLANKS",
+    "DUPLICATE_COUNT": "NODUPLICATES",
+}
+
+# Prefix marking a dcx-authored expectation, so it stays distinguishable from one a
+# user created directly in Snowsight (which keeps its own plain `EXP__...` name) and
+# groups all dcx expectations together in the Snowsight UI.
+_EXP_PREFIX = "EXP__DCX__"
+
+
+def _fmt_num(n: float | int) -> str:
+    """Render a number without a trailing `.0` so `5.0` -> `5`."""
+    if isinstance(n, float) and n.is_integer():
+        return str(int(n))
+    return str(n)
+
+
+def _value_token(n: float | int) -> str:
+    """Identifier-safe form of a threshold for an expectation name (`-` -> `NEG`,
+    `.` -> `_`), so `10` -> `10`, `-3` -> `NEG3`, `5.5` -> `5_5`."""
+    return _fmt_num(n).replace("-", "NEG").replace(".", "_")
+
+
+def _expectation_name_and_expr(
+    q: DataQuality, dmf: str, column: Optional[str]
+) -> Optional[tuple[str, str]]:
+    """Return `(expectation_name, expression)` for the rule's ODCS operator, or None
+    if the rule carries no operator.
+
+    Names follow Snowsight's convention under an `EXP__DCX__` provenance prefix:
+    - a column `= 0` completeness/uniqueness check uses the friendly alias
+      (`EXP__DCX__<COL>__NONULLS` / `NOBLANKS` / `NODUPLICATES`);
+    - any other column check uses `EXP__DCX__<COL>__<DMF>__<OP><value>`;
+    - a table check uses `EXP__DCX__<DMF>__<OP><value>`.
+    Because the threshold is part of the name, a different threshold yields a distinct
+    expectation added alongside the existing one (additive). `VALUE` is the DMF
+    result; the expression is TRUE when the data passes."""
+    # Take the function name (before the ` ON (...)` args) then its last dotted part,
+    # so values containing periods in the args don't corrupt the label.
+    dmf_short = dmf.split(" ")[0].split(".")[-1].upper()
+    col = column.upper() if column else None
+
+    for op, (template, label) in _OPERATOR_TO_EXPECTATION.items():
+        v = getattr(q, op, None)
+        if v is None:
+            continue
+        expr = template.format(v=_fmt_num(v))
+        if col and op == "mustBe" and v == 0 and dmf_short in _ZERO_COUNT_ALIAS:
+            return f"{_EXP_PREFIX}{col}__{_ZERO_COUNT_ALIAS[dmf_short]}", expr
+        cond = f"{label}{_value_token(v)}"
+        body = f"{col}__{dmf_short}__{cond}" if col else f"{dmf_short}__{cond}"
+        return f"{_EXP_PREFIX}{body}", expr
+
+    for op, (template, label) in _RANGE_OPERATOR_TO_EXPECTATION.items():
+        rng = getattr(q, op, None)
+        if not (rng and len(rng) == 2):
+            continue
+        expr = template.format(a=_fmt_num(rng[0]), b=_fmt_num(rng[1]))
+        cond = f"{label}{_value_token(rng[0])}_{_value_token(rng[1])}"
+        body = f"{col}__{dmf_short}__{cond}" if col else f"{dmf_short}__{cond}"
+        return f"{_EXP_PREFIX}{body}", expr
+    return None
+
+
+def _expectation_for_quality(q: DataQuality, dmf: str, column: Optional[str]) -> Optional[str]:
+    """Build a Snowflake `EXPECTATION <name> ( <expr> )` clause from the rule's ODCS
+    operator, or None if the rule carries no operator."""
+    parts = _expectation_name_and_expr(q, dmf, column)
+    if parts is None:
+        return None
+    name, expr = parts
+    return f"EXPECTATION {name} ({expr})"
 
 
 def _quality_iter(
@@ -689,28 +895,183 @@ def _quality_iter(
             yield (col, q)
 
 
+def _to_dmf_schedule(value: str) -> str:
+    """Snowflake DATA_METRIC_SCHEDULE clause from a stored schedule value.
+
+    The contract stores the engine-neutral bare cron (e.g. `0 20 * * *`,
+    `*/5 * * * *`), which becomes `USING CRON <cron> UTC` — Snowflake's CRON accepts
+    step expressions, so minute cadences ride the same path. A value already in
+    Snowflake clause form (`USING CRON ...`, `<n> MINUTE`, `TRIGGER_ON_CHANGES`)
+    is used as-is, so the `metric_schedule` fallback default passes through.
+    """
+    clause = value.strip()
+    upper = clause.upper()
+    if (
+        upper.startswith("USING CRON")
+        or upper.endswith("MINUTE")
+        or upper == "TRIGGER_ON_CHANGES"
+    ):
+        return clause
+    return f"USING CRON {clause} UTC"
+
+
+def _resolve_table_schedule(
+    entries: list[tuple[Optional[str], DataQuality]],
+    slas: list[ServiceLevelAgreementProperty],
+    default: str,
+    *,
+    qualified: str = "",
+    warnings: Optional[list[str]] = None,
+) -> str:
+    """Snowflake DATA_METRIC_SCHEDULE for a table, from its quality rules / SLAs.
+
+    `DATA_METRIC_SCHEDULE` is a property of the TABLE, not of an individual metric, so
+    a table whose rules disagree cannot be represented. The first schedule found wins
+    and every differing one is reported through `warnings` — silently dropping a
+    cadence the contract asked for is exactly the kind of thing nobody notices.
+    If nothing carries one, the `metric_schedule` default (CLI `--metric-schedule` /
+    API field) applies.
+    """
+    found: list[str] = [
+        cron
+        for cron in ((q.schedule or "").strip() for _column, q in entries)
+        if cron
+    ]
+    found += [cron for cron in ((s.schedule or "").strip() for s in slas) if cron]
+    if not found:
+        return _to_dmf_schedule(default)
+    chosen = found[0]
+    ignored = sorted({c for c in found[1:] if c != chosen})
+    if ignored and warnings is not None:
+        warnings.append(
+            f"{qualified or 'table'}: conflicting data-quality schedules "
+            f"{[chosen, *ignored]}; DATA_METRIC_SCHEDULE is per-table, so '{chosen}' "
+            f"is used and the rest are ignored."
+        )
+    return _to_dmf_schedule(chosen)
+
+
+def _sla_seconds(sla: ServiceLevelAgreementProperty) -> Optional[int]:
+    """The SLA's value converted to seconds, or None if not a usable number/unit.
+
+    `SNOWFLAKE.CORE.FRESHNESS` reports seconds, so an SLA written in hours or days is
+    converted rather than refused. An unknown unit yields None (and a `-- TODO`) rather
+    than a guess — silently treating `4` weeks as `4` seconds would be worse than
+    emitting nothing.
+    """
+    value = sla.value
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    factor = _SLA_UNIT_SECONDS.get((sla.unit or "s").strip().lower())
+    if factor is None:
+        return None
+    return int(value * factor)
+
+
+def _sla_by_object(contract: OpenDataContractStandard) -> dict[str, list]:
+    """Group natively-enforceable `slaProperties` by the schema object they target.
+
+    ODCS `element` uses path notation, so it may be bare (`ORDERS`), qualified
+    (`DB.SCHEMA.ORDERS`) or column-scoped (`DB.SCHEMA.ORDERS.CREATED_AT`). An entry is
+    attributed to a schema object when that object's name appears as one of the path
+    segments. SLA properties with no `element`, or ones this adapter has no DMF for,
+    are left alone — they remain documentation, which is all ODCS asks of them.
+    """
+    grouped: dict[str, list] = {}
+    names = [obj.name for obj in (contract.schema_ or []) if obj.name]
+    for sla in contract.slaProperties or []:
+        if (sla.property or "").strip().lower() not in _SLA_PROPERTY_TO_DMF:
+            continue
+        segments = {seg.upper() for seg in (sla.element or "").split(".") if seg}
+        for name in names:
+            if name.upper() in segments:
+                grouped.setdefault(name, []).append(sla)
+    return grouped
+
+
+def _sla_dmf_line(
+    sla: ServiceLevelAgreementProperty, *, kind: str, qualified: str
+) -> str:
+    """One `ADD DATA METRIC FUNCTION` for an SLA, or a `-- TODO` if unenforceable.
+
+    An SLA value is an upper bound (`latency: 4 h` means "at most 4 hours old"), so the
+    expectation is `VALUE <= <seconds>`. ODCS SLA entries carry no operator field.
+    """
+    dmf, _scope = _SLA_PROPERTY_TO_DMF[(sla.property or "").strip().lower()]
+    seconds = _sla_seconds(sla)
+    if seconds is None:
+        return (
+            f"-- TODO: SLA '{sla.property}' on {qualified} is not enforceable "
+            f"(value={sla.value!r}, unit={sla.unit!r})"
+        )
+    short = dmf.split(".")[-1].upper()
+    name = f"{_EXP_PREFIX}{short}__LESSTHANOREQUALTO{_value_token(seconds)}"
+    return (
+        f"ALTER {kind} {qualified} ADD DATA METRIC FUNCTION {dmf} ON ()\n"
+        f"  EXPECTATION {name} (VALUE <= {seconds});"
+    )
+
+
 def _generate_quality_sql(
     contract: OpenDataContractStandard,
     *,
     metric_schedule: str,
     table_prefix: str = "",
+    warnings: Optional[list[str]] = None,
 ) -> str:
+    sla_by_object = _sla_by_object(contract)
     lines: list[str] = []
     for schema_obj in contract.schema_ or []:
         table = schema_obj.name
         if not table:
             continue
         entries = list(_quality_iter(schema_obj))
-        if not entries:
+        slas = sla_by_object.get(table, [])
+        if not entries and not slas:
             continue
         kind = _object_kind(schema_obj)
         qualified = f"{table_prefix}{table}"
-        lines.append(f"ALTER {kind} {qualified} SET DATA_METRIC_SCHEDULE = '{metric_schedule}';")
+        # Collected locally so a conflict is always visible as a `-- WARNING:` in the
+        # script itself (dry-run, export, review), and additionally handed to a caller
+        # that wants it programmatically.
+        schedule_warnings: list[str] = []
+        schedule_clause = _resolve_table_schedule(
+            entries, slas, metric_schedule,
+            qualified=qualified, warnings=schedule_warnings,
+        )
+        for warning in schedule_warnings:
+            lines.append(f"-- WARNING: {warning}")
+        if warnings is not None:
+            warnings.extend(schedule_warnings)
+        lines.append(f"ALTER {kind} {qualified} SET DATA_METRIC_SCHEDULE = '{schedule_clause}';")
+        for sla in slas:
+            lines.append(_sla_dmf_line(sla, kind=kind, qualified=qualified))
+        emitted: set[str] = set()
         for column, q in entries:
-            dmf = _dmf_for_quality(q, column=column)
+            add_dmf = _dmf_binding(q, column=column)
             label = q.name or _quality_metric(q) or "unnamed"
-            if dmf:
-                lines.append(f"ALTER {kind} {qualified} ADD DATA METRIC FUNCTION {dmf};")
+            if add_dmf:
+                # A table-scope metric (rowCount, ...) authored under a COLUMN still
+                # binds to the table: `ON ()`. Naming its expectation after that column
+                # would be a lie, and would make N column-level rowCount rules look like
+                # N distinct expectations on one metric.
+                effective_column = None if add_dmf.rstrip().endswith("ON ()") else column
+                expectation = _expectation_for_quality(q, add_dmf, effective_column)
+                clause = f"\n  {expectation}" if expectation else ""
+                # Emit a plain ADD with its value-named expectation. If the DMF is
+                # already on the column, `apply` re-issues this as MODIFY ... ADD
+                # EXPECTATION so a new threshold is added additively (Snowsight style).
+                statement = (
+                    f"ALTER {kind} {qualified} ADD DATA METRIC FUNCTION {add_dmf}{clause};"
+                )
+                # Several rules can collapse onto one association+expectation — most
+                # often a `rowCount` repeated under every column. Snowflake would take
+                # the first and treat the rest as already-present, so emitting them adds
+                # only noise.
+                if statement in emitted:
+                    continue
+                emitted.add(statement)
+                lines.append(statement)
             else:
                 target = f" on column {column}" if column else ""
                 lines.append(f"-- TODO: unmappable quality rule '{label}'{target} (type={q.type})")

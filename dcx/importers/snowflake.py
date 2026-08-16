@@ -14,7 +14,10 @@ server would import using its own single set of credentials for every caller —
 multi-tenant data-access concern. Live importers are CLI-only for v1.
 """
 
+import json
+import logging
 import os
+import re
 import sys
 from typing import Any, Optional
 
@@ -35,6 +38,8 @@ from dcx.apply.snowflake import (
     SNOWFLAKE_NETWORK_TIMEOUT,
 )
 from dcx.exporters.snowflake import _view_select_body
+
+logger = logging.getLogger(__name__)
 
 
 class SnowflakeImportError(Exception):
@@ -90,8 +95,56 @@ def _physical_object_type(table_type: Optional[str]) -> str:
     return _TABLE_TYPE_TO_PHYSICAL.get(tt, tt.lower())
 
 
-def _physical_type(data_type: Optional[str], char_len, prec, scale) -> str:
-    """Reconstruct a canonical Snowflake type string for `physicalType`."""
+# Snowflake's INTERNAL element-type names (as they appear in a `SHOW COLUMNS` payload)
+# → the spelling `CREATE TABLE` requires. VECTOR permits only these two element types.
+_VECTOR_ELEMENT_TYPES: dict[str, str] = {"REAL": "FLOAT", "FIXED": "INT"}
+
+
+def _vector_type_from_show_columns(payload: Any) -> Optional[str]:
+    """Reconstruct `VECTOR(<element>, <dim>)` from a `SHOW COLUMNS` data_type payload.
+
+    `INFORMATION_SCHEMA.COLUMNS.DATA_TYPE` reports a bare `VECTOR` for vector columns —
+    the element type and dimension appear nowhere in that view — and a bare `VECTOR` is
+    not valid DDL. A contract imported from such a table therefore produced a
+    `CREATE TABLE` Snowflake refuses to parse. `SHOW COLUMNS` carries the complete type
+    as JSON, so we recover it from there:
+
+        VECTOR(FLOAT, 256) -> {"type": "VECTOR", "dimension": 256,
+                               "vectorElementType": {"type": "REAL", ...}}
+        VECTOR(INT, 3)     -> {"type": "VECTOR", "dimension": 3,
+                               "vectorElementType": {"type": "FIXED", "precision": 38, ...}}
+
+    Note the element type is NESTED and uses Snowflake's internal names (`REAL`/`FIXED`),
+    which must be translated back to the `FLOAT`/`INT` that DDL accepts.
+
+    Returns None for anything that is not a confidently-reconstructable VECTOR, leaving
+    the INFORMATION_SCHEMA-derived type untouched — this only ever adds precision.
+    """
+    try:
+        info = json.loads(payload)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(info, dict) or str(info.get("type", "")).upper() != "VECTOR":
+        return None
+    dimension = info.get("dimension")
+    if not isinstance(dimension, int) or isinstance(dimension, bool):
+        return None
+    element = info.get("vectorElementType")
+    internal = element.get("type") if isinstance(element, dict) else element
+    ddl_element = _VECTOR_ELEMENT_TYPES.get(str(internal or "").upper())
+    if not ddl_element:
+        return None
+    return f"VECTOR({ddl_element}, {dimension})"
+
+
+def _physical_type(data_type: Optional[str], char_len, prec, scale, full_type=None) -> str:
+    """Reconstruct a canonical Snowflake type string for `physicalType`.
+
+    `full_type` (from `SHOW COLUMNS`) wins when present: it is the only source for types
+    INFORMATION_SCHEMA cannot express, such as `VECTOR(FLOAT, 256)`.
+    """
+    if full_type:
+        return full_type
     dt = (data_type or "").upper()
     if dt in ("TEXT", "STRING", "VARCHAR", "CHAR", "CHARACTER"):
         return f"VARCHAR({char_len})" if char_len else "VARCHAR"
@@ -100,6 +153,343 @@ def _physical_type(data_type: Optional[str], char_len, prec, scale) -> str:
     if dt in ("BINARY", "VARBINARY"):
         return f"BINARY({char_len})" if char_len else "BINARY"
     return dt
+
+
+# Snowflake CORE DMF → how the rule is represented in the contract. Inverse of the
+# exporter's `_LIBRARY_METRIC_TO_DMF` / `_CHECK_TO_DMF`, so an applied contract can be
+# read back. Each entry: DMF short name → (kind, name, scope) where `kind` is
+#   "library" — an ODCS `quality.metric` enum value
+#   "check"   — no ODCS metric exists; a `type: sql` rule carrying a `check` tag
+#   "sla"     — not a quality rule at all; an `slaProperties` entry
+#
+# NULL_COUNT is the export target of BOTH `nullValues` and `missingValues`, so the
+# reverse direction has to pick one: `nullValues` is canonical. A contract using
+# `missingValues` therefore comes back as `nullValues` — same DMF, same semantics.
+_DMF_TO_QUALITY: dict[str, tuple[str, str, str]] = {
+    "ROW_COUNT":       ("library", "rowCount", "table"),
+    "NULL_COUNT":      ("library", "nullValues", "column"),
+    "DUPLICATE_COUNT": ("library", "duplicateValues", "column"),
+    "ACCEPTED_VALUES": ("library", "invalidValues", "column"),
+    "BLANK_COUNT":     ("check", "blankCount", "column"),
+    "FRESHNESS":       ("sla", "latency", "table"),
+}
+
+# Mirrors dcx.enrich.quality.CHECK_PROPERTY / the exporter's `_CHECK_PROPERTY`.
+_CHECK_PROPERTY = "check"
+
+# Portable query re-attached to an imported `check` rule, so the round trip produces
+# the same contract the enricher would have written. Kept in step with
+# `dcx.enrich.quality._CHECK_QUERY`.
+_CHECK_QUERY: dict[str, str] = {
+    "blankCount": (
+        "SELECT COUNT(*) FROM ${table} "
+        "WHERE ${column} IS NOT NULL AND TRIM(CAST(${column} AS STRING)) = ''"
+    ),
+}
+
+
+# Built-in DMFs live in SNOWFLAKE.CORE. A user is free to define their own
+# `NULL_COUNT` elsewhere, so the namespace is part of the identity — only
+# SNOWFLAKE.CORE metrics map to ODCS constructs.
+_CORE_DMF_NAMESPACE = ("SNOWFLAKE", "CORE")
+
+
+def _dmf_identity(database: Any, schema: Any, name: Any) -> tuple[str, str]:
+    """`(short_name, fully_qualified_name)` for a DMF reference.
+
+    `METRIC_NAME` is the bare name (`NULL_COUNT`); the namespace arrives in the
+    separate `METRIC_DATABASE_NAME` / `METRIC_SCHEMA_NAME` columns. The short name
+    drives the mapping only when the namespace is SNOWFLAKE.CORE; the qualified name
+    is what a `type: custom` rule records.
+    """
+    short = str(name or "").strip().upper()
+    parts = [str(p).strip() for p in (database, schema, name) if p]
+    qualified = ".".join(parts) if parts else short
+    is_core = (
+        str(database or "").strip().upper(),
+        str(schema or "").strip().upper(),
+    ) == _CORE_DMF_NAMESPACE
+    return (short if is_core else "", qualified)
+
+
+def _parse_ref_arguments(ref_arguments: Any) -> list[dict]:
+    """`REF_ARGUMENTS` as a list of dicts; `[]` for anything unparseable."""
+    if isinstance(ref_arguments, str):
+        try:
+            ref_arguments = json.loads(ref_arguments)
+        except ValueError:
+            return []
+    if not isinstance(ref_arguments, list):
+        return []
+    return [a for a in ref_arguments if isinstance(a, dict)]
+
+
+def _dmf_ref_columns(ref_arguments: Any) -> list[str]:
+    """Column names a DMF is attached to, from its `REF_ARGUMENTS`.
+
+    Entries are domain-tagged and the array MIXES domains — an ACCEPTED_VALUES
+    reference carries both a `COLUMN` entry and a `VALUES` entry holding the
+    condition — so filtering on `domain` is required. Taking every `name` would
+    treat the condition text as a column name. A table-scope DMF has `[]`.
+    """
+    return [
+        str(arg["name"])
+        for arg in _parse_ref_arguments(ref_arguments)
+        if str(arg.get("domain", "")).upper() == "COLUMN" and arg.get("name")
+    ]
+
+
+def _dmf_ref_condition(ref_arguments: Any) -> Optional[str]:
+    """The `VALUES`-domain predicate of an ACCEPTED_VALUES reference, e.g.
+    `AGE BETWEEN 0 AND 150` or `STATUS IN ('A', 'B')`. None when absent."""
+    for arg in _parse_ref_arguments(ref_arguments):
+        if str(arg.get("domain", "")).upper() == "VALUES" and arg.get("name"):
+            return str(arg["name"])
+    return None
+
+
+# `IN ('A', 'B')` within an ACCEPTED_VALUES condition. Only an IN-list maps onto ODCS
+# `invalidValues` + `arguments.validValues`; any other predicate (BETWEEN, LIKE, ...)
+# has no ODCS equivalent and is preserved as an engine-specific rule instead.
+_ACCEPTED_VALUES_RE = re.compile(r"\bIN\s*\((?P<values>.+)\)\s*$", re.IGNORECASE | re.DOTALL)
+
+
+def _accepted_values_from_condition(condition: Optional[str]) -> Optional[list[str]]:
+    """Allowed-value set parsed out of an ACCEPTED_VALUES condition, or None if the
+    predicate is not a plain `IN` list."""
+    if not condition:
+        return None
+    match = _ACCEPTED_VALUES_RE.search(condition.strip())
+    if not match:
+        return None
+    values = [v.strip() for v in match.group("values").split(",")]
+    unquoted = [
+        v[1:-1].replace("\'\'", "\'") if len(v) >= 2 and v.startswith("\'") and v.endswith("\'") else v
+        for v in values
+        if v
+    ]
+    return unquoted or None
+
+
+# --- Expectations → ODCS operators -------------------------------------------
+# Exact inverse of the exporter's `_OPERATOR_TO_EXPECTATION` /
+# `_RANGE_OPERATOR_TO_EXPECTATION`. An attached DMF carries no threshold — Snowflake
+# keeps the pass condition in a separate EXPECTATION — so without this an imported rule
+# says "count the nulls" but never "and there must be none".
+#
+# The expression is parsed rather than the expectation NAME: names encode the threshold
+# too, but only for expectations dcx wrote. Parsing `VALUE <= 4` also recovers the
+# operator from an expectation a user created in Snowsight.
+#
+# Expectations live in their OWN table function, INFORMATION_SCHEMA.
+# DATA_METRIC_FUNCTION_EXPECTATIONS — not on the reference row, which is why nothing in
+# DATA_METRIC_FUNCTION_REFERENCES, GET_DDL or SHOW output ever mentions them. The two
+# are joined on `ref_id`, which both report.
+_NUM = r"-?\d+(?:\.\d+)?"
+
+_SQL_OP_TO_ODCS: dict[str, str] = {
+    "=":  "mustBe",
+    "<>": "mustNotBe",
+    "!=": "mustNotBe",
+    ">":  "mustBeGreaterThan",
+    ">=": "mustBeGreaterOrEqualTo",
+    "<":  "mustBeLessThan",
+    "<=": "mustBeLessOrEqualTo",
+}
+
+_EXPECTATION_SIMPLE_RE = re.compile(
+    rf"^\s*VALUE\s*(?P<op><=|>=|<>|!=|=|<|>)\s*(?P<v>{_NUM})\s*$", re.IGNORECASE,
+)
+_EXPECTATION_RANGE_RES: list[tuple[Any, str]] = [
+    (re.compile(rf"^\s*(?P<a>{_NUM})\s*<=\s*VALUE\s+AND\s+VALUE\s*<=\s*(?P<b>{_NUM})\s*$",
+                re.IGNORECASE), "mustBeBetween"),
+    (re.compile(rf"^\s*VALUE\s*<\s*(?P<a>{_NUM})\s+OR\s+VALUE\s*>\s*(?P<b>{_NUM})\s*$",
+                re.IGNORECASE), "mustNotBeBetween"),
+]
+
+
+def _as_number(text: str):
+    """`'0'` → `0`, `'4.5'` → `4.5` — integral values stay ints so contracts round-trip
+    without gaining a spurious `.0`."""
+    value = float(text)
+    return int(value) if value.is_integer() else value
+
+
+def _operator_from_expectation(expression: Optional[str]) -> Optional[tuple[str, Any]]:
+    """`(odcs_operator, value)` parsed from an expectation expression, or None.
+
+    `VALUE <= 14400`                   → ("mustBeLessOrEqualTo", 14400)
+    `10 <= VALUE AND VALUE <= 20`      → ("mustBeBetween", [10, 20])
+    """
+    if not expression:
+        return None
+    text = str(expression).strip()
+    if text.startswith("(") and text.endswith(")"):
+        text = text[1:-1].strip()
+    for pattern, operator in _EXPECTATION_RANGE_RES:
+        match = pattern.match(text)
+        if match:
+            return operator, [_as_number(match.group("a")), _as_number(match.group("b"))]
+    match = _EXPECTATION_SIMPLE_RE.match(text)
+    if match:
+        operator = _SQL_OP_TO_ODCS.get(match.group("op"))
+        if operator:
+            return operator, _as_number(match.group("v"))
+    return None
+
+
+# A trailing timezone on a cron schedule (`UTC`, `America/Los_Angeles`) — anything
+# that is not a cron field. Cron fields only ever contain digits and `*,-/?LW#`.
+_CRON_TIMEZONE_RE = re.compile(r"\s+(?P<tz>[A-Za-z][A-Za-z0-9_+\-/]*)$")
+
+
+def _bare_cron(schedule: Optional[str]) -> Optional[str]:
+    """Reduce a Snowflake schedule to the bare cron the contract stores.
+
+    `DATA_METRIC_FUNCTION_REFERENCES.SCHEDULE` reports `0 */1 * * * UTC` — the cron
+    plus a timezone, WITHOUT the `USING CRON` prefix that `ALTER ... SET
+    DATA_METRIC_SCHEDULE` requires. Both forms are accepted here so this is the exact
+    inverse of the exporter's `_to_dmf_schedule`. Non-cron schedules (`5 MINUTE`,
+    `TRIGGER_ON_CHANGES`) pass through untouched.
+    """
+    if not schedule:
+        return None
+    text = str(schedule).strip()
+    if text.upper().startswith("USING CRON"):
+        text = text[len("USING CRON"):].strip()
+    elif text.upper().endswith("MINUTE") or text.upper() == "TRIGGER_ON_CHANGES":
+        return text
+    text = _CRON_TIMEZONE_RE.sub("", text).strip()
+    return text or None
+
+
+def _quality_from_dmf_references(
+    references: list, *, database: Optional[str], schema: Optional[str],
+) -> tuple[dict, dict, list]:
+    """Turn DMF references into `(quality_by_column, quality_by_table, slaProperties)`.
+
+    Closes the round trip: quality applied by `dcx apply snowflake` reads back as the
+    same ODCS constructs that produced it. FRESHNESS deliberately returns as an SLA,
+    not a quality rule, matching how the exporter sources it.
+
+    An attached DMF has no operator attached to it here — Snowflake keeps the pass
+    condition in a separate EXPECTATION — so imported rules carry the metric without a
+    threshold. They are a faithful record of what is *attached*, and `enrich quality`
+    or a human supplies the operator.
+    """
+    from open_data_contract_standard.model import DataQuality, ServiceLevelAgreementProperty
+
+    by_column: dict[tuple, list] = {}
+    by_table: dict[str, list] = {}
+    slas: list = []
+    unmapped: set[str] = set()
+    missing_operator: list[str] = []
+
+    for ref in references:
+        table = ref.get("table")
+        mapping = _DMF_TO_QUALITY.get(ref.get("dmf") or "")
+        columns = ref.get("columns") or []
+        schedule = _bare_cron(ref.get("schedule"))
+        if mapping is None:
+            # A DMF this adapter has no ODCS equivalent for — typically a user-defined
+            # one. ODCS models exactly this with `type: custom`, which is honest: it is
+            # executable only on Snowflake, so there is no portable query to invent.
+            unmapped.add(ref.get("qualified") or "?")
+            rule = DataQuality(
+                type="custom", engine="snowflake", implementation=ref.get("qualified"),
+            )
+            if schedule:
+                rule.schedule, rule.scheduler = schedule, "cron"
+            target = (table, columns[0]) if columns else None
+            (by_column.setdefault(target, []) if target else by_table.setdefault(table, [])).append(rule)
+            continue
+
+        kind, name, _scope = mapping
+        if kind == "sla":
+            # FRESHNESS reports seconds, and its expectation is an upper bound, so
+            # `VALUE <= 14400` is exactly the SLA value in seconds.
+            operator = _operator_from_expectation(ref.get("expectation"))
+            seconds = operator[1] if operator and not isinstance(operator[1], list) else None
+            sla = ServiceLevelAgreementProperty(
+                property=name, value=seconds if seconds is not None else 0, unit="s",
+            )
+            sla.element = ".".join(p for p in (database, schema, table) if p)
+            if seconds is None:
+                sla.description = (
+                    "Imported from an attached SNOWFLAKE.CORE.FRESHNESS metric that "
+                    "carries no expectation; set the threshold here."
+                )
+            if schedule:
+                sla.schedule, sla.scheduler = schedule, "cron"
+            slas.append(sla)
+            continue
+
+        if kind == "check":
+            rule = DataQuality(
+                type="sql",
+                query=_CHECK_QUERY.get(name, ""),
+                customProperties=[CustomProperty(property=_CHECK_PROPERTY, value=name)],
+            )
+        else:
+            if name == "invalidValues":
+                # ACCEPTED_VALUES stores an arbitrary predicate. Only a plain IN-list
+                # maps onto ODCS `invalidValues` + `arguments.validValues`; anything
+                # else (BETWEEN, LIKE, ...) has no ODCS equivalent, so it is preserved
+                # verbatim as an engine-specific rule rather than silently flattened
+                # into a rule that means something different.
+                condition = ref.get("condition")
+                values = _accepted_values_from_condition(condition)
+                if values is None:
+                    rule = DataQuality(
+                        type="custom",
+                        engine="snowflake",
+                        implementation={
+                            "metric": ref.get("qualified"),
+                            "column": columns[0] if columns else None,
+                            "condition": condition,
+                        },
+                    )
+                    _warn(
+                        f"{table}: ACCEPTED_VALUES on {columns[0] if columns else '?'} "
+                        f"uses a predicate ODCS cannot express ({condition!r}); "
+                        "imported as `type: custom`."
+                    )
+                    if schedule:
+                        rule.schedule, rule.scheduler = schedule, "cron"
+                    (by_column.setdefault((table, columns[0]), []) if columns
+                     else by_table.setdefault(table, [])).append(rule)
+                    continue
+                rule = DataQuality(type="library", metric=name, arguments={"validValues": values})
+            else:
+                rule = DataQuality(type="library", metric=name)
+        operator = _operator_from_expectation(ref.get("expectation"))
+        if operator:
+            setattr(rule, operator[0], operator[1])
+        else:
+            missing_operator.append(f"{table}.{columns[0]}" if columns else str(table))
+        
+        if schedule:
+            rule.schedule, rule.scheduler = schedule, "cron"
+
+        if columns:
+            by_column.setdefault((table, columns[0]), []).append(rule)
+        else:
+            by_table.setdefault(table, []).append(rule)
+
+    if missing_operator:
+        # One summary line rather than one per rule: a metric with no expectation is a
+        # legitimate Snowflake state (it computes a value nothing is compared against).
+        _warn(
+            f"{len(missing_operator)} quality rule(s) imported without a pass condition "
+            "(the metric carries no expectation in Snowflake): "
+            f"{', '.join(missing_operator)}."
+        )
+    if unmapped:
+        _warn(
+            "Imported non-standard data metric functions as `type: custom` "
+            f"(Snowflake-only): {', '.join(sorted(unmapped))}"
+        )
+    return by_column, by_table, slas
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +507,8 @@ def build_snowflake_contract(
     table_tags: Optional[dict] = None,
     table_types: Optional[dict] = None,
     view_definitions: Optional[dict] = None,
+    full_types: Optional[dict] = None,
+    dmf_references: Optional[list] = None,
     server_name: str = "production",
 ) -> OpenDataContractStandard:
     """Build an ODCS contract from already-fetched Snowflake metadata.
@@ -129,12 +521,21 @@ def build_snowflake_contract(
     `table_tags`: table → list of `DB.SCHEMA.NAME=VALUE` tag strings.
     `table_types`: table → Snowflake TABLE_TYPE (e.g. `VIEW`) → sets `physicalType`.
     `view_definitions`: view → SELECT body → stored as a `viewDefinition` customProperty.
+    `full_types`: (table, column) → complete Snowflake type, for types INFORMATION_SCHEMA
+    cannot express (e.g. `VECTOR(FLOAT, 256)`); overrides the reconstructed type.
+    `dmf_references`: attached Data Metric Functions → `quality` rules and, for
+    FRESHNESS, an `slaProperties` entry. Empty unless the caller opted in.
     `server_info`: account, database, schema, warehouse.
     """
     column_tags = column_tags or {}
     table_tags = table_tags or {}
     table_types = table_types or {}
     view_definitions = view_definitions or {}
+    full_types = full_types or {}
+    quality_by_column, quality_by_table, sla_properties = _quality_from_dmf_references(
+        dmf_references or [], database=server_info.get("database"),
+        schema=server_info.get("schema"),
+    )
     # Group columns by table, preserving first-seen order.
     tables: dict[str, list[dict]] = {}
     for col in columns:
@@ -151,6 +552,7 @@ def build_snowflake_contract(
                 physicalType=_physical_type(
                     col.get("data_type"), col.get("char_len"),
                     col.get("precision"), col.get("scale"),
+                    full_types.get((table_name, col["name"])),
                 ),
                 logicalType=logical,
             )
@@ -177,6 +579,10 @@ def build_snowflake_contract(
             if ctags:
                 prop.tags = ctags
 
+            cquality = quality_by_column.get((table_name, col["name"]))
+            if cquality:
+                prop.quality = cquality
+
             props.append(prop)
 
         obj = SchemaObject(
@@ -189,6 +595,9 @@ def build_snowflake_contract(
         ttags = table_tags.get(table_name)
         if ttags:
             obj.tags = ttags
+        tquality = quality_by_table.get(table_name)
+        if tquality:
+            obj.quality = tquality
         vdef = _view_select_body(view_definitions.get(table_name))
         if vdef:
             obj.customProperties = (obj.customProperties or []) + [
@@ -219,6 +628,8 @@ def build_snowflake_contract(
     )
     contract.servers = [server]
     contract.schema_ = schema_objects
+    if sla_properties:
+        contract.slaProperties = sla_properties
     return contract
 
 
@@ -338,10 +749,25 @@ def _fetch_metadata(conn, database: str, schema: str, tables: Optional[list[str]
             tname = row[idx["table_name"]]
             cname = row[idx["column_name"]]
             primary_keys.setdefault(tname, set()).add(cname)
+
+        # --- full types INFORMATION_SCHEMA can't express (VECTOR's element/dimension) ---
+        # Best-effort: SHOW COLUMNS needs its own privileges, and the contract is still
+        # correct without it for every type INFORMATION_SCHEMA does describe.
+        full_types: dict[tuple[str, str], str] = {}
+        try:
+            cur.execute(f'SHOW COLUMNS IN SCHEMA "{db}"."{sch}"')
+            idx = {c[0].lower(): i for i, c in enumerate(cur.description)}
+            for row in cur.fetchall():
+                rendered = _vector_type_from_show_columns(row[idx["data_type"]])
+                if rendered:
+                    full_types[(row[idx["table_name"]], row[idx["column_name"]])] = rendered
+        except Exception:
+            logger.debug("SHOW COLUMNS unavailable; parameterised types may be incomplete",
+                         exc_info=True)
     finally:
         cur.close()
 
-    return columns, primary_keys, table_comments, table_types, view_definitions
+    return columns, primary_keys, table_comments, table_types, view_definitions, full_types
 
 
 def _fq_tag(row: tuple, idx: dict) -> str:
@@ -421,6 +847,105 @@ def _fetch_tags(conn, database: str, schema: str, table_names: list[str]):
     return column_tags, table_tags
 
 
+def _fetch_dmf_references(conn, database: str, schema: str, table_names: list[str]):
+    """Read attached Data Metric Functions, so applied quality comes back on import.
+
+    Returns a list of dicts, one per attached metric. Both the reference and the
+    expectation table functions are per-entity, so this costs TWO queries per table on
+    top of the base import — which is why it is opt-in via `--quality` rather than on
+    by default.
+
+    DMFs are an Enterprise feature and visibility is role-dependent, so a failure
+    degrades to "no quality imported" with a single warning rather than failing the
+    whole import.
+    """
+    db = database.upper()
+    sch = schema.upper()
+    references: list[dict] = []
+    expectations: dict[str, list[str]] = {}
+    errors: list[str] = []
+
+    cur = conn.cursor()
+    try:
+        for table in table_names:
+            fq = f"{db}.{sch}.{table.upper()}"
+            try:
+                cur.execute(
+                    f'SELECT * FROM TABLE("{db}".INFORMATION_SCHEMA.'
+                    f"DATA_METRIC_FUNCTION_REFERENCES("
+                    f"REF_ENTITY_NAME => '{fq}', REF_ENTITY_DOMAIN => 'TABLE'))"
+                )
+                idx = {c[0].lower(): i for i, c in enumerate(cur.description)}
+
+                def _col(row, *names):
+                    for name in names:
+                        if name in idx:
+                            return row[idx[name]]
+                    return None
+
+                for row in cur.fetchall():
+                    ref_arguments = _col(row, "ref_arguments")
+                    short, qualified = _dmf_identity(
+                        _col(row, "metric_database_name"),
+                        _col(row, "metric_schema_name"),
+                        _col(row, "metric_name"),
+                    )
+                    references.append({
+                        "table": table,
+                        "dmf": short,
+                        "qualified": qualified,
+                        "columns": _dmf_ref_columns(ref_arguments),
+                        "condition": _dmf_ref_condition(ref_arguments),
+                        "schedule": _col(row, "schedule"),
+                        "ref_id": _col(row, "ref_id"),
+                    })
+            except Exception as exc:  # noqa: BLE001 — graceful degradation
+                errors.append(str(exc))
+
+            # Expectations live in a separate table function, joined on ref_id.
+            try:
+                cur.execute(
+                    f'SELECT * FROM TABLE("{db}".INFORMATION_SCHEMA.'
+                    f"DATA_METRIC_FUNCTION_EXPECTATIONS("
+                    f"REF_ENTITY_NAME => '{fq}', REF_ENTITY_DOMAIN => 'TABLE'))"
+                )
+                idx = {c[0].lower(): i for i, c in enumerate(cur.description)}
+                for row in cur.fetchall():
+                    ref_id = row[idx["ref_id"]] if "ref_id" in idx else None
+                    expression = (
+                        row[idx["expectation_expression"]]
+                        if "expectation_expression" in idx else None
+                    )
+                    if ref_id and expression:
+                        expectations.setdefault(ref_id, []).append(str(expression))
+            except Exception as exc:  # noqa: BLE001 — graceful degradation
+                errors.append(str(exc))
+            except Exception as exc:  # noqa: BLE001 — graceful degradation
+                errors.append(str(exc))
+    finally:
+        cur.close()
+
+    # Attach each association's expectation. An association may carry several; ODCS has
+    # room for exactly one operator, so the first parseable one wins and the rest are
+    # reported rather than dropped silently.
+    for ref in references:
+        found = expectations.get(ref.get("ref_id")) or []
+        ref["expectation"] = found[0] if found else None
+        if len(found) > 1:
+            _warn(
+                f"{ref['table']}: metric {ref.get('qualified')} has {len(found)} "
+                f"expectations; ODCS holds one operator, so {found[0]!r} was used "
+                f"and {found[1:]} ignored."
+            )
+
+    if errors and not references:
+        _warn(
+            "Could not read Snowflake data metric functions (none visible to this "
+            f"role, or DMFs not in use): {errors[0]}"
+        )
+    return references
+
+
 def _contract_from_connection(
     conn,
     *,
@@ -428,11 +953,12 @@ def _contract_from_connection(
     schema: str,
     tables: Optional[list[str]],
     fetch_tags: bool,
+    fetch_quality: bool = False,
     server_info: dict,
     server_name: str,
 ) -> OpenDataContractStandard:
     """Read metadata over an open connection and build the contract (caller closes conn)."""
-    columns, primary_keys, table_comments, table_types, view_definitions = _fetch_metadata(
+    columns, primary_keys, table_comments, table_types, view_definitions, full_types = _fetch_metadata(
         conn, database, schema, tables,
     )
     if not columns:
@@ -441,10 +967,16 @@ def _contract_from_connection(
             + (f" for tables {tables}." if tables else ".")
         )
 
+    # Both the tag and DMF lookups are per-entity table functions, so they share one
+    # ordered list of table names.
+    table_names = list(dict.fromkeys(c["table"] for c in columns))
+
     column_tags: dict = {}
     table_tags: dict = {}
+    dmf_references: list = []
+    if fetch_quality:
+        dmf_references = _fetch_dmf_references(conn, database, schema, table_names)
     if fetch_tags:
-        table_names = list(dict.fromkeys(c["table"] for c in columns))
         column_tags, table_tags = _fetch_tags(conn, database, schema, table_names)
 
     return build_snowflake_contract(
@@ -454,8 +986,10 @@ def _contract_from_connection(
         table_comments=table_comments,
         column_tags=column_tags,
         table_tags=table_tags,
+        dmf_references=dmf_references,
         table_types=table_types,
         view_definitions=view_definitions,
+        full_types=full_types,
         server_name=server_name,
     )
 
@@ -477,6 +1011,7 @@ def import_snowflake(import_args: dict) -> OpenDataContractStandard:
             schema=schema,
             tables=import_args.get("tables"),
             fetch_tags=import_args.get("tags", True),
+            fetch_quality=import_args.get("quality", False),
             server_info={
                 "account": _first(import_args.get("account"), os.environ.get(_ENV_VARS["account"])),
                 "database": database,
@@ -499,6 +1034,7 @@ def import_snowflake_oauth(
     role: Optional[str] = None,
     warehouse: Optional[str] = None,
     tags: bool = True,
+    quality: bool = False,
     server_name: str = "production",
 ) -> OpenDataContractStandard:
     """Import using a caller-supplied Snowflake **OAuth token** — no env, no ambient creds.
@@ -546,6 +1082,7 @@ def import_snowflake_oauth(
             schema=schema,
             tables=tables,
             fetch_tags=tags,
+            fetch_quality=quality,
             server_info={"account": account, "database": database, "schema": schema, "warehouse": warehouse},
             server_name=server_name,
         )

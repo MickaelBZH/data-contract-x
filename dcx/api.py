@@ -825,6 +825,10 @@ class SnowflakeImportRequest(BaseModel):
     role: Optional[str] = Field(None, description="Role to assume.")
     warehouse: Optional[str] = Field(None, description="Warehouse for the queries.")
     tags: bool = Field(True, description="Import object tags as NAME=VALUE.")
+    quality: bool = Field(
+        False,
+        description="Import attached data metric functions as quality rules and SLAs.",
+    )
     server_name: str = Field("production", description="Name for the server entry in the contract.")
 
 
@@ -864,6 +868,7 @@ def mirror_snowflake_import_to_fastapi(api_app: FastAPI, prefix: str = "/import"
                 role=body.role,
                 warehouse=body.warehouse,
                 tags=body.tags,
+                quality=body.quality,
                 server_name=body.server_name,
             )
         except snowflake_import.SnowflakeImportError as exc:

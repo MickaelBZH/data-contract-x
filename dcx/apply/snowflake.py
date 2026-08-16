@@ -17,6 +17,7 @@ to build the script, then runs it via `snowflake-connector-python`.
 
 import logging
 import os
+import re
 from typing import Any, List, Optional
 
 import typer
@@ -76,6 +77,119 @@ def _first(*candidates: Optional[str]) -> Optional[str]:
         if c is not None and c != "":
             return c
     return None
+
+
+# Head of our generated `ALTER ... ADD DATA METRIC FUNCTION <assoc> EXPECTATION <exp>`.
+# `rest` deliberately captures everything after the keyword: the association can be
+# `ON ()`, `ON (col)`, or ACCEPTED_VALUES' lambda form
+# `ON (col, col -> col IN ('A', 'B'))`, which no fixed paren pattern matches safely.
+_ADD_DMF_HEAD_RE = re.compile(
+    r"^(?P<head>ALTER\s+(?:TABLE|VIEW)\s+\S+)\s+"
+    r"ADD\s+DATA\s+METRIC\s+FUNCTION\s+(?P<rest>.+)$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Separates the association from the trailing `EXPECTATION <name> (<expr>)` clause.
+_EXPECTATION_SEP_RE = re.compile(r"\s+EXPECTATION\s+", re.IGNORECASE)
+
+
+def _has_expectation(stmt: str) -> bool:
+    """True if the statement carries an `EXPECTATION` clause."""
+    return bool(_EXPECTATION_SEP_RE.search(stmt))
+
+
+def _add_dmf_to_modify_expectation(stmt: str) -> Optional[str]:
+    """Rewrite one of our `ADD DATA METRIC FUNCTION ... EXPECTATION ...` statements as
+    `MODIFY DATA METRIC FUNCTION ... ADD EXPECTATION ...`, or None if it isn't one of
+    ours or carries no expectation clause.
+
+    Splitting on the LAST ` EXPECTATION ` is what makes the ACCEPTED_VALUES lambda form
+    work: the association may embed arbitrary string literals, but the expectation
+    expression we generate (`VALUE = 0`, `VALUE >= 10`, ...) never contains the keyword,
+    so the final occurrence is always the real clause boundary.
+    """
+    m = _ADD_DMF_HEAD_RE.match(stmt.strip())
+    if not m:
+        return None
+    rest = m.group("rest")
+    separators = list(_EXPECTATION_SEP_RE.finditer(rest))
+    if not separators:
+        return None
+    last = separators[-1]
+    assoc = rest[: last.start()].strip()
+    expectation = rest[last.end():].strip()
+    if not assoc or not expectation:
+        return None
+    return (
+        f"{m.group('head')} MODIFY DATA METRIC FUNCTION "
+        f"{assoc} ADD EXPECTATION {expectation}"
+    )
+
+
+# Snowflake signals these two idempotent "already there" conditions only in the message
+# text — the connector exposes no distinct errno for either — so they are matched on
+# wording. If a future Snowflake release rewords them, re-applying an unchanged contract
+# starts failing loudly rather than silently skipping work, which is the safe direction.
+_DMF_ALREADY_ATTACHED = "already has the data metric function"
+_EXPECTATION_ALREADY_EXISTS = "already has an expectation"
+
+
+def _split_sql_statements(sql: str) -> list[str]:
+    """Split a generated script into individual statements, quote-aware.
+
+    Uses the connector's own parser — the one `execute_string` calls internally — so a
+    semicolon inside a string literal never splits a statement in half. That is not
+    hypothetical: a column comment (`'Lifecycle state; one of NEW, DONE'`) or a value in
+    an ACCEPTED_VALUES list will contain one. `remove_comments` drops the `-- TODO` lines
+    the exporter emits for unmappable rules, so they never reach Snowflake.
+
+    We iterate and execute the statements ourselves instead of calling `execute_string`
+    so each one can carry its own error handling (see `_execute_statement`).
+    """
+    from io import StringIO
+
+    from snowflake.connector.util_text import split_statements
+
+    statements: list[str] = []
+    for stmt, _is_put_or_get in split_statements(StringIO(sql), remove_comments=True):
+        cleaned = (stmt or "").strip().rstrip(";").strip()
+        if cleaned:
+            statements.append(cleaned)
+    return statements
+
+
+def _execute_statement(conn, stmt: str) -> None:
+    """Execute one statement, absorbing only the genuinely idempotent conflicts."""
+    cur = conn.cursor()
+    try:
+        try:
+            cur.execute(stmt)
+        except Exception as exc:
+            if _DMF_ALREADY_ATTACHED not in str(exc).lower():
+                raise
+            # Snowflake permits one instance of a given DMF per column, so re-applying
+            # a contract fails here. Re-issue as `MODIFY ... ADD EXPECTATION` so a
+            # changed threshold is added alongside the existing one (Snowsight style).
+            modify = _add_dmf_to_modify_expectation(stmt)
+            if modify is None:
+                # A bare DMF with no expectation is simply already attached — nothing
+                # more to apply. But if the statement DID carry an expectation we could
+                # not rewrite, staying silent would drop a governance change on the
+                # floor, so surface the original error instead.
+                if _has_expectation(stmt):
+                    raise
+                return
+            try:
+                cur.execute(modify)
+            except Exception as exc2:
+                # The same expectation name is already present (re-applying an unchanged
+                # rule). Snowflake has no `ADD EXPECTATION IF NOT EXISTS`, so a duplicate
+                # is treated as the no-op it is.
+                if _EXPECTATION_ALREADY_EXISTS not in str(exc2).lower():
+                    raise
+    finally:
+        cur.close()
+
 
 
 def _find_snowflake_server(
@@ -453,14 +567,17 @@ def _connect_apply(
                 + "\n- ".join(real_drift)
             )
 
-        # `Connection.execute_string` parses & runs each `;`-separated statement
-        # and returns one cursor per statement. (Note: `execute_string` lives on
-        # the Connection, not the Cursor.)
+        # Statements are split quote-aware and run one at a time, rather than handed to
+        # `execute_string`, so each can absorb its own idempotent DMF/expectation
+        # conflicts (see `_execute_statement`).
         try:
-            cursors = list(conn.execute_string(sql))
+            executed = 0
+            for stmt in _split_sql_statements(sql):
+                _execute_statement(conn, stmt)
+                executed += 1
         except Exception as exc:
             raise ApplyError(f"Snowflake execution failed: {exc}")
-        return len(cursors), warnings
+        return executed, warnings
     finally:
         conn.close()
 
