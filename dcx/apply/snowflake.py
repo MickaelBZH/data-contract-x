@@ -134,6 +134,26 @@ _DMF_ALREADY_ATTACHED = "already has the data metric function"
 _EXPECTATION_ALREADY_EXISTS = "already has an expectation"
 
 
+# The reconcile counterpart of the "already there" conditions: a `DROP` errors when the
+# association / expectation is already gone (a concurrent edit, or re-running the same
+# reconcile). Same matched-on-wording approach as the ADD side — the connector exposes no
+# distinct errno — gated to DROP statements so a real failure elsewhere still surfaces.
+_DROP_DMF_GONE_HINTS = ("does not have", "not associated", "does not exist", "not attached")
+_DROP_EXPECTATION_GONE_HINTS = ("unknown expectation", "does not exist", "not found", "no expectation")
+
+
+def _is_drop_already_gone(stmt: str, exc: Exception) -> bool:
+    """True when a reconcile `DROP` failed only because its target is already absent."""
+    upper = stmt.upper()
+    msg = str(exc).lower()
+    if "DROP EXPECTATION" in upper:
+        return any(hint in msg for hint in _DROP_EXPECTATION_GONE_HINTS)
+    if "DROP DATA METRIC FUNCTION" in upper and "MODIFY DATA METRIC FUNCTION" not in upper:
+        return any(hint in msg for hint in _DROP_DMF_GONE_HINTS)
+    return False
+
+
+
 def _split_sql_statements(sql: str) -> list[str]:
     """Split a generated script into individual statements, quote-aware.
 
@@ -165,6 +185,9 @@ def _execute_statement(conn, stmt: str) -> None:
         try:
             cur.execute(stmt)
         except Exception as exc:
+            if _is_drop_already_gone(stmt, exc):
+                # Reconcile DROP whose target is already gone — the no-op it should be.
+                return
             if _DMF_ALREADY_ATTACHED not in str(exc).lower():
                 raise
             # Snowflake permits one instance of a given DMF per column, so re-applying
@@ -283,13 +306,16 @@ def apply_snowflake(
     tag_namespace_filter: Optional[list[str]] = None,
     metric_schedule: str = "USING CRON 0 0 * * * UTC",
     strict: bool = False,
+    reconcile: bool = False,
 ) -> dict[str, Any]:
     """Generate Snowflake SQL from the contract and execute it.
 
-    Returns `{dry_run, sql, statements_executed, account, warnings}`. `warnings`
-    holds any schema-drift notes from comparing the contract to live tables; with
-    `strict=True` drift raises `ApplyError` and nothing is executed. Raises
-    `ApplyError` on connection/configuration problems.
+    Returns `{dry_run, sql, statements_executed, account, warnings, reconcile_sql}`.
+    `warnings` holds any schema-drift notes from comparing the contract to live tables;
+    with `strict=True` drift raises `ApplyError` and nothing is executed. When
+    `reconcile=True`, DMFs/expectations the contract no longer wants are removed after
+    the additive apply (and previewed on dry-run, which then needs a live connection).
+    Raises `ApplyError` on connection/configuration problems.
     """
     sql = to_snowflake_full_sql(
         contract,
@@ -305,12 +331,13 @@ def apply_snowflake(
         server=server_name,
     )
 
-    if dry_run:
+    if dry_run and not reconcile:
         return {
             "dry_run": True,
             "sql": sql,
             "statements_executed": 0,
             "warnings": [],
+            "reconcile_sql": "",
         }
 
     # Build connector kwargs
@@ -334,15 +361,31 @@ def apply_snowflake(
             schema=schema, authenticator=authenticator,
         )
 
-    statements_executed, warnings = _connect_apply(
+    if dry_run:  # reconcile preview — needs live state, so it connects (read-only)
+        drops = preview_reconcile(
+            conn_kwargs, contract, database=conn_kwargs.get("database"),
+            schema=conn_kwargs.get("schema"), server_name=server_name,
+        )
+        return {
+            "dry_run": True,
+            "sql": _with_reconcile_section(sql, "\n".join(drops)),
+            "statements_executed": 0,
+            "warnings": [],
+            "account": conn_kwargs.get("account"),
+            "reconcile_sql": "\n".join(drops),
+        }
+
+    statements_executed, warnings, reconcile_sql = _connect_apply(
         sql, conn_kwargs, contract=contract, strict=strict,
+        reconcile=reconcile, server_name=server_name,
     )
     return {
         "dry_run": False,
-        "sql": sql,
+        "sql": _with_reconcile_section(sql, reconcile_sql),
         "statements_executed": statements_executed,
         "warnings": warnings,
         "account": conn_kwargs.get("account"),
+        "reconcile_sql": reconcile_sql,
     }
 
 
@@ -367,6 +410,7 @@ def apply_snowflake_oauth(
     tag_namespace_filter: Optional[list[str]] = None,
     metric_schedule: str = "USING CRON 0 0 * * * UTC",
     strict: bool = False,
+    reconcile: bool = False,
 ) -> dict[str, Any]:
     """Apply a contract to Snowflake using a caller-supplied **OAuth token**.
 
@@ -374,7 +418,9 @@ def apply_snowflake_oauth(
     warehouse, database, schema) is taken from the contract's Snowflake server
     block, with optional overrides. Defaults to `auto` DDL — creates the table if
     missing, otherwise governs the existing one. Returns schema-drift `warnings`;
-    with `strict=True` drift raises instead of applying.
+    with `strict=True` drift raises instead of applying. When `reconcile=True`, DMFs
+    and expectations the contract no longer wants are removed after the additive apply
+    (previewed on dry-run, which then also needs the token to read live state).
     """
     srv = _find_snowflake_server(contract, server_name)
     account = account or (srv.account if srv else None)
@@ -399,10 +445,10 @@ def apply_snowflake_oauth(
         server=server_name,
     )
 
-    if dry_run:  # preview the SQL without connecting — no token needed
+    if dry_run and not reconcile:  # preview the SQL without connecting — no token needed
         return {
             "dry_run": True, "sql": sql, "statements_executed": 0,
-            "warnings": [], "account": account,
+            "warnings": [], "account": account, "reconcile_sql": "",
         }
 
     if not token:
@@ -422,15 +468,31 @@ def apply_snowflake_oauth(
     if srv and srv.schema_:
         conn_kwargs["schema"] = srv.schema_
 
-    statements_executed, warnings = _connect_apply(
+    if dry_run:  # reconcile preview — reads live DMF state (hence the token above)
+        drops = preview_reconcile(
+            conn_kwargs, contract, database=conn_kwargs.get("database"),
+            schema=conn_kwargs.get("schema"), server_name=server_name,
+        )
+        return {
+            "dry_run": True,
+            "sql": _with_reconcile_section(sql, "\n".join(drops)),
+            "statements_executed": 0,
+            "warnings": [],
+            "account": account,
+            "reconcile_sql": "\n".join(drops),
+        }
+
+    statements_executed, warnings, reconcile_sql = _connect_apply(
         sql, conn_kwargs, contract=contract, strict=strict,
+        reconcile=reconcile, server_name=server_name,
     )
     return {
         "dry_run": False,
-        "sql": sql,
+        "sql": _with_reconcile_section(sql, reconcile_sql),
         "statements_executed": statements_executed,
         "warnings": warnings,
         "account": account,
+        "reconcile_sql": reconcile_sql,
     }
 
 
@@ -520,20 +582,16 @@ def _detect_drift(
     return warnings
 
 
-def _connect_apply(
-    sql: str,
-    conn_kwargs: dict[str, Any],
-    *,
-    contract: Optional[OpenDataContractStandard] = None,
-    check_drift: bool = True,
-    strict: bool = False,
-) -> tuple[int, list[str]]:
-    """Connect, optionally check schema drift, then execute the multi-statement SQL.
+def _with_reconcile_section(sql: str, reconcile_sql: str) -> str:
+    """Append the reconcile removals to the additive script for audit/preview, or return
+    the script unchanged when there is nothing to remove."""
+    if not reconcile_sql:
+        return sql
+    return f"{sql}\n\n-- ===== RECONCILE (removals) =====\n{reconcile_sql}"
 
-    Returns `(statements_executed, warnings)`. With `strict`, any drift becomes an
-    `ApplyError` and nothing is executed. Drift introspection is best-effort: if it
-    fails (e.g. no INFORMATION_SCHEMA access) the apply still proceeds with a note.
-    """
+
+def _open_connection(conn_kwargs: dict[str, Any]):
+    """Open a Snowflake connection, applying shared timeouts and AWS-noise silencing."""
     try:
         import snowflake.connector
     except ImportError:
@@ -546,9 +604,68 @@ def _connect_apply(
     conn_kwargs.setdefault("network_timeout", SNOWFLAKE_NETWORK_TIMEOUT)
     quiet_aws_credential_noise()
     try:
-        conn = snowflake.connector.connect(**conn_kwargs)
+        return snowflake.connector.connect(**conn_kwargs)
     except Exception as exc:
         raise ApplyError(f"Snowflake connection failed: {exc}")
+
+
+def _reconcile_plan(
+    conn,
+    contract: OpenDataContractStandard,
+    *,
+    database: Optional[str],
+    schema: Optional[str],
+    server_name: Optional[str],
+) -> list[str]:
+    """The reconcile DROP/MODIFY statements for `contract` over an open connection."""
+    from dcx.apply import reconcile as reconcile_mod
+
+    return reconcile_mod.plan_reconcile(
+        conn, contract, database=database, schema=schema, server=server_name,
+    )
+
+
+def preview_reconcile(
+    conn_kwargs: dict[str, Any],
+    contract: OpenDataContractStandard,
+    *,
+    database: Optional[str],
+    schema: Optional[str],
+    server_name: Optional[str],
+) -> list[str]:
+    """Open a short-lived connection just to compute the reconcile removals (dry-run).
+
+    A reconcile preview must read live Snowflake state to know what to drop, so unlike a
+    plain dry-run it does connect — hence the API path still requires a token for it.
+    """
+    conn = _open_connection(dict(conn_kwargs))
+    try:
+        return _reconcile_plan(
+            conn, contract, database=database, schema=schema, server_name=server_name,
+        )
+    finally:
+        conn.close()
+
+
+def _connect_apply(
+    sql: str,
+    conn_kwargs: dict[str, Any],
+    *,
+    contract: Optional[OpenDataContractStandard] = None,
+    check_drift: bool = True,
+    strict: bool = False,
+    reconcile: bool = False,
+    server_name: Optional[str] = None,
+) -> tuple[int, list[str], str]:
+    """Connect, optionally check schema drift, then execute the multi-statement SQL.
+
+    Returns `(statements_executed, warnings, reconcile_sql)`. With `strict`, any drift
+    becomes an `ApplyError` and nothing is executed. Drift introspection is best-effort:
+    if it fails (e.g. no INFORMATION_SCHEMA access) the apply still proceeds with a note.
+    When `reconcile` is set, the additive script runs first, then the DROP/MODIFY
+    removals computed from live state are executed and returned as `reconcile_sql`.
+    """
+    conn = _open_connection(conn_kwargs)
 
     try:
         warnings: list[str] = []
@@ -570,14 +687,27 @@ def _connect_apply(
         # Statements are split quote-aware and run one at a time, rather than handed to
         # `execute_string`, so each can absorb its own idempotent DMF/expectation
         # conflicts (see `_execute_statement`).
+        reconcile_sql = ""
         try:
             executed = 0
             for stmt in _split_sql_statements(sql):
                 _execute_statement(conn, stmt)
                 executed += 1
+            if reconcile and contract is not None:
+                # Additive statements have run; now remove what the contract no longer
+                # wants (deleted rules, stale/disabled expectations). New expectations
+                # already exist by here, so an edited threshold is never left unguarded.
+                drops = _reconcile_plan(
+                    conn, contract, database=conn_kwargs.get("database"),
+                    schema=conn_kwargs.get("schema"), server_name=server_name,
+                )
+                for stmt in drops:
+                    _execute_statement(conn, stmt)
+                    executed += 1
+                reconcile_sql = "\n".join(drops)
         except Exception as exc:
             raise ApplyError(f"Snowflake execution failed: {exc}")
-        return executed, warnings
+        return executed, warnings, reconcile_sql
     finally:
         conn.close()
 
