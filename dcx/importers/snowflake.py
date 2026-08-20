@@ -925,18 +925,22 @@ def _fetch_dmf_references(conn, database: str, schema: str, table_names: list[st
     finally:
         cur.close()
 
-    # Attach each association's expectation. An association may carry several; ODCS has
-    # room for exactly one operator, so the first parseable one wins and the rest are
-    # reported rather than dropped silently.
+    # Attach expectations. A single DMF association can carry several (e.g. two ROW_COUNT
+    # thresholds). ODCS models one operator per rule, so expand a multi-expectation
+    # association into one ref per expectation — each becomes its own rule downstream —
+    # rather than collapsing to the first and dropping the rest.
+    expanded: list[dict] = []
     for ref in references:
         found = expectations.get(ref.get("ref_id")) or []
-        ref["expectation"] = found[0] if found else None
-        if len(found) > 1:
-            _warn(
-                f"{ref['table']}: metric {ref.get('qualified')} has {len(found)} "
-                f"expectations; ODCS holds one operator, so {found[0]!r} was used "
-                f"and {found[1:]} ignored."
-            )
+        if len(found) <= 1:
+            ref["expectation"] = found[0] if found else None
+            expanded.append(ref)
+            continue
+        for expression in found:
+            clone = dict(ref)
+            clone["expectation"] = expression
+            expanded.append(clone)
+    references = expanded
 
     if errors and not references:
         _warn(
