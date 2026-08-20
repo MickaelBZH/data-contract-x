@@ -36,7 +36,10 @@ from dcx.exporters.snowflake import (
     _object_kind,
     _quality_iter,
     _rule_disabled,
+    _sla_by_object,
+    _sla_seconds,
     _snowflake_table_prefix,
+    _value_token,
 )
 from dcx.importers.snowflake import (
     _DMF_TO_QUALITY,
@@ -48,6 +51,27 @@ from dcx.importers.snowflake import (
 # (dmf_fully_qualified_name_upper, columns_upper) — identifies one DMF association,
 # matching how both the exporter emits it and the live reference reports it.
 AssocKey = tuple[str, tuple[str, ...]]
+
+# Fully-qualified table-scope freshness DMF, mirroring the exporter's SLA emission.
+_FRESHNESS_DMF = "SNOWFLAKE.CORE.FRESHNESS"
+
+# customProperties key the frontend stamps on a rule it read back from Snowflake.
+# Such a rule's live threshold is not recoverable (INFORMATION_SCHEMA does not expose
+# expectation expressions), so reconcile must preserve — never drop — its expectations.
+_SNOWFLAKE_SOURCE_PROPERTY = "snowflakeSource"
+
+# Desired-state marker for an association whose expectations must be left intact: an
+# imported rule. Distinct from an empty set (which means "drop every expectation",
+# i.e. a disabled rule). `is`-compared, never equality-compared.
+_PRESERVE = object()
+
+
+def _rule_imported(q: Any) -> bool:
+    """True if the rule carries the frontend's `snowflakeSource: import` tag."""
+    for cp in (getattr(q, "customProperties", None) or []):
+        if getattr(cp, "property", None) == _SNOWFLAKE_SOURCE_PROPERTY:
+            return str(getattr(cp, "value", "")).strip().lower() == "import"
+    return False
 
 
 def _assoc_key(add_dmf: str, column: Optional[str]) -> tuple[AssocKey, Optional[str]]:
@@ -86,11 +110,18 @@ def desired_state(
 ) -> dict[str, dict]:
     """Desired DMF state per table, as ``qualified_upper -> {kind, statement_table, assocs}``.
 
-    ``assocs`` maps each desired association (`AssocKey`) to the set of dcx expectation
-    NAMES the contract wants on it — empty for a disabled or operator-less rule, which
-    is what drives a `DROP EXPECTATION` on the live side.
+    ``assocs`` maps each desired association (`AssocKey`) to EITHER the set of dcx
+    expectation NAMES the contract wants on it (empty ⇒ `DROP EXPECTATION`, i.e. a
+    disabled rule) OR the `_PRESERVE` sentinel for an imported rule whose live
+    threshold is unknown and must be left untouched.
+
+    The desired set is the *complete* thing the user wants kept: it spans the
+    contract's quality rules AND its `slaProperties` freshness (a table-scope
+    `SNOWFLAKE.CORE.FRESHNESS`), so a reconcile never removes a metric the contract
+    still declares just because it lives outside the `quality` array.
     """
     prefix = _snowflake_table_prefix(contract, server)
+    slas_by_object = _sla_by_object(contract)
     out: dict[str, dict] = {}
     for schema_obj in contract.schema_ or []:
         name = schema_obj.name
@@ -101,17 +132,32 @@ def desired_state(
             statement_table.upper(),
             {"kind": _object_kind(schema_obj), "statement_table": statement_table, "assocs": {}},
         )
+        assocs = table["assocs"]
         for column, q in _quality_iter(schema_obj):
             add_dmf = _dmf_binding(q, column=column)
             if not add_dmf:
                 continue
             key, effective_column = _assoc_key(add_dmf, column)
-            exps: set[str] = table["assocs"].setdefault(key, set())
+            if _rule_imported(q):
+                assocs[key] = _PRESERVE
+                continue
+            if assocs.get(key) is _PRESERVE:
+                continue  # an imported sibling already locked this association
+            exps: set[str] = assocs.setdefault(key, set())
             if _rule_disabled(q):
                 continue
             parts = _expectation_name_and_expr(q, add_dmf, effective_column)
             if parts:
                 exps.add(parts[0].upper())
+        for sla in slas_by_object.get(name, []):
+            seconds = _sla_seconds(sla)
+            if seconds is None:
+                continue
+            key = (_FRESHNESS_DMF, ())
+            if assocs.get(key) is _PRESERVE:
+                continue
+            exps = assocs.setdefault(key, set())
+            exps.add(f"{_EXP_PREFIX}FRESHNESS__LESSTHANOREQUALTO{_value_token(seconds)}".upper())
     return out
 
 
@@ -228,7 +274,8 @@ def plan_from_states(desired: dict[str, dict], live: dict[str, list[dict]]) -> l
             continue  # table not in the contract — not managed here
         kind = d_table["kind"]
         stmt_table = d_table["statement_table"]
-        d_assocs: dict[AssocKey, set[str]] = d_table["assocs"]
+        # Values are `set[str]` (managed expectations) or the `_PRESERVE` sentinel.
+        d_assocs: dict[AssocKey, Any] = d_table["assocs"]
 
         for a in assocs:
             if not a["supported"]:
@@ -241,6 +288,8 @@ def plan_from_states(desired: dict[str, dict], live: dict[str, list[dict]]) -> l
                 )
                 continue
             desired_exps = d_assocs[a["key"]]
+            if desired_exps is _PRESERVE:
+                continue  # imported association — leave the metric and its expectations
             for ename in sorted(a["exp_names"]):
                 if ename.startswith(prefix_upper) and ename not in desired_exps:
                     expectation_drops.append(

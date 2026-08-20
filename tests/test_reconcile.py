@@ -248,6 +248,142 @@ def test_desired_state_disabled_rule_has_no_expectation():
     assert state["DB.SCH.T"]["assocs"][("SNOWFLAKE.CORE.ROW_COUNT", ())] == set()
 
 
+# === imported rules & SLA freshness: complete desired state, never dropped ==
+
+
+def test_desired_state_marks_imported_rule_as_preserve():
+    from dcx.apply.reconcile import _PRESERVE
+
+    contract = _contract(
+        """
+        schema:
+          - name: T
+            physicalType: table
+            properties:
+              - name: EMAIL
+                physicalType: STRING
+                quality:
+                  - type: library
+                    metric: nullValues
+                    customProperties:
+                      - property: snowflakeSource
+                        value: import
+        """
+    )
+    state = desired_state(contract)
+    assert state["DB.SCH.T"]["assocs"][("SNOWFLAKE.CORE.NULL_COUNT", ("EMAIL",))] is _PRESERVE
+
+
+def test_imported_association_and_its_expectations_are_never_dropped():
+    """A pre-existing (imported) rule the user kept must survive a reconcile: its
+    association stays and its unknown-threshold expectation is left intact."""
+    contract = _contract(
+        """
+        schema:
+          - name: T
+            physicalType: table
+            properties:
+              - name: EMAIL
+                physicalType: STRING
+                quality:
+                  - type: library
+                    metric: nullValues
+                    customProperties:
+                      - property: snowflakeSource
+                        value: import
+        """
+    )
+    live = {
+        "DB.SCH.T": [
+            {
+                "key": ("SNOWFLAKE.CORE.NULL_COUNT", ("EMAIL",)),
+                "qualified_dmf": "SNOWFLAKE.CORE.NULL_COUNT",
+                "on_args": "EMAIL",
+                "supported": True,
+                "exp_names": {"EXP__DCX__EMAIL__NONULLS"},
+            }
+        ]
+    }
+    assert plan_from_states(desired_state(contract), live) == []
+
+
+def test_removed_imported_rule_is_still_dropped():
+    """Preservation is driven by the rule being present with its import tag; once it is
+    gone from the contract, reconcile detaches it as usual."""
+    contract = _contract(
+        """
+        schema:
+          - name: T
+            physicalType: table
+            properties:
+              - name: EMAIL
+                physicalType: STRING
+        """
+    )
+    live = {
+        "DB.SCH.T": [
+            {
+                "key": ("SNOWFLAKE.CORE.NULL_COUNT", ("EMAIL",)),
+                "qualified_dmf": "SNOWFLAKE.CORE.NULL_COUNT",
+                "on_args": "EMAIL",
+                "supported": True,
+                "exp_names": {"EXP__DCX__EMAIL__NONULLS"},
+            }
+        ]
+    }
+    assert plan_from_states(desired_state(contract), live) == [
+        "ALTER TABLE DB.SCH.T DROP DATA METRIC FUNCTION SNOWFLAKE.CORE.NULL_COUNT ON (EMAIL);"
+    ]
+
+
+def test_desired_state_includes_sla_freshness():
+    contract = _contract(
+        """
+        slaProperties:
+          - property: latency
+            value: 4
+            unit: h
+            element: T
+        schema:
+          - name: T
+            physicalType: table
+        """
+    )
+    state = desired_state(contract)
+    assert state["DB.SCH.T"]["assocs"][("SNOWFLAKE.CORE.FRESHNESS", ())] == {
+        "EXP__DCX__FRESHNESS__LESSTHANOREQUALTO14400"
+    }
+
+
+def test_live_freshness_not_dropped_when_contract_declares_it():
+    """Freshness lives in slaProperties, not quality — reconcile must still treat it as
+    desired so a live FRESHNESS metric is never spuriously detached."""
+    contract = _contract(
+        """
+        slaProperties:
+          - property: latency
+            value: 4
+            unit: h
+            element: T
+        schema:
+          - name: T
+            physicalType: table
+        """
+    )
+    live = {
+        "DB.SCH.T": [
+            {
+                "key": ("SNOWFLAKE.CORE.FRESHNESS", ()),
+                "qualified_dmf": "SNOWFLAKE.CORE.FRESHNESS",
+                "on_args": "",
+                "supported": True,
+                "exp_names": {"EXP__DCX__FRESHNESS__LESSTHANOREQUALTO14400"},
+            }
+        ]
+    }
+    assert plan_from_states(desired_state(contract), live) == []
+
+
 # === end-to-end apply → reconcile (fake connector serving live DMF state) ====
 
 
