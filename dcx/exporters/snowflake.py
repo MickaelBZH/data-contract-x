@@ -749,6 +749,30 @@ def _check_name(q: DataQuality) -> Optional[str]:
     return None
 
 
+# customProperty flag that turns a rule's pass/fail expectation off while leaving the
+# metric attached. Snowflake has no per-association enable/disable, so "disable" is
+# modelled as: keep the DATA METRIC FUNCTION computing, but carry no EXPECTATION (so it
+# never flips to a violation). `reconcile` drops the previously-applied EXPECTATION.
+_ENABLED_PROPERTY = "enabled"
+
+
+def _rule_disabled(q: DataQuality) -> bool:
+    """True if the rule carries `customProperties.enabled == false` (any falsey spelling).
+
+    A disabled rule still binds its DMF (the metric keeps computing and recording a
+    value) but emits no EXPECTATION, so it raises no data-quality violation.
+    """
+    for cp in (q.customProperties or []):
+        if getattr(cp, "property", None) != _ENABLED_PROPERTY:
+            continue
+        val = getattr(cp, "value", None)
+        if isinstance(val, bool):
+            return not val
+        if isinstance(val, str):
+            return val.strip().lower() in ("false", "0", "no", "off")
+    return False
+
+
 def _dmf_binding(
     q: DataQuality, *, column: Optional[str]
 ) -> Optional[str]:
@@ -1056,9 +1080,13 @@ def _generate_quality_sql(
                 # would be a lie, and would make N column-level rowCount rules look like
                 # N distinct expectations on one metric.
                 effective_column = None if add_dmf.rstrip().endswith("ON ()") else column
-                expectation = _expectation_for_quality(q, add_dmf, effective_column)
-                clause = f"\n  {expectation}" if expectation else ""
-                # Emit a plain ADD with its value-named expectation. If the DMF is
+                # A disabled rule keeps the metric attached but carries no EXPECTATION,
+                # so it never raises a violation; reconcile drops the prior expectation.
+                expectation = (
+                    None if _rule_disabled(q)
+                    else _expectation_for_quality(q, add_dmf, effective_column)
+                )
+                clause = f"\n  {expectation}" if expectation else ""                # Emit a plain ADD with its value-named expectation. If the DMF is
                 # already on the column, `apply` re-issues this as MODIFY ... ADD
                 # EXPECTATION so a new threshold is added additively (Snowsight style).
                 statement = (

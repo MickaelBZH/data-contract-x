@@ -152,6 +152,10 @@ class ApplySnowflakeResponse(BaseModel):
         description="Schema-drift notes: columns that differ between the contract and existing tables.",
     )
     sql: str = Field(..., description="The full SQL script generated (and executed unless dry_run).")
+    reconcile_sql: str = Field(
+        "",
+        description="The DROP/MODIFY removals computed by reconcile (empty unless reconcile was set).",
+    )
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -929,6 +933,15 @@ class ApplySnowflakeRequestOptions(BaseModel):
     metric_schedule: str = Field(
         "USING CRON 0 0 * * * UTC", description="DATA_METRIC_SCHEDULE clause for DMF tables."
     )
+    reconcile: bool = Field(
+        False,
+        description=(
+            "Also remove DMFs/expectations the contract no longer wants: deleted rules are "
+            "detached, edited thresholds replace the old expectation, disabled rules keep the "
+            "metric but drop its expectation. Bounded to SNOWFLAKE.CORE metrics and dcx-authored "
+            "expectations. On dry_run this reads live state, so a token is still required."
+        ),
+    )
 
 
 # Built with `create_model` (like the auto-generated endpoints) so it reuses the
@@ -961,7 +974,9 @@ def mirror_apply_snowflake_to_fastapi(api_app: FastAPI, prefix: str = "/apply") 
 
         opts = body.options
         token = _bearer_token(authorization)
-        if not opts.dry_run and not token:
+        # A reconcile dry-run still reads live Snowflake state to know what to remove, so
+        # it needs a token even though a plain dry-run does not.
+        if (not opts.dry_run or opts.reconcile) and not token:
             raise HTTPException(
                 status_code=401,
                 detail="Provide a Snowflake OAuth token via 'Authorization: Bearer <token>'.",
@@ -986,6 +1001,7 @@ def mirror_apply_snowflake_to_fastapi(api_app: FastAPI, prefix: str = "/apply") 
                 tag_namespace=opts.tag_namespace,
                 tag_namespace_filter=opts.tag_namespace_filter,
                 metric_schedule=opts.metric_schedule,
+                reconcile=opts.reconcile,
             )
         except apply_module.ApplyError as exc:
             raise HTTPException(status_code=502, detail=str(exc))
@@ -997,6 +1013,7 @@ def mirror_apply_snowflake_to_fastapi(api_app: FastAPI, prefix: str = "/apply") 
             "account": result.get("account"),
             "warnings": result.get("warnings") or [],
             "sql": result["sql"],
+            "reconcile_sql": result.get("reconcile_sql") or "",
         }
 
 
