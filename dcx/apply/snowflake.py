@@ -825,6 +825,15 @@ def apply_snowflake_command(
     metric_schedule: Annotated[
         str, typer.Option(help="DATA_METRIC_SCHEDULE clause to set on tables with DMFs."),
     ] = "USING CRON 0 0 * * * UTC",
+    reconcile: Annotated[
+        bool,
+        typer.Option(
+            "--reconcile/--no-reconcile",
+            help="Also remove DMFs/expectations the contract no longer wants (deleted "
+            "rules detached, edited thresholds replaced, disabled rules' expectation "
+            "dropped). Bounded to SNOWFLAKE.CORE metrics and dcx-authored expectations.",
+        ),
+    ] = False,
 ) -> None:
     """Apply a data contract to Snowflake.
 
@@ -859,6 +868,7 @@ def apply_snowflake_command(
             tag_namespace_filter=tag_namespace_filter,
             metric_schedule=metric_schedule,
             strict=strict,
+            reconcile=reconcile,
         )
     except ApplyError as exc:
         typer.secho(f"Error: {exc}", err=True, fg=typer.colors.RED)
