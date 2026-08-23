@@ -7,11 +7,12 @@ with one schema object per table.
 
 **Auth mirrors `dcx apply snowflake`** (see [[design-dcx-apply-auth]]): secrets via
 env vars only (no `--password` flag); non-secret context via CLI flags / env;
-`--connection-name` reads `~/.snowflake/config.toml`. Reuses `apply._ENV_VARS`.
+`--connection-name` reads Snowflake's own `config.toml`. Reuses `apply._ENV_VARS`.
 
-**Not exposed over the REST API** for the same reason `apply` isn't: the API
-server would import using its own single set of credentials for every caller — a
-multi-tenant data-access concern. Live importers are CLI-only for v1.
+**Over the REST API** (`POST /import/snowflake`) the credentials come from the
+request instead: an OAuth token, a key pair, or a password in the `auth` block —
+never the server's env — so the server acts on behalf of each caller rather than
+with one shared identity. See `import_snowflake_api` and `dcx.snowflake_auth`.
 """
 
 import json
@@ -33,11 +34,18 @@ from open_data_contract_standard.model import (
 from dcx.apply.snowflake import (
     _ENV_VARS,
     _first,
+    default_connection_name,
+    profile_conn_kwargs,
     quiet_aws_credential_noise,
     SNOWFLAKE_LOGIN_TIMEOUT,
     SNOWFLAKE_NETWORK_TIMEOUT,
 )
 from dcx.exporters.snowflake import _view_select_body
+from dcx.snowflake_auth import (
+    connect_kwargs,
+    connection_error_message,
+    uses_server_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -676,13 +684,31 @@ def _connect(import_args: dict):
         )
 
     connection_name = import_args.get("connection_name")
-    if connection_name:
-        conn_kwargs: dict[str, Any] = {"connection_name": connection_name}
-        for k in ("account", "user", "role", "warehouse", "database", "schema", "authenticator"):
-            if import_args.get(k):
-                conn_kwargs[k] = import_args[k]
-    else:
-        conn_kwargs = _resolve_conn_params(import_args)
+    conn_kwargs: Optional[dict[str, Any]] = None
+    if not connection_name:
+        try:
+            conn_kwargs = _resolve_conn_params(import_args)
+        except SnowflakeImportError:
+            # Nothing in flags or env identified a connection. Before giving up,
+            # use Snowflake's own default profile if the user has one — no reason
+            # to demand a second copy of what config.toml already says.
+            connection_name = default_connection_name()
+            if not connection_name:
+                raise
+
+    if conn_kwargs is None:
+        conn_kwargs = profile_conn_kwargs(
+            connection_name,
+            user=import_args.get("user"),
+            role=import_args.get("role"),
+            warehouse=import_args.get("warehouse"),
+            account=import_args.get("account"),
+            authenticator=import_args.get("authenticator"),
+            # `--database`/`--schema` are required on import: they name what to
+            # read, so they override the profile's own context.
+            extra={"database": import_args.get("database"),
+                   "schema": import_args.get("schema")},
+        )
 
     conn_kwargs.setdefault("login_timeout", SNOWFLAKE_LOGIN_TIMEOUT)
     conn_kwargs.setdefault("network_timeout", SNOWFLAKE_NETWORK_TIMEOUT)
@@ -690,7 +716,7 @@ def _connect(import_args: dict):
     try:
         return snowflake.connector.connect(**conn_kwargs)
     except Exception as exc:
-        raise SnowflakeImportError(f"Snowflake connection failed: {exc}")
+        raise SnowflakeImportError(connection_error_message(exc))
 
 
 def _fetch_metadata(conn, database: str, schema: str, tables: Optional[list[str]]):
@@ -1034,12 +1060,12 @@ def import_snowflake(import_args: dict) -> OpenDataContractStandard:
         conn.close()
 
 
-def import_snowflake_oauth(
+def import_snowflake_api(
     *,
-    token: str,
-    account: str,
+    auth: Any,
     database: str,
     schema: str,
+    account: Optional[str] = None,
     tables: Optional[list[str]] = None,
     role: Optional[str] = None,
     warehouse: Optional[str] = None,
@@ -1047,15 +1073,35 @@ def import_snowflake_oauth(
     quality: bool = False,
     server_name: str = "production",
 ) -> OpenDataContractStandard:
-    """Import using a caller-supplied Snowflake **OAuth token** — no env, no ambient creds.
+    """Import using the credentials in the request's `auth` block — no env, no CLI flags.
 
-    This is the API path: each caller brings their own bearer token, so the
-    server acts on behalf of the caller rather than with shared credentials.
+    This is the API path: each caller brings their own credentials (OAuth token,
+    key pair, or password), so the server acts on behalf of the caller rather
+    than with shared credentials. The one exception is `connection_name` auth,
+    which reads the server's own Snowflake connection config and is therefore
+    gated behind `dcx api --allow-local-credentials` — see `dcx.snowflake_auth`.
+
+    Raises `SnowflakeAuthError` for unusable credentials and `SnowflakeImportError`
+    for connection/metadata failures; the API maps them to 400/403 and 502.
     """
-    if not token:
-        raise SnowflakeImportError("An OAuth token is required.")
-    if not (account and database and schema):
-        raise SnowflakeImportError("account, database and schema are required.")
+    if not (database and schema):
+        raise SnowflakeImportError("database and schema are required.")
+
+    # Raises SnowflakeAuthError (400) / LocalCredentialsDisabled (403) before we
+    # touch the network.
+    conn_kwargs: dict[str, Any] = dict(connect_kwargs(auth))
+
+    # A connection profile supplies its own account; every other method must name one.
+    if not account and not uses_server_config(auth):
+        raise SnowflakeImportError("account is required.")
+
+    conn_kwargs.update({"database": database, "schema": schema})
+    if account:
+        conn_kwargs["account"] = account
+    if role:
+        conn_kwargs["role"] = role
+    if warehouse:
+        conn_kwargs["warehouse"] = warehouse
 
     try:
         import snowflake.connector
@@ -1065,25 +1111,13 @@ def import_snowflake_oauth(
             "Install it via `pip install snowflake-connector-python`."
         )
 
-    conn_kwargs: dict[str, Any] = {
-        "account": account,
-        "authenticator": "oauth",
-        "token": token,
-        "database": database,
-        "schema": schema,
-    }
-    if role:
-        conn_kwargs["role"] = role
-    if warehouse:
-        conn_kwargs["warehouse"] = warehouse
-
     conn_kwargs.setdefault("login_timeout", SNOWFLAKE_LOGIN_TIMEOUT)
     conn_kwargs.setdefault("network_timeout", SNOWFLAKE_NETWORK_TIMEOUT)
     quiet_aws_credential_noise()
     try:
         conn = snowflake.connector.connect(**conn_kwargs)
     except Exception as exc:
-        raise SnowflakeImportError(f"Snowflake connection failed: {exc}")
+        raise SnowflakeImportError(connection_error_message(exc))
 
     try:
         return _contract_from_connection(
@@ -1093,7 +1127,13 @@ def import_snowflake_oauth(
             tables=tables,
             fetch_tags=tags,
             fetch_quality=quality,
-            server_info={"account": account, "database": database, "schema": schema, "warehouse": warehouse},
+            server_info={
+                # With a connection profile the account is only known once connected.
+                "account": account or getattr(conn, "account", None),
+                "database": database,
+                "schema": schema,
+                "warehouse": warehouse,
+            },
             server_name=server_name,
         )
     finally:

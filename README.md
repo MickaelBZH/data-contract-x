@@ -48,7 +48,7 @@ It's **platform-extensible by design** — each platform is a small importer / e
 - ✅ **Executable, portable data quality.** Quality rules prefer ODCS `library` metrics (portable, mappable to platform-native checks) and fall back to portable `sql` checks — across all seven ODCS dimensions.
 - 🔌 **Any LLM provider.** Powered by [litellm](https://github.com/BerriAI/litellm) — Anthropic, OpenAI, Azure, Bedrock, Gemini, Ollama, … behind one `--model` flag.
 - 🧩 **Pluggable platforms, no fork.** You keep all 30+ upstream importers/exporters and `lint` / `test` / `changelog`, and gain the AI + platform layer on top.
-- 🔐 **Auth that makes sense per surface.** Live platform operations over the API use **caller-supplied OAuth**; secrets are never CLI flags.
+- 🔐 **Auth that makes sense per surface.** Live platform operations over the API use **caller-supplied credentials** — OAuth, key-pair, or password, never the server's; on the CLI, secrets are never flags.
 
 ## Install
 
@@ -114,7 +114,7 @@ dcx import sql --source schema.sql --dialect snowflake --output contract.yaml
 ```
 
 **API**
-- `POST /import/snowflake` — live import, authenticated by the caller's Snowflake OAuth token (`Authorization: Bearer <token>`).
+- `POST /import/snowflake` — live import, authenticated by the caller's own credentials: an `auth` block (`oauth` · `key_pair` · `password`) or an `Authorization: Bearer` token. See [Connecting to Snowflake](#connecting-to-snowflake).
 - `POST /import/{format}` — file-based importers; send the document inline as `source_content`.
 - *(Kafka import is CLI-only.)*
 
@@ -235,7 +235,7 @@ Column comments are the catch. Snowflake persists them **only** inside the `CREA
 Materialized and external tables are imported with their real `physicalType`, but are currently governed as tables.
 
 **API**
-- `POST /apply/snowflake` — authenticated by the caller's Snowflake OAuth token. Supports `dry_run`, `ddl_mode`, `strict`, `structured_types`, `tag_namespace_filter`, … (all under `options`) and returns the executed SQL plus any drift `warnings`.
+- `POST /apply/snowflake` — authenticated by the caller's own credentials (see [Connecting to Snowflake](#connecting-to-snowflake); `dry_run` needs none). Supports `dry_run`, `ddl_mode`, `strict`, `structured_types`, `tag_namespace_filter`, … (all under `options`) and returns the executed SQL plus any drift `warnings`.
 
 ### `target` — bind a contract to a platform
 
@@ -273,6 +273,169 @@ dcx info                 # show dcx + datacontract-cli versions   (API: GET /inf
 ```
 
 ---
+
+## Connecting to Snowflake
+
+Two rules cover everything below:
+
+1. **Credentials differ per surface.** The CLI takes secrets from the environment or your Snowflake connection profile — never from a flag. The API takes them from the request, so the server acts as the caller rather than with one shared identity.
+2. **Where the objects land never depends on the credentials.** Every generated statement is qualified `DATABASE.SCHEMA.OBJECT` from the contract's **server block**. A connection profile, an env var, or an OAuth token decides *who you are*, never *what you touch*.
+
+To apply the same contract to a different database, name a different server block — `--server dev` on the CLI, `"server_name": "dev"` in the API — or edit the contract. There is deliberately no `--database` / `--schema` on `apply`: those could not retarget anything, and only pointed the drift check at a different database than the one being written.
+
+### CLI
+
+Non-secret connection context resolves **CLI flag → env var → contract server block**:
+
+| Flag | Env var | Also in the contract |
+|---|---|---|
+| `--account` | `SNOWFLAKE_ACCOUNT` | ✅ |
+| `--user` | `SNOWFLAKE_USER` | — |
+| `--role` | `SNOWFLAKE_ROLE` | — |
+| `--warehouse` | `SNOWFLAKE_WAREHOUSE` | ✅ |
+| `--authenticator` | `SNOWFLAKE_AUTHENTICATOR` | — |
+
+**Secrets are environment-only — there is no `--password` flag and there never will be** (shell history, `ps aux`, CI logs):
+
+| Env var | Used for |
+|---|---|
+| `SNOWFLAKE_PASSWORD` | password auth |
+| `SNOWFLAKE_PRIVATE_KEY_PATH` | key-pair — `--authenticator snowflake_jwt` |
+| `SNOWFLAKE_PRIVATE_KEY_PASSPHRASE` | encrypted private key |
+| `SNOWFLAKE_TOKEN` | OAuth — `--authenticator oauth` |
+
+`--authenticator` selects the method: `snowflake` (password, the default), `externalbrowser` (SSO), `oauth`, `snowflake_jwt` (key-pair). The connector auto-detects when you omit it.
+
+```bash
+export SNOWFLAKE_ACCOUNT=xy12345.eu-central-1 SNOWFLAKE_USER=me SNOWFLAKE_PASSWORD=...
+dcx import snowflake --database MY_DB --schema LOAD --output contract.yaml
+
+dcx apply snowflake contract.yaml --authenticator externalbrowser --role TRANSFORMER
+```
+
+### Connection profiles (`config.toml`)
+
+A ready-to-edit template with all four methods lives in [`examples/snowflake_config.example.toml`](examples/snowflake_config.example.toml).
+
+`--connection-name` uses a named profile from **the connector's own config file** — dcx defines no config format of its own and never parses these files; `snowflake-connector-python` resolves them:
+
+```toml
+# config.toml — see "Where the file lives" below
+[connections.dev]
+account = "xy12345.eu-central-1"
+user = "SVC_DCX"
+authenticator = "SNOWFLAKE_JWT"
+private_key_file = "/home/me/.snowflake/rsa_key.p8"   # absolute: `~` is NOT expanded
+role = "TRANSFORMER"
+warehouse = "DEV_WH"
+```
+
+```bash
+dcx import snowflake --connection-name dev --database MY_DB --schema LOAD
+dcx apply snowflake contract.yaml --connection-name dev --server dev
+```
+
+The profile supplies the whole connection; only `--user`, `--role`, `--warehouse`, `--account` and `--authenticator` layer on top of it — plus `--database` / `--schema` on `import`, which name what to read. Env vars are not consulted at all on this path.
+
+Profiles may equally live in `connections.toml` alongside it (same tables, without the `connections.` prefix) — the connector reads both.
+
+#### Where the file lives
+
+The connector resolves the directory, in this order:
+
+1. **`$SNOWFLAKE_HOME`** if that directory exists — defaults to `~/.snowflake/`.
+2. Otherwise the platform config dir: `~/.config/snowflake/` on Linux, `~/Library/Application Support/snowflake/` on macOS, `%LOCALAPPDATA%\snowflake\` on Windows.
+
+Note the first rule tests for *existence*: with no `~/.snowflake/` directory, `~/.config/snowflake/config.toml` is the file in play. To check which one your install uses:
+
+```bash
+python -c "from snowflake.connector.constants import CONFIG_FILE; print(CONFIG_FILE)"
+```
+
+**If you set nothing at all, your default profile is used.** When no flag, no `SNOWFLAKE_*` variable and no contract server block identify a connection, dcx falls back to the profile named by `default_connection_name` — the same one `connect()` uses with no arguments — instead of erroring:
+
+```toml
+# config.toml
+default_connection_name = "dev"
+```
+
+```bash
+dcx apply snowflake contract.yaml        # no credentials anywhere: uses [connections.dev]
+```
+
+The contract's `account` is still layered on top, so a default profile can never silently move an apply to another account. If no default profile is configured, you get the usual `Cannot determine Snowflake account/user` error.
+
+> Snowflake requires the file to be private: `chmod 0600` it, or the connector warns `Bad owner or permissions` on every connect.
+
+> **`private_key_file` must be an absolute path.** The connector opens it with a bare `open()` and does not expand `~`, so a tilde path fails at connect time with `No such file or directory: '~/...'`.
+
+> SnowSQL's `~/.snowsql/config` is a different file in a different format and is **not** read. If your profiles live there, port them to `config.toml` (`snow connection add`) or use the env vars above.
+
+**A profile authenticates; the contract targets.** A `dev` profile applied to a contract whose server block names `PROD_DB` will authenticate as dev and still write to `PROD_DB`. Pair a profile with the matching `--server` block.
+
+### API
+
+The live endpoints (`POST /import/snowflake`, `POST /apply/snowflake`) take an `auth` object in the request body — the server holds no credentials of its own:
+
+| `auth.type` | Fields |
+|---|---|
+| `oauth` | `token` |
+| `key_pair` | `user`, `private_key`, `private_key_passphrase?` |
+| `password` | `user`, `password` |
+| `config` | `connection_name` (omit for the server's default profile) — **off by default**, see below |
+
+```jsonc
+POST /import/snowflake
+{
+  "account": "xy12345.eu-central-1", "database": "MY_DB", "schema": "LOAD",
+  "auth": {
+    "type": "key_pair",
+    "user": "SVC_DCX",
+    "private_key": "-----BEGIN ENCRYPTED PRIVATE KEY-----\n...",
+    "private_key_passphrase": "..."
+  }
+}
+```
+
+With `config` the server's profile carries the account, user and credentials, so the body needs only what to read:
+
+```jsonc
+POST /import/snowflake
+{
+  "database": "MY_DB", "schema": "LOAD",
+  "auth": {"type": "config", "connection_name": "dev"}
+}
+```
+
+Omit `connection_name` to use the server's `default_connection_name`; if it has none configured, that is a 400.
+
+`private_key` is PEM text or base64-encoded PKCS#8 DER. There is no `private_key_file`: a path would make the server read *its own* filesystem on a caller's behalf.
+
+`Authorization: Bearer <token>` is shorthand for `{"type": "oauth"}` and still works on its own; when both are sent, the body wins. `dry_run` on `/apply/snowflake` needs no credentials at all.
+
+Errors: **401** no credentials · **400** unusable key material · **403** method disabled on this server · **502** Snowflake refused.
+
+#### Server-side profiles — `dcx api --allow-local-credentials`
+
+`auth.type: config` is the one method that reads the **API host's** own connection config instead of the caller's credentials, so it is disabled unless you start the server with it:
+
+```bash
+dcx api --allow-local-credentials                              # only when the server is yours alone
+dcx api --allow-local-credentials --snowflake-config /etc/dcx  # profiles from a specific location
+```
+
+`--snowflake-config` takes the directory holding `config.toml` / `connections.toml` (or the file itself) and points the connector at it via `SNOWFLAKE_HOME`, so a service account's profiles need not live in the server user's home. It is validated at startup — a missing path, an unreadable filename, or a directory with no config in it fails immediately rather than silently falling back to the default location. It requires `--allow-local-credentials`, since without that the server never reads a Snowflake config at all.
+
+Whenever server-side profiles are enabled, startup reports which config is in play and what it contains (names only, never values):
+
+```
+Snowflake config: /etc/dcx/config.toml (4 profiles: dev, sso, pw, oauth; default: dev)
+Server-side profiles enabled: any caller may authenticate as this host via `auth.type: config`.
+```
+
+A config that cannot be read, or that defines no profiles, is reported as a warning at startup rather than surfacing later as a failed request.
+
+`dcx api` has no authentication of its own. On a shared instance a server-side profile would let anyone who can reach the port connect as whoever runs the server — so it stays off by default, and requests using it get a `403`. On a personal localhost server it is the safest option available, since no secret crosses the wire. Only a profile *name* is accepted, never a path.
 
 ## The tag catalog
 
@@ -332,9 +495,9 @@ dcx api --port 4242      # Swagger UI at http://127.0.0.1:4242/docs
 
 Every command above is mirrored to an endpoint, with request **and** response schemas in the OpenAPI spec. Auth model:
 
-- **Live platform operations** (`/import/snowflake`, `/apply/snowflake`) act *as the caller* — the OAuth bearer token comes from the `Authorization` header, so the server never uses ambient credentials for someone else's data.
+- **Live platform operations** (`/import/snowflake`, `/apply/snowflake`) act *as the caller* — credentials ride on the request (an `auth` block or a bearer token), so the server never uses ambient credentials for someone else's data. The one exception, server-side connection profiles, is off unless you start the server with `--allow-local-credentials`. Details: [Connecting to Snowflake](#connecting-to-snowflake).
 - **Enrichment** (`/enrich/*`) uses the **server's** LLM key (from the environment). Put service-level auth/quota in front of it before exposing it publicly.
-- **The CLI never takes secrets as flags** — platform secrets come from env vars or the platform's own config; LLM keys from the provider's standard env var.
+- **The CLI never takes secrets as flags** — platform secrets come from env vars or the connector's own `config.toml`; LLM keys from the provider's standard env var. (Over HTTP a caller *does* send credentials in the request body — that is the point: they are the caller's, not the server's. Terminate TLS in front of it.)
 
 ## How it fits with datacontract-cli
 
@@ -353,7 +516,7 @@ So you keep all of upstream's importers, exporters, `lint`, `test` and `changelo
 
 ```bash
 pip install -e ".[dev]"
-pytest          # 211 tests
+pytest          # 375 tests
 ruff check dcx  # lint
 ```
 
