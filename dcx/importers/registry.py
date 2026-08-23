@@ -71,7 +71,7 @@ def import_snowflake(
     ] = None,
     connection_name: Annotated[
         Optional[str],
-        typer.Option(help="Named connection profile from ~/.snowflake/config.toml."),
+        typer.Option(help="Named connection profile from Snowflake's config.toml."),
     ] = None,
     tags: Annotated[
         bool,

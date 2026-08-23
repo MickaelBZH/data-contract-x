@@ -183,14 +183,16 @@ def _snowflake_correct_escape():
         _upstream_sql_exporter._escape = original
 
 
-def _snowflake_table_prefix(
+def snowflake_server_context(
     contract: OpenDataContractStandard, server_name: Optional[str],
-) -> str:
-    """Return the `DB.SCHEMA.` prefix from the contract's Snowflake server, or ''.
+) -> tuple[Optional[str], Optional[str]]:
+    """Return `(database, schema)` from the contract's Snowflake server block.
 
-    Mirrors upstream's `to_sql_ddl` behavior for Databricks (which already prefixes
-    `catalog.schema.`) — we provide the equivalent for Snowflake, which upstream
-    omits. If `server_name` is given, only that named server is considered.
+    The single source of truth for *where* a contract's objects live: it qualifies
+    the generated SQL (via `_snowflake_table_prefix`) and, in `apply`, the drift
+    check's `DESCRIBE TABLE`. Both must agree, or an apply reports drift against a
+    different database than the one it writes to. If `server_name` is given, only
+    that named server is considered.
     """
     servers = contract.servers or []
     if server_name:
@@ -198,13 +200,27 @@ def _snowflake_table_prefix(
     for srv in servers:
         if srv.type != "snowflake":
             continue
-        db, schema = srv.database, srv.schema_
-        if db and schema:
-            return f"{db}.{schema}."
-        if db:
-            return f"{db}."
-        if schema:
-            return f"{schema}."
+        if srv.database or srv.schema_:
+            return srv.database, srv.schema_
+    return None, None
+
+
+def _snowflake_table_prefix(
+    contract: OpenDataContractStandard, server_name: Optional[str],
+) -> str:
+    """Return the `DB.SCHEMA.` prefix from the contract's Snowflake server, or ''.
+
+    Mirrors upstream's `to_sql_ddl` behavior for Databricks (which already prefixes
+    `catalog.schema.`) — we provide the equivalent for Snowflake, which upstream
+    omits.
+    """
+    db, schema = snowflake_server_context(contract, server_name)
+    if db and schema:
+        return f"{db}.{schema}."
+    if db:
+        return f"{db}."
+    if schema:
+        return f"{schema}."
     return ""
 
 

@@ -7,12 +7,24 @@ to build the script, then runs it via `snowflake-connector-python`.
 
 - **No `--password` CLI flag.** Secrets must come from environment variables
   (`SNOWFLAKE_PASSWORD`, `SNOWFLAKE_PRIVATE_KEY_PATH`, `SNOWFLAKE_TOKEN`, ...) or
-  Snowflake's `~/.snowflake/config.toml` connection profile.
+  Snowflake's own `config.toml` connection profile (located by the connector:
+  `$SNOWFLAKE_HOME` or `~/.snowflake/` when it exists, else the platform config
+  dir such as `~/.config/snowflake/` — dcx never parses these files itself).
 - Precedence for connection parameters: **CLI flag > env var > contract server
   block**. CLI flags exist for non-secret context (`--user`, `--role`,
   `--warehouse`, `--account`, `--authenticator`); env vars carry the secrets.
+- **No `--database` / `--schema` flags** (dropped 2026-08-23). Every generated
+  statement is fully qualified with `DB.SCHEMA.` from the contract's server block,
+  so a connection pointed elsewhere never retargeted the apply — it only sent the
+  drift check (`_detect_drift`, which qualifies via the *connection*) to a
+  different database than the one being written. Both now come from the contract,
+  with `SNOWFLAKE_DATABASE`/`SNOWFLAKE_SCHEMA` as the only override. To apply to a
+  different database, name a different server block with `--server`.
 - Supports all auth methods the official connector supports (password,
   key-pair, externalbrowser SSO, OAuth) — we just pass the values through.
+- **Over the REST API** none of the above applies: `apply_snowflake_api` takes
+  the caller's own credentials from the request's `auth` block, so the server
+  never acts with ambient credentials. See `dcx.snowflake_auth`.
 """
 
 import logging
@@ -26,7 +38,17 @@ from typing_extensions import Annotated
 
 # DdlMode lives with the SQL generator (it maps to to_snowflake_full_sql flags) and
 # is re-exported here so `dcx.apply.snowflake.DdlMode` keeps working.
-from dcx.exporters.snowflake import DdlMode, to_snowflake_full_sql
+from dcx.exporters.snowflake import (
+    DdlMode,
+    snowflake_server_context,
+    to_snowflake_full_sql,
+)
+from dcx.snowflake_auth import (
+    connect_kwargs,
+    connection_error_message,
+    default_connection_name,  # re-exported: importers and tests patch it here
+    uses_server_config,
+)
 
 
 def quiet_aws_credential_noise() -> None:
@@ -77,6 +99,33 @@ def _first(*candidates: Optional[str]) -> Optional[str]:
         if c is not None and c != "":
             return c
     return None
+
+
+def profile_conn_kwargs(
+    connection_name: str,
+    *,
+    user: Optional[str] = None,
+    role: Optional[str] = None,
+    warehouse: Optional[str] = None,
+    account: Optional[str] = None,
+    authenticator: Optional[str] = None,
+    extra: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Connector kwargs for a named profile, with explicit overrides layered on.
+
+    `connection_name` makes the connector read its own `config.toml` itself, so
+    nothing else is resolved from env or contract — only the values passed here
+    override the profile.
+    """
+    conn_kwargs: dict[str, Any] = {"connection_name": connection_name}
+    for k, v in {
+        "user": user, "role": role, "warehouse": warehouse,
+        "account": account, "authenticator": authenticator,
+        **(extra or {}),
+    }.items():
+        if v is not None:
+            conn_kwargs[k] = v
+    return conn_kwargs
 
 
 # Head of our generated `ALTER ... ADD DATA METRIC FUNCTION <assoc> EXPECTATION <exp>`.
@@ -212,8 +261,6 @@ def _resolve_connection_params(
     role: Optional[str] = None,
     warehouse: Optional[str] = None,
     account: Optional[str] = None,
-    database: Optional[str] = None,
-    schema: Optional[str] = None,
     authenticator: Optional[str] = None,
 ) -> dict[str, Any]:
     """Build the `snowflake.connector.connect()` kwargs from contract + env + CLI.
@@ -230,9 +277,13 @@ def _resolve_connection_params(
         "role":          _first(role, os.environ.get(_ENV_VARS["role"])),
         "warehouse":     _first(warehouse, os.environ.get(_ENV_VARS["warehouse"]),
                                 srv.warehouse if srv else None),
-        "database":      _first(database, os.environ.get(_ENV_VARS["database"]),
+        # No CLI override for these two: the generated SQL is fully qualified from
+        # the contract's server block, so a connection pointing somewhere else could
+        # not retarget the apply — it could only send the drift check to the wrong
+        # tables. They stay session context, resolved from env then contract.
+        "database":      _first(os.environ.get(_ENV_VARS["database"]),
                                 srv.database if srv else None),
-        "schema":        _first(schema, os.environ.get(_ENV_VARS["schema"]),
+        "schema":        _first(os.environ.get(_ENV_VARS["schema"]),
                                 srv.schema_ if srv else None),
         "authenticator": _first(authenticator, os.environ.get(_ENV_VARS["authenticator"])),
     }
@@ -265,8 +316,6 @@ def apply_snowflake(
     role: Optional[str] = None,
     warehouse: Optional[str] = None,
     account: Optional[str] = None,
-    database: Optional[str] = None,
-    schema: Optional[str] = None,
     authenticator: Optional[str] = None,
     connection_name: Optional[str] = None,
     dry_run: bool = False,
@@ -315,27 +364,38 @@ def apply_snowflake(
 
     # Build connector kwargs
     if connection_name:
-        # Snowflake's `connection_name` reads ~/.snowflake/config.toml; ignore
+        # Snowflake's `connection_name` reads the connector's own config.toml; ignore
         # other resolution and let the connector do the work. CLI overrides still
         # layer on top.
-        conn_kwargs: dict[str, Any] = {"connection_name": connection_name}
-        for k, v in {
-            "user": user, "role": role, "warehouse": warehouse,
-            "account": account, "database": database, "schema": schema,
-            "authenticator": authenticator,
-        }.items():
-            if v is not None:
-                conn_kwargs[k] = v
-    else:
-        conn_kwargs = _resolve_connection_params(
-            contract,
-            server_name=server_name, user=user, role=role,
-            warehouse=warehouse, account=account, database=database,
-            schema=schema, authenticator=authenticator,
+        conn_kwargs: dict[str, Any] = profile_conn_kwargs(
+            connection_name, user=user, role=role, warehouse=warehouse,
+            account=account, authenticator=authenticator,
         )
+    else:
+        try:
+            conn_kwargs = _resolve_connection_params(
+                contract,
+                server_name=server_name, user=user, role=role,
+                warehouse=warehouse, account=account, authenticator=authenticator,
+            )
+        except ApplyError:
+            # Nothing in flags, env or the contract identified a connection. Before
+            # giving up, use Snowflake's own default profile if the user has one —
+            # no reason to demand a second copy of what config.toml already says.
+            fallback = default_connection_name()
+            if not fallback:
+                raise
+            srv = _find_snowflake_server(contract, server_name)
+            conn_kwargs = profile_conn_kwargs(
+                fallback, user=user, role=role, warehouse=warehouse,
+                # The contract still names the account it targets, so it is layered
+                # on top rather than letting the profile silently cross accounts.
+                account=account or (srv.account if srv else None),
+                authenticator=authenticator,
+            )
 
     statements_executed, warnings = _connect_apply(
-        sql, conn_kwargs, contract=contract, strict=strict,
+        sql, conn_kwargs, contract=contract, server_name=server_name, strict=strict,
     )
     return {
         "dry_run": False,
@@ -346,10 +406,10 @@ def apply_snowflake(
     }
 
 
-def apply_snowflake_oauth(
+def apply_snowflake_api(
     contract: OpenDataContractStandard,
     *,
-    token: str,
+    auth: Optional[Any] = None,
     server_name: Optional[str] = None,
     account: Optional[str] = None,
     role: Optional[str] = None,
@@ -360,29 +420,27 @@ def apply_snowflake_oauth(
     ddl_mode: DdlMode = DdlMode.auto,
     structured_types: bool = False,
     include_comments: bool = True,
-    include_tags: bool = True,
     include_quality: bool = True,
+    include_tags: bool = True,
     create_tags: bool = False,
     tag_namespace: Optional[str] = None,
     tag_namespace_filter: Optional[list[str]] = None,
     metric_schedule: str = "USING CRON 0 0 * * * UTC",
     strict: bool = False,
 ) -> dict[str, Any]:
-    """Apply a contract to Snowflake using a caller-supplied **OAuth token**.
+    """Apply a contract to Snowflake using the credentials in the request's `auth` block.
 
-    The API path: no env / ambient credentials. Connection context (account,
-    warehouse, database, schema) is taken from the contract's Snowflake server
-    block, with optional overrides. Defaults to `auto` DDL — creates the table if
-    missing, otherwise governs the existing one. Returns schema-drift `warnings`;
-    with `strict=True` drift raises instead of applying.
+    The API path: no env / ambient credentials — the caller supplies an OAuth
+    token, a key pair, or a password (see `dcx.snowflake_auth`). Connection
+    context (account, warehouse, database, schema) comes from the contract's
+    Snowflake server block, with optional overrides. Defaults to `auto` DDL —
+    creates the table if missing, otherwise governs the existing one. Returns
+    schema-drift `warnings`; with `strict=True` drift raises instead of applying.
+
+    `dry_run=True` returns the SQL without connecting, so it needs no `auth`.
     """
     srv = _find_snowflake_server(contract, server_name)
     account = account or (srv.account if srv else None)
-    if not account:
-        raise ApplyError(
-            "Cannot determine Snowflake account: not in the contract server block "
-            "or the request."
-        )
     warehouse = warehouse or (srv.warehouse if srv else None)
 
     sql = to_snowflake_full_sql(
@@ -399,20 +457,28 @@ def apply_snowflake_oauth(
         server=server_name,
     )
 
-    if dry_run:  # preview the SQL without connecting — no token needed
+    if dry_run:  # preview the SQL without connecting — no credentials needed
         return {
             "dry_run": True, "sql": sql, "statements_executed": 0,
             "warnings": [], "account": account,
         }
 
-    if not token:
-        raise ApplyError("An OAuth token is required.")
+    if auth is None:
+        raise ApplyError("Credentials are required: send an `auth` block or a bearer token.")
 
-    conn_kwargs: dict[str, Any] = {
-        "account": account,
-        "authenticator": "oauth",
-        "token": token,
-    }
+    # Raises SnowflakeAuthError (400) / LocalCredentialsDisabled (403) before we
+    # touch the network.
+    conn_kwargs: dict[str, Any] = dict(connect_kwargs(auth))
+
+    # A connection profile supplies its own account; every other method must name one.
+    if not account and not uses_server_config(auth):
+        raise ApplyError(
+            "Cannot determine Snowflake account: not in the contract server block "
+            "or the request."
+        )
+
+    if account:
+        conn_kwargs["account"] = account
     if role:
         conn_kwargs["role"] = role
     if warehouse:
@@ -423,7 +489,7 @@ def apply_snowflake_oauth(
         conn_kwargs["schema"] = srv.schema_
 
     statements_executed, warnings = _connect_apply(
-        sql, conn_kwargs, contract=contract, strict=strict,
+        sql, conn_kwargs, contract=contract, server_name=server_name, strict=strict,
     )
     return {
         "dry_run": False,
@@ -461,6 +527,11 @@ def _detect_drift(
     conn, contract: OpenDataContractStandard, database: Optional[str], schema: Optional[str],
 ) -> list[str]:
     """Compare each contract table's top-level columns to the live Snowflake table.
+
+    `database`/`schema` come from the contract's Snowflake server block (see
+    `snowflake_server_context`), never from the live connection: the generated SQL
+    is qualified from that same block, so this compares against exactly the tables
+    the apply writes to.
 
     Uses `DESCRIBE TABLE` — a metadata command that needs **no active warehouse**,
     so drift detection works in exactly the sessions where the apply itself works
@@ -525,6 +596,7 @@ def _connect_apply(
     conn_kwargs: dict[str, Any],
     *,
     contract: Optional[OpenDataContractStandard] = None,
+    server_name: Optional[str] = None,
     check_drift: bool = True,
     strict: bool = False,
 ) -> tuple[int, list[str]]:
@@ -548,15 +620,19 @@ def _connect_apply(
     try:
         conn = snowflake.connector.connect(**conn_kwargs)
     except Exception as exc:
-        raise ApplyError(f"Snowflake connection failed: {exc}")
+        raise ApplyError(connection_error_message(exc))
 
     try:
         warnings: list[str] = []
         if check_drift and contract is not None:
             try:
-                warnings = _detect_drift(
-                    conn, contract, conn_kwargs.get("database"), conn_kwargs.get("schema"),
-                )
+                # Qualified from the contract's server block — the same source that
+                # qualifies the generated SQL — so drift is always checked against
+                # the tables being written. The connection's own database/schema
+                # (which SNOWFLAKE_DATABASE/SNOWFLAKE_SCHEMA can point elsewhere)
+                # is session context only and must not steer this.
+                drift_db, drift_schema = snowflake_server_context(contract, server_name)
+                warnings = _detect_drift(conn, contract, drift_db, drift_schema)
             except Exception as exc:
                 warnings = [f"(drift check skipped: {exc})"]
 
@@ -612,12 +688,6 @@ def apply_snowflake_command(
     account: Annotated[
         Optional[str], typer.Option(help="Override account from contract."),
     ] = None,
-    database: Annotated[
-        Optional[str], typer.Option(help="Override database from contract."),
-    ] = None,
-    schema: Annotated[
-        Optional[str], typer.Option(help="Override schema from contract."),
-    ] = None,
     authenticator: Annotated[
         Optional[str],
         typer.Option(
@@ -630,7 +700,7 @@ def apply_snowflake_command(
     connection_name: Annotated[
         Optional[str],
         typer.Option(
-            help="Use a named connection profile from ~/.snowflake/config.toml.",
+            help="Use a named connection profile from Snowflake's config.toml.",
         ),
     ] = None,
     dry_run: Annotated[
@@ -715,7 +785,7 @@ def apply_snowflake_command(
             contract,
             server_name=server,
             user=user, role=role,
-            warehouse=warehouse, account=account, database=database, schema=schema,
+            warehouse=warehouse, account=account,
             authenticator=authenticator,
             connection_name=connection_name,
             dry_run=dry_run,

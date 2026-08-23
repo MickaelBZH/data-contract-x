@@ -1,3 +1,4 @@
+import os
 from importlib import metadata
 from typing import Optional
 
@@ -100,6 +101,53 @@ app.add_typer(enrich_app, name="enrich")
 app.registered_commands = [c for c in app.registered_commands if c.name != "api"]
 
 
+def _report_snowflake_config() -> None:
+    """Log which Snowflake config the server will read, and the profiles in it.
+
+    Only called when `--allow-local-credentials` is on, because that is the only
+    case where the server reads a config at all. Worth printing even without
+    `--snowflake-config`: the connector's default location is `$SNOWFLAKE_HOME`
+    (default `~/.snowflake/`) *if that directory exists*, and otherwise the
+    platform config dir — so "which file is actually in play" is not obvious.
+
+    Profile names only; never the values inside them.
+    """
+    try:
+        from snowflake.connector.config_manager import CONFIG_MANAGER
+        from snowflake.connector.constants import CONFIG_FILE
+
+        profiles = list(CONFIG_MANAGER["connections"])
+        default = CONFIG_MANAGER["default_connection_name"]
+    except Exception as exc:  # no connector, unreadable file, malformed TOML
+        typer.secho(
+            f"Warning: server-side profiles are enabled but the Snowflake config "
+            f"could not be read ({exc}).",
+            err=True, fg=typer.colors.YELLOW,
+        )
+        return
+
+    if not profiles:
+        typer.secho(
+            f"Warning: server-side profiles are enabled but {CONFIG_FILE} defines none — "
+            "`auth.type: config` requests will fail.",
+            err=True, fg=typer.colors.YELLOW,
+        )
+        return
+
+    suffix = f"; default: {default}" if default in profiles else ""
+    typer.secho(
+        f"Snowflake config: {CONFIG_FILE} "
+        f"({len(profiles)} profile{'s' if len(profiles) != 1 else ''}: "
+        f"{', '.join(profiles)}{suffix})",
+        err=True, fg=typer.colors.CYAN,
+    )
+    typer.secho(
+        "Server-side profiles enabled: any caller may authenticate as this host via "
+        "`auth.type: config`.",
+        err=True, fg=typer.colors.YELLOW,
+    )
+
+
 @app.command(
     "api",
     context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
@@ -118,6 +166,24 @@ def api(
         Optional[int],
         typer.Option(help="Worker processes to run (production). Ignored when --reload is set."),
     ] = None,
+    allow_local_credentials: Annotated[
+        bool,
+        typer.Option(
+            "--allow-local-credentials",
+            help="Let requests authenticate to Snowflake with a named profile from this "
+                 "host's own Snowflake connection config. Off by default — only safe when the "
+                 "server is yours alone, since it has no auth of its own.",
+        ),
+    ] = False,
+    snowflake_config: Annotated[
+        Optional[str],
+        typer.Option(
+            "--snowflake-config",
+            help="Directory holding the server's config.toml / connections.toml (or the "
+                 "file itself). Defaults to the connector's own location. Only meaningful "
+                 "with --allow-local-credentials.",
+        ),
+    ] = None,
 ) -> None:
     """Start the dcx REST API server.
 
@@ -126,9 +192,49 @@ def api(
 
     Defaults to a single process; pass --workers N for production concurrency, or
     --reload for live-reloading during development.
+
+    The live Snowflake endpoints take their credentials from each request, so the
+    server holds none. `--allow-local-credentials` opts out of that: it lets a
+    request name a connection profile from *this host's* config instead. Do not
+    use it on a shared instance — every caller who can reach the port would then
+    be able to connect as whoever runs the server.
     """
     import uvicorn
     from uvicorn.config import LOGGING_CONFIG
+
+    from dcx.snowflake_auth import (
+        ALLOW_LOCAL_CREDENTIALS_ENV,
+        SnowflakeAuthError,
+        apply_snowflake_home,
+        resolve_snowflake_home,
+    )
+
+    if snowflake_config and not allow_local_credentials:
+        typer.secho(
+            "Error: --snowflake-config only has an effect with --allow-local-credentials; "
+            "without it the server never reads a Snowflake config at all.",
+            err=True, fg=typer.colors.RED,
+        )
+        raise typer.Exit(2)
+
+    if allow_local_credentials:
+        # Via the environment rather than app state: --workers/--reload run the
+        # app in child processes, which inherit env but not in-process globals.
+        os.environ[ALLOW_LOCAL_CREDENTIALS_ENV] = "1"
+
+    if snowflake_config:
+        try:
+            # SNOWFLAKE_HOME is the connector's own knob; `apply_snowflake_home`
+            # also re-points an already-imported connector, whose config paths are
+            # fixed at import time.
+            apply_snowflake_home(resolve_snowflake_home(snowflake_config))
+        except SnowflakeAuthError as exc:
+            typer.secho(f"Error: {exc}", err=True, fg=typer.colors.RED)
+            raise typer.Exit(2)
+
+    if allow_local_credentials:
+        # After SNOWFLAKE_HOME is set: the connector resolves its paths on import.
+        _report_snowflake_config()
 
     log_config = LOGGING_CONFIG
     log_config["root"] = {"level": "INFO"}

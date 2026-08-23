@@ -206,6 +206,10 @@ class _FakeCursor:
 
 
 class _FakeConn:
+    # The real connector exposes the resolved account on the connection; that is
+    # the only way a `connection_name` import learns which account it reached.
+    account = "PROFILE_ACCT"
+
     def __init__(self, data):
         self.data = data
         self.closed = False
@@ -498,12 +502,28 @@ def test_snowflake_import_in_api_with_dedicated_endpoint():
     assert "/import/kafka" not in paths   # kafka remains CLI-only for now
 
 
-# === OAuth import path ======================================================
+# === API import path (caller-supplied credentials) ==========================
 
 
-def test_import_snowflake_oauth_uses_token(monkeypatch):
+def _rsa_pem(passphrase=None):
+    """A throwaway RSA private key as PEM text, optionally encrypted."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    encryption = (
+        serialization.BestAvailableEncryption(passphrase.encode())
+        if passphrase
+        else serialization.NoEncryption()
+    )
+    return key.private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, encryption
+    ).decode()
+
+
+def _capture_connect(monkeypatch):
+    """Patch connector.connect and return the dict its kwargs land in."""
     import snowflake.connector as connector
-    from dcx.importers.snowflake import import_snowflake_oauth
 
     captured = {}
 
@@ -512,8 +532,17 @@ def test_import_snowflake_oauth_uses_token(monkeypatch):
         return _FakeConn(_fake_data())
 
     monkeypatch.setattr(connector, "connect", fake_connect)
-    contract = import_snowflake_oauth(
-        token="tok123", account="ACME", database="DB", schema="SCH", tables=["CUSTOMER"],
+    return captured
+
+
+def test_import_snowflake_api_uses_oauth_token(monkeypatch):
+    from dcx.importers.snowflake import import_snowflake_api
+    from dcx.snowflake_auth import OAuthAuth
+
+    captured = _capture_connect(monkeypatch)
+    contract = import_snowflake_api(
+        auth=OAuthAuth(type="oauth", token="tok123"),
+        account="ACME", database="DB", schema="SCH", tables=["CUSTOMER"],
     )
     assert captured["authenticator"] == "oauth"
     assert captured["token"] == "tok123"
@@ -522,10 +551,74 @@ def test_import_snowflake_oauth_uses_token(monkeypatch):
     assert [o.name for o in contract.schema_] == ["CUSTOMER"]
 
 
-def test_import_snowflake_oauth_requires_token():
-    from dcx.importers.snowflake import import_snowflake_oauth
-    with pytest.raises(SnowflakeImportError, match="OAuth token is required"):
-        import_snowflake_oauth(token="", account="A", database="D", schema="S")
+def test_import_snowflake_api_uses_key_pair(monkeypatch):
+    from dcx.importers.snowflake import import_snowflake_api
+    from dcx.snowflake_auth import KeyPairAuth
+
+    captured = _capture_connect(monkeypatch)
+    import_snowflake_api(
+        auth=KeyPairAuth(
+            type="key_pair", user="SVC", private_key=_rsa_pem(passphrase="pw"),
+            private_key_passphrase="pw",
+        ),
+        account="ACME", database="DB", schema="SCH",
+    )
+    assert captured["authenticator"] == "SNOWFLAKE_JWT"
+    assert captured["user"] == "SVC"
+    # Handed to the connector as decrypted DER bytes, never the PEM we were sent.
+    assert isinstance(captured["private_key"], bytes)
+    assert b"BEGIN" not in captured["private_key"]
+    assert "private_key_file" not in captured    # no server-side path, ever
+
+
+def test_import_snowflake_api_uses_password(monkeypatch):
+    from dcx.importers.snowflake import import_snowflake_api
+    from dcx.snowflake_auth import PasswordAuth
+
+    captured = _capture_connect(monkeypatch)
+    import_snowflake_api(
+        auth=PasswordAuth(type="password", user="SVC", password="hunter2"),
+        account="ACME", database="DB", schema="SCH",
+    )
+    assert captured["user"] == "SVC"
+    assert captured["password"] == "hunter2"
+    assert "authenticator" not in captured       # connector default
+
+
+def test_import_snowflake_api_connection_profile_needs_no_account(monkeypatch):
+    """A profile carries its own account; we read it back off the connection."""
+    from dcx.importers.snowflake import import_snowflake_api
+    from dcx.snowflake_auth import ALLOW_LOCAL_CREDENTIALS_ENV, ConfigAuth
+
+    monkeypatch.setenv(ALLOW_LOCAL_CREDENTIALS_ENV, "1")
+    captured = _capture_connect(monkeypatch)
+    contract = import_snowflake_api(
+        auth=ConfigAuth(type="config", connection_name="dev"),
+        database="DB", schema="SCH",
+    )
+    assert captured["connection_name"] == "dev"
+    assert "account" not in captured
+    assert contract.servers[0].account == _FakeConn.account
+
+
+def test_import_snowflake_api_requires_account(monkeypatch):
+    from dcx.importers.snowflake import import_snowflake_api
+    from dcx.snowflake_auth import OAuthAuth
+
+    with pytest.raises(SnowflakeImportError, match="account is required"):
+        import_snowflake_api(
+            auth=OAuthAuth(type="oauth", token="t"), database="D", schema="S",
+        )
+
+
+def test_import_snowflake_api_requires_token():
+    from dcx.importers.snowflake import import_snowflake_api
+    from dcx.snowflake_auth import OAuthAuth, SnowflakeAuthError
+
+    with pytest.raises(SnowflakeAuthError, match="OAuth token is required"):
+        import_snowflake_api(
+            auth=OAuthAuth(type="oauth", token=""), account="A", database="D", schema="S",
+        )
 
 
 # === API endpoint ===========================================================
@@ -537,10 +630,10 @@ def _client():
     return TestClient(build_dcx_api_app())
 
 
-def test_api_snowflake_requires_bearer_token():
+def test_api_snowflake_requires_credentials():
     r = _client().post("/import/snowflake", json={"account": "A", "database": "D", "schema": "S"})
     assert r.status_code == 401
-    assert "Bearer" in r.json()["detail"]
+    assert "auth" in r.json()["detail"] and "Bearer" in r.json()["detail"]
 
 
 def test_api_snowflake_works(monkeypatch):
@@ -553,14 +646,14 @@ def test_api_snowflake_works(monkeypatch):
             apiVersion="v3.1.0", kind="DataContract", id="x", name="X", version="1.0.0",
         )
 
-    monkeypatch.setattr(si, "import_snowflake_oauth", fake)
+    monkeypatch.setattr(si, "import_snowflake_api", fake)
     r = _client().post(
         "/import/snowflake",
         headers={"Authorization": "Bearer tok-xyz"},
         json={"account": "ACME", "database": "DB", "schema": "SCH", "tables": ["T"]},
     )
     assert r.status_code == 200, r.text
-    assert captured["token"] == "tok-xyz"
+    assert captured["auth"].token.get_secret_value() == "tok-xyz"
     assert captured["account"] == "ACME"
     assert captured["schema"] == "SCH"       # body "schema" → schema_ → schema kwarg
     assert captured["tables"] == ["T"]
@@ -577,7 +670,7 @@ def test_api_snowflake_quality_flag_passes_through(monkeypatch):
             apiVersion="v3.1.0", kind="DataContract", id="x", name="X", version="1.0.0",
         )
 
-    monkeypatch.setattr(si, "import_snowflake_oauth", fake)
+    monkeypatch.setattr(si, "import_snowflake_api", fake)
     r = _client().post(
         "/import/snowflake",
         headers={"Authorization": "Bearer tok"},
@@ -593,7 +686,7 @@ def test_api_snowflake_error_is_502(monkeypatch):
     def boom(**kw):
         raise si.SnowflakeImportError("Snowflake connection failed: bad token")
 
-    monkeypatch.setattr(si, "import_snowflake_oauth", boom)
+    monkeypatch.setattr(si, "import_snowflake_api", boom)
     r = _client().post(
         "/import/snowflake",
         headers={"Authorization": "Bearer tok"},
@@ -986,7 +1079,7 @@ def test_second_expectation_on_one_association_is_reported(monkeypatch, capsys):
 
 
 # === Query failures surface as SnowflakeImportError, not a 500 ==============
-# `import_snowflake_oauth` wrapped only `connect()`, so anything that failed during
+# `import_snowflake_api` wrapped only `connect()`, so anything that failed during
 # the metadata queries escaped as a raw ProgrammingError and the API answered 500
 # with a traceback. Snowflake's own message is passed through unchanged.
 
@@ -1054,7 +1147,7 @@ def test_api_returns_502_with_snowflake_text_not_500(monkeypatch):
     def boom(**kw):
         raise SnowflakeImportError(f"Snowflake metadata query failed: {NO_WAREHOUSE}")
 
-    monkeypatch.setattr(si, "import_snowflake_oauth", boom)
+    monkeypatch.setattr(si, "import_snowflake_api", boom)
     r = _client().post(
         "/import/snowflake",
         headers={"Authorization": "Bearer tok"},
@@ -1062,3 +1155,330 @@ def test_api_returns_502_with_snowflake_text_not_500(monkeypatch):
     )
     assert r.status_code == 502
     assert "No active warehouse selected" in r.json()["detail"]
+
+
+# === API endpoint: credential methods =======================================
+
+
+def _fake_import(monkeypatch, captured):
+    """Intercept the importer so endpoint tests never touch the network."""
+    import dcx.importers.snowflake as si
+
+    def fake(**kw):
+        captured.update(kw)
+        return OpenDataContractStandard(
+            apiVersion="v3.1.0", kind="DataContract", id="x", name="X", version="1.0.0",
+        )
+
+    monkeypatch.setattr(si, "import_snowflake_api", fake)
+
+
+def test_api_snowflake_key_pair_auth(monkeypatch):
+    captured = {}
+    _fake_import(monkeypatch, captured)
+    r = _client().post(
+        "/import/snowflake",
+        json={
+            "account": "ACME", "database": "DB", "schema": "SCH",
+            "auth": {
+                "type": "key_pair", "user": "SVC",
+                "private_key": _rsa_pem(), "private_key_passphrase": None,
+            },
+        },
+    )
+    assert r.status_code == 200, r.text
+    auth = captured["auth"]
+    assert auth.user == "SVC"
+    # SecretStr: the key never shows up in a repr, log line, or error echo.
+    assert "BEGIN" not in repr(auth)
+
+
+def test_api_snowflake_password_auth(monkeypatch):
+    captured = {}
+    _fake_import(monkeypatch, captured)
+    r = _client().post(
+        "/import/snowflake",
+        json={
+            "account": "ACME", "database": "DB", "schema": "SCH",
+            "auth": {"type": "password", "user": "SVC", "password": "hunter2"},
+        },
+    )
+    assert r.status_code == 200, r.text
+    assert captured["auth"].password.get_secret_value() == "hunter2"
+    assert "hunter2" not in repr(captured["auth"])
+
+
+def test_api_snowflake_body_auth_beats_bearer_header(monkeypatch):
+    captured = {}
+    _fake_import(monkeypatch, captured)
+    r = _client().post(
+        "/import/snowflake",
+        headers={"Authorization": "Bearer header-tok"},
+        json={
+            "account": "A", "database": "D", "schema": "S",
+            "auth": {"type": "oauth", "token": "body-tok"},
+        },
+    )
+    assert r.status_code == 200, r.text
+    assert captured["auth"].token.get_secret_value() == "body-tok"
+
+
+def test_api_snowflake_bad_private_key_is_400(monkeypatch):
+    # No importer stub here: credential handling is what's under test, and it
+    # has to reject the request before `connect()` is ever reached.
+    connected = _capture_connect(monkeypatch)
+    r = _client().post(
+        "/import/snowflake",
+        json={
+            "account": "A", "database": "D", "schema": "S",
+            "auth": {"type": "key_pair", "user": "SVC", "private_key": "not-a-key"},
+        },
+    )
+    assert r.status_code == 400
+    assert "private_key" in r.json()["detail"]
+    assert connected == {}          # never dialled Snowflake
+
+
+def test_api_snowflake_wrong_passphrase_is_400_without_key_material(monkeypatch):
+    connected = _capture_connect(monkeypatch)
+    r = _client().post(
+        "/import/snowflake",
+        json={
+            "account": "A", "database": "D", "schema": "S",
+            "auth": {
+                "type": "key_pair", "user": "SVC",
+                "private_key": _rsa_pem(passphrase="right"),
+                "private_key_passphrase": "wrong",
+            },
+        },
+    )
+    assert r.status_code == 400
+    assert "BEGIN" not in r.text            # the error never quotes the key
+    assert connected == {}
+
+
+def test_api_config_auth_disabled_by_default(monkeypatch):
+    from dcx.snowflake_auth import ALLOW_LOCAL_CREDENTIALS_ENV
+
+    monkeypatch.delenv(ALLOW_LOCAL_CREDENTIALS_ENV, raising=False)
+    connected = _capture_connect(monkeypatch)
+    r = _client().post(
+        "/import/snowflake",
+        json={
+            "database": "D", "schema": "S",
+            "auth": {"type": "config", "connection_name": "dev"},
+        },
+    )
+    assert r.status_code == 403
+    assert "--allow-local-credentials" in r.json()["detail"]
+    assert connected == {}          # the gate holds before any connection
+
+
+def test_api_config_auth_when_enabled(monkeypatch):
+    from dcx.snowflake_auth import ALLOW_LOCAL_CREDENTIALS_ENV
+
+    monkeypatch.setenv(ALLOW_LOCAL_CREDENTIALS_ENV, "1")
+    connected = _capture_connect(monkeypatch)
+    r = _client().post(
+        "/import/snowflake",
+        json={
+            "database": "D", "schema": "S",       # no account: the profile has one
+            "auth": {"type": "config", "connection_name": "dev"},
+        },
+    )
+    assert r.status_code == 200, r.text
+    assert connected["connection_name"] == "dev"
+    assert "account" not in connected
+
+
+def test_api_snowflake_rejects_server_side_key_path(monkeypatch):
+    """A path would make the server read its own filesystem for the caller."""
+    _capture_connect(monkeypatch)
+    r = _client().post(
+        "/import/snowflake",
+        json={
+            "account": "A", "database": "D", "schema": "S",
+            "auth": {
+                "type": "key_pair", "user": "SVC",
+                "private_key_file": "/home/someone/.ssh/rsa_key.p8",
+            },
+        },
+    )
+    assert r.status_code == 422       # extra="forbid" + private_key missing
+
+
+# === Default connection profile fallback ====================================
+
+
+def test_import_falls_back_to_default_profile(monkeypatch):
+    """No flags, no env — use Snowflake's own default profile rather than erroring."""
+    import dcx.importers.snowflake as si
+
+    for var in ("SNOWFLAKE_USER", "SNOWFLAKE_ACCOUNT", "SNOWFLAKE_PASSWORD"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(si, "default_connection_name", lambda: "my_default")
+    captured = _capture_connect(monkeypatch)
+
+    si.import_snowflake({"database": "DB", "schema": "SCH"})
+    assert captured["connection_name"] == "my_default"
+    # --database/--schema name what to read, so they override the profile context.
+    assert (captured["database"], captured["schema"]) == ("DB", "SCH")
+
+
+def test_import_original_error_kept_without_default_profile(monkeypatch):
+    import dcx.importers.snowflake as si
+
+    for var in ("SNOWFLAKE_USER", "SNOWFLAKE_ACCOUNT"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(si, "default_connection_name", lambda: None)
+
+    with pytest.raises(SnowflakeImportError, match="Cannot determine Snowflake account"):
+        si.import_snowflake({"database": "DB", "schema": "SCH"})
+
+
+def test_import_default_profile_not_used_when_env_is_set(monkeypatch):
+    import dcx.importers.snowflake as si
+
+    monkeypatch.setenv("SNOWFLAKE_ACCOUNT", "ACME")
+    monkeypatch.setenv("SNOWFLAKE_USER", "me")
+    monkeypatch.setattr(si, "default_connection_name", lambda: "my_default")
+    captured = _capture_connect(monkeypatch)
+
+    si.import_snowflake({"database": "DB", "schema": "SCH"})
+    assert "connection_name" not in captured
+    assert captured["account"] == "ACME"
+
+
+def test_allow_local_credentials_does_not_change_other_auth_methods(monkeypatch):
+    """Enabling server-side profiles unlocks `connection_name` and nothing else."""
+    from dcx.snowflake_auth import ALLOW_LOCAL_CREDENTIALS_ENV
+
+    monkeypatch.setenv(ALLOW_LOCAL_CREDENTIALS_ENV, "1")
+    monkeypatch.setenv("SNOWFLAKE_USER", "server-ambient-user")
+    monkeypatch.setenv("SNOWFLAKE_PASSWORD", "server-ambient-pw")
+    connected = _capture_connect(monkeypatch)
+
+    r = _client().post(
+        "/import/snowflake",
+        json={
+            "account": "CALLER_ACCT", "database": "DB", "schema": "SCH",
+            "auth": {"type": "oauth", "token": "caller-token"},
+        },
+    )
+    assert r.status_code == 200, r.text
+    assert connected["token"] == "caller-token"
+    assert connected["account"] == "CALLER_ACCT"
+    assert "connection_name" not in connected           # the server profile is untouched
+    assert "server-ambient-user" not in connected.values()
+    assert "password" not in connected
+
+
+def test_api_never_falls_back_to_the_servers_default_profile(monkeypatch):
+    """The CLI's default-profile fallback must not exist on the API path: it would
+    make the server connect as itself for a caller who supplied no account."""
+    import dcx.importers.snowflake as si
+    from dcx.snowflake_auth import ALLOW_LOCAL_CREDENTIALS_ENV
+
+    monkeypatch.setenv(ALLOW_LOCAL_CREDENTIALS_ENV, "1")
+    consulted = []
+    monkeypatch.setattr(
+        si, "default_connection_name", lambda: consulted.append(1) or "server_default",
+    )
+    connected = _capture_connect(monkeypatch)
+
+    r = _client().post(
+        "/import/snowflake",
+        json={
+            "database": "DB", "schema": "SCH",      # no account
+            "auth": {"type": "oauth", "token": "caller-token"},
+        },
+    )
+    assert r.status_code == 502
+    assert "account is required" in r.json()["detail"]
+    assert consulted == []
+    assert connected == {}
+
+
+def test_api_config_auth_name_may_be_omitted_for_the_default(monkeypatch):
+    """`{"type": "config"}` means the server's default_connection_name."""
+    import dcx.snowflake_auth as sa
+    from dcx.snowflake_auth import ALLOW_LOCAL_CREDENTIALS_ENV
+
+    monkeypatch.setenv(ALLOW_LOCAL_CREDENTIALS_ENV, "1")
+    monkeypatch.setattr(sa, "default_connection_name", lambda: "server_default")
+    connected = _capture_connect(monkeypatch)
+
+    r = _client().post(
+        "/import/snowflake",
+        json={"database": "D", "schema": "S", "auth": {"type": "config"}},
+    )
+    assert r.status_code == 200, r.text
+    assert connected["connection_name"] == "server_default"
+
+
+def test_api_config_auth_without_a_default_is_400(monkeypatch):
+    import dcx.snowflake_auth as sa
+    from dcx.snowflake_auth import ALLOW_LOCAL_CREDENTIALS_ENV
+
+    monkeypatch.setenv(ALLOW_LOCAL_CREDENTIALS_ENV, "1")
+    monkeypatch.setattr(sa, "default_connection_name", lambda: None)
+    connected = _capture_connect(monkeypatch)
+
+    r = _client().post(
+        "/import/snowflake",
+        json={"database": "D", "schema": "S", "auth": {"type": "config"}},
+    )
+    assert r.status_code == 400
+    assert "default_connection_name" in r.json()["detail"]
+    assert connected == {}
+
+
+def test_api_gate_checked_before_the_default_is_looked_up(monkeypatch):
+    """A disabled server must 403 without revealing whether it has a default."""
+    import dcx.snowflake_auth as sa
+    from dcx.snowflake_auth import ALLOW_LOCAL_CREDENTIALS_ENV
+
+    monkeypatch.delenv(ALLOW_LOCAL_CREDENTIALS_ENV, raising=False)
+    looked_up = []
+    monkeypatch.setattr(
+        sa, "default_connection_name", lambda: looked_up.append(1) or "secret_default",
+    )
+    r = _client().post(
+        "/import/snowflake",
+        json={"database": "D", "schema": "S", "auth": {"type": "config"}},
+    )
+    assert r.status_code == 403
+    assert looked_up == []
+    assert "secret_default" not in r.text
+
+
+def test_tilde_private_key_path_error_explains_itself(monkeypatch):
+    """The connector does not expand `~` in private_key_file; say so."""
+    import snowflake.connector as connector
+    import dcx.importers.snowflake as si
+
+    def boom(**kw):
+        raise FileNotFoundError(
+            2, "No such file or directory", "~/keys/rsa_key.p8"
+        )
+
+    monkeypatch.setattr(connector, "connect", boom)
+    with pytest.raises(si.SnowflakeImportError) as excinfo:
+        si.import_snowflake({"database": "D", "schema": "S", "account": "A",
+                             "user": "u", "connection_name": "dev"})
+    msg = str(excinfo.value)
+    assert "does not expand" in msg
+    assert "absolute path" in msg
+
+
+def test_ordinary_connection_error_gets_no_tilde_hint(monkeypatch):
+    import snowflake.connector as connector
+    import dcx.importers.snowflake as si
+
+    monkeypatch.setattr(connector, "connect", lambda **kw: (_ for _ in ()).throw(
+        Exception("Incorrect username or password was specified.")))
+    with pytest.raises(si.SnowflakeImportError) as excinfo:
+        si.import_snowflake({"database": "D", "schema": "S", "account": "A",
+                             "user": "u", "connection_name": "dev"})
+    assert "does not expand" not in str(excinfo.value)
+    assert "Incorrect username" in str(excinfo.value)
