@@ -77,6 +77,7 @@ _ENV_VARS: dict[str, str] = {
     "account":               "SNOWFLAKE_ACCOUNT",
     "role":                  "SNOWFLAKE_ROLE",
     "warehouse":             "SNOWFLAKE_WAREHOUSE",
+    "secondary_roles":       "SNOWFLAKE_SECONDARY_ROLES",
     "database":              "SNOWFLAKE_DATABASE",
     "schema":                "SNOWFLAKE_SCHEMA",
     "authenticator":         "SNOWFLAKE_AUTHENTICATOR",
@@ -99,6 +100,22 @@ def _first(*candidates: Optional[str]) -> Optional[str]:
         if c is not None and c != "":
             return c
     return None
+
+
+def configure_secondary_roles(conn, secondary_roles: Optional[str]) -> None:
+    """Configure an explicitly requested Snowflake secondary-role mode."""
+    if secondary_roles is None:
+        return
+
+    value = secondary_roles.upper()
+    if value not in {"ALL", "NONE"}:
+        raise ValueError("secondary_roles must be either ALL or NONE")
+
+    cur = conn.cursor()
+    try:
+        cur.execute(f"USE SECONDARY ROLES {value}")
+    finally:
+        cur.close()
 
 
 def profile_conn_kwargs(
@@ -314,6 +331,7 @@ def apply_snowflake(
     server_name: Optional[str] = None,
     user: Optional[str] = None,
     role: Optional[str] = None,
+    secondary_roles: Optional[str] = None,
     warehouse: Optional[str] = None,
     account: Optional[str] = None,
     authenticator: Optional[str] = None,
@@ -395,7 +413,12 @@ def apply_snowflake(
             )
 
     statements_executed, warnings = _connect_apply(
-        sql, conn_kwargs, contract=contract, server_name=server_name, strict=strict,
+        sql,
+        conn_kwargs,
+        secondary_roles=_first(secondary_roles, os.environ.get(_ENV_VARS["secondary_roles"])),
+        contract=contract,
+        server_name=server_name,
+        strict=strict,
     )
     return {
         "dry_run": False,
@@ -413,6 +436,7 @@ def apply_snowflake_api(
     server_name: Optional[str] = None,
     account: Optional[str] = None,
     role: Optional[str] = None,
+    secondary_roles: Optional[str] = None,
     warehouse: Optional[str] = None,
     dry_run: bool = False,
     # SQL-generation options. `auto` (default) creates missing tables and governs
@@ -489,7 +513,12 @@ def apply_snowflake_api(
         conn_kwargs["schema"] = srv.schema_
 
     statements_executed, warnings = _connect_apply(
-        sql, conn_kwargs, contract=contract, server_name=server_name, strict=strict,
+        sql,
+        conn_kwargs,
+        secondary_roles=secondary_roles,
+        contract=contract,
+        server_name=server_name,
+        strict=strict,
     )
     return {
         "dry_run": False,
@@ -595,6 +624,7 @@ def _connect_apply(
     sql: str,
     conn_kwargs: dict[str, Any],
     *,
+    secondary_roles: Optional[str] = None,
     contract: Optional[OpenDataContractStandard] = None,
     server_name: Optional[str] = None,
     check_drift: bool = True,
@@ -623,6 +653,11 @@ def _connect_apply(
         raise ApplyError(connection_error_message(exc))
 
     try:
+        try:
+            configure_secondary_roles(conn, secondary_roles)
+        except Exception as exc:
+            raise ApplyError(f"Snowflake session configuration failed: {exc}")
+
         warnings: list[str] = []
         if check_drift and contract is not None:
             try:
@@ -681,6 +716,10 @@ def apply_snowflake_command(
     ] = None,
     role: Annotated[
         Optional[str], typer.Option(help="Snowflake role to assume."),
+    ] = None,
+    secondary_roles: Annotated[
+        Optional[str],
+        typer.Option(help="Secondary-role mode: ALL or NONE (or SNOWFLAKE_SECONDARY_ROLES)."),
     ] = None,
     warehouse: Annotated[
         Optional[str], typer.Option(help="Override warehouse from contract."),
@@ -785,6 +824,7 @@ def apply_snowflake_command(
             contract,
             server_name=server,
             user=user, role=role,
+            secondary_roles=secondary_roles,
             warehouse=warehouse, account=account,
             authenticator=authenticator,
             connection_name=connection_name,

@@ -64,6 +64,9 @@ def import_snowflake(
         Optional[str], typer.Option(help="Username (or SNOWFLAKE_USER env var).")
     ] = None,
     role: Annotated[Optional[str], typer.Option(help="Role to assume.")] = None,
+    secondary_roles: Annotated[
+        Optional[str], typer.Option(help="Secondary-role mode: ALL or NONE (or SNOWFLAKE_SECONDARY_ROLES)."),
+    ] = None,
     warehouse: Annotated[Optional[str], typer.Option(help="Warehouse to use for the queries.")] = None,
     authenticator: Annotated[
         Optional[str],
@@ -110,6 +113,7 @@ def import_snowflake(
         account=account,
         user=user,
         role=role,
+        secondary_roles=secondary_roles,
         warehouse=warehouse,
         authenticator=authenticator,
         connection_name=connection_name,

@@ -34,6 +34,7 @@ from open_data_contract_standard.model import (
 from dcx.apply.snowflake import (
     _ENV_VARS,
     _first,
+    configure_secondary_roles,
     default_connection_name,
     profile_conn_kwargs,
     quiet_aws_credential_noise,
@@ -714,9 +715,19 @@ def _connect(import_args: dict):
     conn_kwargs.setdefault("network_timeout", SNOWFLAKE_NETWORK_TIMEOUT)
     quiet_aws_credential_noise()
     try:
-        return snowflake.connector.connect(**conn_kwargs)
+        conn = snowflake.connector.connect(**conn_kwargs)
     except Exception as exc:
         raise SnowflakeImportError(connection_error_message(exc))
+
+    try:
+        configure_secondary_roles(
+            conn,
+            _first(import_args.get("secondary_roles"), os.environ.get(_ENV_VARS["secondary_roles"])),
+        )
+    except Exception as exc:
+        conn.close()
+        raise SnowflakeImportError(f"Snowflake session configuration failed: {exc}")
+    return conn
 
 
 def _fetch_metadata(conn, database: str, schema: str, tables: Optional[list[str]]):
@@ -1068,6 +1079,7 @@ def import_snowflake_api(
     account: Optional[str] = None,
     tables: Optional[list[str]] = None,
     role: Optional[str] = None,
+    secondary_roles: Optional[str] = None,
     warehouse: Optional[str] = None,
     tags: bool = True,
     quality: bool = False,
@@ -1118,6 +1130,12 @@ def import_snowflake_api(
         conn = snowflake.connector.connect(**conn_kwargs)
     except Exception as exc:
         raise SnowflakeImportError(connection_error_message(exc))
+
+    try:
+        configure_secondary_roles(conn, secondary_roles)
+    except Exception as exc:
+        conn.close()
+        raise SnowflakeImportError(f"Snowflake session configuration failed: {exc}")
 
     try:
         return _contract_from_connection(

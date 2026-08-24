@@ -535,6 +535,79 @@ def _capture_connect(monkeypatch):
     return captured
 
 
+def test_import_connect_configures_env_secondary_roles_before_metadata(monkeypatch):
+    import dcx.importers.snowflake as si
+    import snowflake.connector as connector
+
+    executed: list[str] = []
+
+    class RecordingCursor(_FakeCursor):
+        def execute(self, sql, params=None):
+            executed.append(sql)
+            return super().execute(sql, params)
+
+    class RecordingConn(_FakeConn):
+        def cursor(self):
+            return RecordingCursor(self.data)
+
+    monkeypatch.setenv("SNOWFLAKE_SECONDARY_ROLES", "all")
+    monkeypatch.setattr(connector, "connect", lambda **kwargs: RecordingConn(_fake_data()))
+
+    conn = si._connect({"account": "ACME", "user": "SVC"})
+    try:
+        assert executed == ["USE SECONDARY ROLES ALL"]
+    finally:
+        conn.close()
+
+
+def test_import_connect_invalid_secondary_roles_executes_no_sql(monkeypatch):
+    import dcx.importers.snowflake as si
+    import snowflake.connector as connector
+
+    executed: list[str] = []
+
+    class RecordingCursor(_FakeCursor):
+        def execute(self, sql, params=None):
+            executed.append(sql)
+            return super().execute(sql, params)
+
+    class RecordingConn(_FakeConn):
+        def cursor(self):
+            return RecordingCursor(self.data)
+
+    conn = RecordingConn(_fake_data())
+    monkeypatch.setattr(connector, "connect", lambda **kwargs: conn)
+
+    with pytest.raises(SnowflakeImportError, match="secondary_roles must be either ALL or NONE"):
+        si._connect({"account": "ACME", "user": "SVC", "secondary_roles": "ROLE_A"})
+
+    assert executed == []
+    assert conn.closed is True
+
+
+def test_import_connect_secondary_role_failure_stops_before_metadata(monkeypatch):
+    import dcx.importers.snowflake as si
+    import snowflake.connector as connector
+
+    class FailingCursor(_FakeCursor):
+        def execute(self, sql, params=None):
+            if sql == "USE SECONDARY ROLES ALL":
+                raise RuntimeError("not allowed")
+            return super().execute(sql, params)
+
+    class FailingConn(_FakeConn):
+        def cursor(self):
+            return FailingCursor(self.data)
+
+    conn = FailingConn(_fake_data())
+    monkeypatch.setattr(connector, "connect", lambda **kwargs: conn)
+
+    with pytest.raises(SnowflakeImportError, match="session configuration failed: not allowed"):
+        si._connect({"account": "ACME", "user": "SVC", "secondary_roles": "ALL"})
+
+    assert conn.closed is True
+
+
 def test_import_snowflake_api_uses_oauth_token(monkeypatch):
     from dcx.importers.snowflake import import_snowflake_api
     from dcx.snowflake_auth import OAuthAuth
@@ -650,13 +723,17 @@ def test_api_snowflake_works(monkeypatch):
     r = _client().post(
         "/import/snowflake",
         headers={"Authorization": "Bearer tok-xyz"},
-        json={"account": "ACME", "database": "DB", "schema": "SCH", "tables": ["T"]},
+        json={
+            "account": "ACME", "database": "DB", "schema": "SCH", "tables": ["T"],
+            "secondary_roles": "NONE",
+        },
     )
     assert r.status_code == 200, r.text
     assert captured["auth"].token.get_secret_value() == "tok-xyz"
     assert captured["account"] == "ACME"
     assert captured["schema"] == "SCH"       # body "schema" → schema_ → schema kwarg
     assert captured["tables"] == ["T"]
+    assert captured["secondary_roles"] == "NONE"
     assert captured["quality"] is False      # opt-in; off unless requested
 
 

@@ -894,6 +894,7 @@ class SnowflakeImportRequest(BaseModel):
     database: str = Field(..., description="Database to import from.")
     tables: Optional[list[str]] = Field(None, description="Limit to these tables. Default: all.")
     role: Optional[str] = Field(None, description="Role to assume.")
+    secondary_roles: Optional[str] = Field(None, description="Secondary-role mode: ALL or NONE.")
     warehouse: Optional[str] = Field(None, description="Warehouse for the queries.")
     tags: bool = Field(True, description="Import object tags as NAME=VALUE.")
     quality: bool = Field(
@@ -955,6 +956,7 @@ def mirror_snowflake_import_to_fastapi(api_app: FastAPI, prefix: str = "/import"
                 schema=body.schema_,
                 tables=body.tables,
                 role=body.role,
+                secondary_roles=body.secondary_roles,
                 warehouse=body.warehouse,
                 tags=body.tags,
                 quality=body.quality,
@@ -985,6 +987,7 @@ class ApplySnowflakeRequestOptions(BaseModel):
     server_name: Optional[str] = Field(None, description="Named server from the contract.")
     account: Optional[str] = Field(None, description="Override account (else from server block).")
     role: Optional[str] = Field(None, description="Role to assume (needs APPLY TAG / table ownership).")
+    secondary_roles: Optional[str] = Field(None, description="Secondary-role mode: ALL or NONE.")
     warehouse: Optional[str] = Field(None, description="Override warehouse (else from server block).")
     dry_run: bool = Field(False, description="Return the SQL without executing (no token needed).")
     ddl_mode: DdlMode = Field(
@@ -1097,6 +1100,7 @@ def mirror_apply_snowflake_to_fastapi(api_app: FastAPI, prefix: str = "/apply") 
                 server_name=opts.server_name,
                 account=opts.account,
                 role=opts.role,
+                secondary_roles=opts.secondary_roles,
                 warehouse=opts.warehouse,
                 dry_run=opts.dry_run,
                 ddl_mode=opts.ddl_mode,
