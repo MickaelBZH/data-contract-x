@@ -50,17 +50,17 @@ class ApplyError(Exception):
 # Snowflake connector kwarg → env var name. The connector itself doesn't
 # auto-read these, so we resolve them here.
 _ENV_VARS: dict[str, str] = {
-    "user":                  "SNOWFLAKE_USER",
-    "password":              "SNOWFLAKE_PASSWORD",
-    "account":               "SNOWFLAKE_ACCOUNT",
-    "role":                  "SNOWFLAKE_ROLE",
-    "warehouse":             "SNOWFLAKE_WAREHOUSE",
-    "database":              "SNOWFLAKE_DATABASE",
-    "schema":                "SNOWFLAKE_SCHEMA",
-    "authenticator":         "SNOWFLAKE_AUTHENTICATOR",
-    "private_key_file":      "SNOWFLAKE_PRIVATE_KEY_PATH",
-    "private_key_file_pwd":  "SNOWFLAKE_PRIVATE_KEY_PASSPHRASE",
-    "token":                 "SNOWFLAKE_TOKEN",
+    "user": "SNOWFLAKE_USER",
+    "password": "SNOWFLAKE_PASSWORD",
+    "account": "SNOWFLAKE_ACCOUNT",
+    "role": "SNOWFLAKE_ROLE",
+    "warehouse": "SNOWFLAKE_WAREHOUSE",
+    "database": "SNOWFLAKE_DATABASE",
+    "schema": "SNOWFLAKE_SCHEMA",
+    "authenticator": "SNOWFLAKE_AUTHENTICATOR",
+    "private_key_file": "SNOWFLAKE_PRIVATE_KEY_PATH",
+    "private_key_file_pwd": "SNOWFLAKE_PRIVATE_KEY_PASSPHRASE",
+    "token": "SNOWFLAKE_TOKEN",
 }
 
 # Connection timeouts (seconds) shared by `apply` and the live importers, so a
@@ -70,6 +70,21 @@ _ENV_VARS: dict[str, str] = {
 SNOWFLAKE_LOGIN_TIMEOUT = 30
 SNOWFLAKE_NETWORK_TIMEOUT = 120
 
+# Session-context fallback: when enabled, dcx tries to set role/warehouse after
+# connecting if either is missing from connect kwargs.
+_AUTO_SESSION_CONTEXT_ENV = "DCX_SNOWFLAKE_AUTO_SESSION_CONTEXT"
+_ROLE_PRIORITY_ENV = "DCX_SNOWFLAKE_ROLE_PRIORITY"
+
+# Heuristic rank for Snowflake built-in roles. Custom roles use a neutral score.
+_ROLE_RANK: dict[str, int] = {
+    "ACCOUNTADMIN": 1000,
+    "SECURITYADMIN": 900,
+    "SYSADMIN": 800,
+    "USERADMIN": 700,
+    "ORGADMIN": 600,
+    "PUBLIC": 0,
+}
+
 
 def _first(*candidates: Optional[str]) -> Optional[str]:
     """Return the first non-empty value from candidates."""
@@ -77,6 +92,104 @@ def _first(*candidates: Optional[str]) -> Optional[str]:
         if c is not None and c != "":
             return c
     return None
+
+
+def _truthy(value: Optional[str]) -> bool:
+    return (value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _auto_session_context_enabled() -> bool:
+    # Enabled by default so API callers without default role/warehouse can still work.
+    raw = os.environ.get(_AUTO_SESSION_CONTEXT_ENV, "true")
+    return _truthy(raw)
+
+
+def _quote_ident(identifier: str) -> str:
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def _pick_highest_privilege_role(role_names: list[str]) -> Optional[str]:
+    if not role_names:
+        return None
+
+    preferred = [
+        r.strip().upper()
+        for r in (os.environ.get(_ROLE_PRIORITY_ENV) or "").split(",")
+        if r.strip()
+    ]
+    if preferred:
+        by_upper = {r.upper(): r for r in role_names}
+        for role in preferred:
+            if role in by_upper:
+                return by_upper[role]
+
+    def _score(role: str) -> tuple[int, str]:
+        upper = role.upper()
+        return (_ROLE_RANK.get(upper, 500), upper)
+
+    return sorted(role_names, key=_score, reverse=True)[0]
+
+
+def _extract_names(rows: list[Any], description: Optional[list[Any]]) -> list[str]:
+    if not rows:
+        return []
+    idx = 0
+    if description:
+        columns = {c[0].lower(): i for i, c in enumerate(description) if c and c[0]}
+        idx = columns.get("name", 0)
+    names: list[str] = []
+    for row in rows:
+        try:
+            value = row[idx]
+        except Exception:
+            value = None
+        if value:
+            names.append(str(value))
+    return names
+
+
+def ensure_session_role_warehouse(conn, conn_kwargs: dict[str, Any]) -> None:
+    """Best-effort role/warehouse fallback when either is missing.
+
+    If role/warehouse are already present in `conn_kwargs`, nothing changes.
+    When missing, this function tries to select sensible defaults in-session via
+    `USE ROLE` / `USE WAREHOUSE`.
+
+    This is intentionally best-effort: failures are ignored so explicit caller
+    settings keep working exactly as before.
+    """
+    if not _auto_session_context_enabled():
+        return
+    if conn_kwargs.get("role") and conn_kwargs.get("warehouse"):
+        return
+
+    cur = conn.cursor()
+    try:
+        if not conn_kwargs.get("role"):
+            try:
+                cur.execute("SHOW ROLES")
+                role_names = _extract_names(cur.fetchall(), cur.description)
+                chosen_role = _pick_highest_privilege_role(role_names)
+                if chosen_role:
+                    cur.execute(f"USE ROLE {_quote_ident(chosen_role)}")
+                    conn_kwargs["role"] = chosen_role
+            except Exception:
+                pass
+
+        if not conn_kwargs.get("warehouse"):
+            try:
+                cur.execute("SHOW WAREHOUSES")
+                wh_names = _extract_names(cur.fetchall(), cur.description)
+                chosen_wh = (
+                    sorted(wh_names, key=lambda x: x.upper())[0] if wh_names else None
+                )
+                if chosen_wh:
+                    cur.execute(f"USE WAREHOUSE {_quote_ident(chosen_wh)}")
+                    conn_kwargs["warehouse"] = chosen_wh
+            except Exception:
+                pass
+    finally:
+        cur.close()
 
 
 # Head of our generated `ALTER ... ADD DATA METRIC FUNCTION <assoc> EXPECTATION <exp>`.
@@ -117,7 +230,7 @@ def _add_dmf_to_modify_expectation(stmt: str) -> Optional[str]:
         return None
     last = separators[-1]
     assoc = rest[: last.start()].strip()
-    expectation = rest[last.end():].strip()
+    expectation = rest[last.end() :].strip()
     if not assoc or not expectation:
         return None
     return (
@@ -191,9 +304,9 @@ def _execute_statement(conn, stmt: str) -> None:
         cur.close()
 
 
-
 def _find_snowflake_server(
-    contract: OpenDataContractStandard, server_name: Optional[str],
+    contract: OpenDataContractStandard,
+    server_name: Optional[str],
 ) -> Optional[Server]:
     for srv in contract.servers or []:
         if srv.type != "snowflake":
@@ -224,17 +337,27 @@ def _resolve_connection_params(
     srv = _find_snowflake_server(contract, server_name)
 
     params: dict[str, Any] = {
-        "account":       _first(account, os.environ.get(_ENV_VARS["account"]),
-                                srv.account if srv else None),
-        "user":          _first(user, os.environ.get(_ENV_VARS["user"])),
-        "role":          _first(role, os.environ.get(_ENV_VARS["role"])),
-        "warehouse":     _first(warehouse, os.environ.get(_ENV_VARS["warehouse"]),
-                                srv.warehouse if srv else None),
-        "database":      _first(database, os.environ.get(_ENV_VARS["database"]),
-                                srv.database if srv else None),
-        "schema":        _first(schema, os.environ.get(_ENV_VARS["schema"]),
-                                srv.schema_ if srv else None),
-        "authenticator": _first(authenticator, os.environ.get(_ENV_VARS["authenticator"])),
+        "account": _first(
+            account, os.environ.get(_ENV_VARS["account"]), srv.account if srv else None
+        ),
+        "user": _first(user, os.environ.get(_ENV_VARS["user"])),
+        "role": _first(role, os.environ.get(_ENV_VARS["role"])),
+        "warehouse": _first(
+            warehouse,
+            os.environ.get(_ENV_VARS["warehouse"]),
+            srv.warehouse if srv else None,
+        ),
+        "database": _first(
+            database,
+            os.environ.get(_ENV_VARS["database"]),
+            srv.database if srv else None,
+        ),
+        "schema": _first(
+            schema, os.environ.get(_ENV_VARS["schema"]), srv.schema_ if srv else None
+        ),
+        "authenticator": _first(
+            authenticator, os.environ.get(_ENV_VARS["authenticator"])
+        ),
     }
 
     # Secrets — env var only, never CLI
@@ -320,8 +443,12 @@ def apply_snowflake(
         # layer on top.
         conn_kwargs: dict[str, Any] = {"connection_name": connection_name}
         for k, v in {
-            "user": user, "role": role, "warehouse": warehouse,
-            "account": account, "database": database, "schema": schema,
+            "user": user,
+            "role": role,
+            "warehouse": warehouse,
+            "account": account,
+            "database": database,
+            "schema": schema,
             "authenticator": authenticator,
         }.items():
             if v is not None:
@@ -329,13 +456,21 @@ def apply_snowflake(
     else:
         conn_kwargs = _resolve_connection_params(
             contract,
-            server_name=server_name, user=user, role=role,
-            warehouse=warehouse, account=account, database=database,
-            schema=schema, authenticator=authenticator,
+            server_name=server_name,
+            user=user,
+            role=role,
+            warehouse=warehouse,
+            account=account,
+            database=database,
+            schema=schema,
+            authenticator=authenticator,
         )
 
     statements_executed, warnings = _connect_apply(
-        sql, conn_kwargs, contract=contract, strict=strict,
+        sql,
+        conn_kwargs,
+        contract=contract,
+        strict=strict,
     )
     return {
         "dry_run": False,
@@ -401,8 +536,11 @@ def apply_snowflake_oauth(
 
     if dry_run:  # preview the SQL without connecting — no token needed
         return {
-            "dry_run": True, "sql": sql, "statements_executed": 0,
-            "warnings": [], "account": account,
+            "dry_run": True,
+            "sql": sql,
+            "statements_executed": 0,
+            "warnings": [],
+            "account": account,
         }
 
     if not token:
@@ -423,7 +561,10 @@ def apply_snowflake_oauth(
         conn_kwargs["schema"] = srv.schema_
 
     statements_executed, warnings = _connect_apply(
-        sql, conn_kwargs, contract=contract, strict=strict,
+        sql,
+        conn_kwargs,
+        contract=contract,
+        strict=strict,
     )
     return {
         "dry_run": False,
@@ -434,21 +575,132 @@ def apply_snowflake_oauth(
     }
 
 
+def apply_snowflake_with_connection(
+    contract: OpenDataContractStandard,
+    *,
+    connection_kwargs: dict[str, Any],
+    server_name: Optional[str] = None,
+    account: Optional[str] = None,
+    role: Optional[str] = None,
+    warehouse: Optional[str] = None,
+    dry_run: bool = False,
+    ddl_mode: DdlMode = DdlMode.auto,
+    structured_types: bool = False,
+    include_comments: bool = True,
+    include_tags: bool = True,
+    include_quality: bool = True,
+    create_tags: bool = False,
+    tag_namespace: Optional[str] = None,
+    tag_namespace_filter: Optional[list[str]] = None,
+    metric_schedule: str = "USING CRON 0 0 * * * UTC",
+    strict: bool = False,
+) -> dict[str, Any]:
+    """Apply using explicit connector kwargs (service-user/server-side auth).
+
+    This path is used by the API when credentials come from a server-side secret
+    source (for example Vault), not from caller OAuth.
+    """
+    srv = _find_snowflake_server(contract, server_name)
+
+    resolved_account = (
+        account or connection_kwargs.get("account") or (srv.account if srv else None)
+    )
+    if not resolved_account:
+        raise ApplyError(
+            "Cannot determine Snowflake account: provide it in the service profile, "
+            "the contract server block, or the request override."
+        )
+    resolved_warehouse = (
+        warehouse
+        or connection_kwargs.get("warehouse")
+        or (srv.warehouse if srv else None)
+    )
+    resolved_role = role or connection_kwargs.get("role")
+
+    sql = to_snowflake_full_sql(
+        contract,
+        **ddl_mode.to_sql_kwargs(),
+        structured_types=structured_types,
+        include_comments=include_comments,
+        include_tags=include_tags,
+        include_quality=include_quality,
+        create_tags=create_tags,
+        tag_namespace=tag_namespace,
+        tag_namespace_filter=tag_namespace_filter,
+        metric_schedule=metric_schedule,
+        server=server_name,
+    )
+
+    if dry_run:
+        return {
+            "dry_run": True,
+            "sql": sql,
+            "statements_executed": 0,
+            "warnings": [],
+            "account": resolved_account,
+        }
+
+    conn_kwargs = dict(connection_kwargs)
+    conn_kwargs["account"] = resolved_account
+    if resolved_role:
+        conn_kwargs["role"] = resolved_role
+    if resolved_warehouse:
+        conn_kwargs["warehouse"] = resolved_warehouse
+    if srv and srv.database and "database" not in conn_kwargs:
+        conn_kwargs["database"] = srv.database
+    if srv and srv.schema_ and "schema" not in conn_kwargs:
+        conn_kwargs["schema"] = srv.schema_
+    conn_kwargs = {k: v for k, v in conn_kwargs.items() if v is not None}
+
+    statements_executed, warnings = _connect_apply(
+        sql,
+        conn_kwargs,
+        contract=contract,
+        strict=strict,
+    )
+    return {
+        "dry_run": False,
+        "sql": sql,
+        "statements_executed": statements_executed,
+        "warnings": warnings,
+        "account": resolved_account,
+    }
+
+
 # Coarse Snowflake type families for drift comparison — strip precision/length and
 # fold synonyms so e.g. contract VARCHAR(255) matches the live INFORMATION_SCHEMA
 # `TEXT`, and NUMBER(38,0) matches `NUMBER`. Only clear family differences are flagged.
 _TYPE_FAMILY: dict[str, str] = {
-    "NUMBER": "NUMBER", "DECIMAL": "NUMBER", "NUMERIC": "NUMBER", "INT": "NUMBER",
-    "INTEGER": "NUMBER", "BIGINT": "NUMBER", "SMALLINT": "NUMBER", "TINYINT": "NUMBER",
+    "NUMBER": "NUMBER",
+    "DECIMAL": "NUMBER",
+    "NUMERIC": "NUMBER",
+    "INT": "NUMBER",
+    "INTEGER": "NUMBER",
+    "BIGINT": "NUMBER",
+    "SMALLINT": "NUMBER",
+    "TINYINT": "NUMBER",
     "BYTEINT": "NUMBER",
-    "FLOAT": "FLOAT", "FLOAT4": "FLOAT", "FLOAT8": "FLOAT", "DOUBLE": "FLOAT",
-    "DOUBLE PRECISION": "FLOAT", "REAL": "FLOAT",
-    "VARCHAR": "TEXT", "CHAR": "TEXT", "CHARACTER": "TEXT", "STRING": "TEXT", "TEXT": "TEXT",
+    "FLOAT": "FLOAT",
+    "FLOAT4": "FLOAT",
+    "FLOAT8": "FLOAT",
+    "DOUBLE": "FLOAT",
+    "DOUBLE PRECISION": "FLOAT",
+    "REAL": "FLOAT",
+    "VARCHAR": "TEXT",
+    "CHAR": "TEXT",
+    "CHARACTER": "TEXT",
+    "STRING": "TEXT",
+    "TEXT": "TEXT",
     "BOOLEAN": "BOOLEAN",
     "DATE": "DATE",
-    "TIMESTAMP": "TIMESTAMP", "DATETIME": "TIMESTAMP", "TIMESTAMP_NTZ": "TIMESTAMP",
-    "TIMESTAMP_LTZ": "TIMESTAMP", "TIMESTAMP_TZ": "TIMESTAMP",
-    "VARIANT": "VARIANT", "OBJECT": "OBJECT", "ARRAY": "ARRAY",
+    "TIMESTAMP": "TIMESTAMP",
+    "DATETIME": "TIMESTAMP",
+    "TIMESTAMP_NTZ": "TIMESTAMP",
+    "TIMESTAMP_LTZ": "TIMESTAMP",
+    "TIMESTAMP_TZ": "TIMESTAMP",
+    "VARIANT": "VARIANT",
+    "OBJECT": "OBJECT",
+    "ARRAY": "ARRAY",
 }
 
 
@@ -458,7 +710,10 @@ def _type_family(t: Optional[str]) -> str:
 
 
 def _detect_drift(
-    conn, contract: OpenDataContractStandard, database: Optional[str], schema: Optional[str],
+    conn,
+    contract: OpenDataContractStandard,
+    database: Optional[str],
+    schema: Optional[str],
 ) -> list[str]:
     """Compare each contract table's top-level columns to the live Snowflake table.
 
@@ -511,7 +766,11 @@ def _detect_drift(
                         f"{table}: column '{col}' exists in Snowflake but not in the contract."
                     )
             for col, ctype in contract_cols.items():
-                if col in live_cols and ctype and _type_family(ctype) != _type_family(live_cols[col]):
+                if (
+                    col in live_cols
+                    and ctype
+                    and _type_family(ctype) != _type_family(live_cols[col])
+                ):
                     warnings.append(
                         f"{table}.{col}: contract type {ctype} differs from Snowflake {live_cols[col]}."
                     )
@@ -551,11 +810,15 @@ def _connect_apply(
         raise ApplyError(f"Snowflake connection failed: {exc}")
 
     try:
+        ensure_session_role_warehouse(conn, conn_kwargs)
         warnings: list[str] = []
         if check_drift and contract is not None:
             try:
                 warnings = _detect_drift(
-                    conn, contract, conn_kwargs.get("database"), conn_kwargs.get("schema"),
+                    conn,
+                    contract,
+                    conn_kwargs.get("database"),
+                    conn_kwargs.get("schema"),
                 )
             except Exception as exc:
                 warnings = [f"(drift check skipped: {exc})"]
@@ -593,7 +856,8 @@ apply_app = typer.Typer(
 @apply_app.command("snowflake")
 def apply_snowflake_command(
     location: Annotated[
-        str, typer.Argument(help="Path to the data contract."),
+        str,
+        typer.Argument(help="Path to the data contract."),
     ] = "datacontract.yaml",
     server: Annotated[
         Optional[str],
@@ -604,19 +868,24 @@ def apply_snowflake_command(
         typer.Option(help="Snowflake username (or set SNOWFLAKE_USER env var)."),
     ] = None,
     role: Annotated[
-        Optional[str], typer.Option(help="Snowflake role to assume."),
+        Optional[str],
+        typer.Option(help="Snowflake role to assume."),
     ] = None,
     warehouse: Annotated[
-        Optional[str], typer.Option(help="Override warehouse from contract."),
+        Optional[str],
+        typer.Option(help="Override warehouse from contract."),
     ] = None,
     account: Annotated[
-        Optional[str], typer.Option(help="Override account from contract."),
+        Optional[str],
+        typer.Option(help="Override account from contract."),
     ] = None,
     database: Annotated[
-        Optional[str], typer.Option(help="Override database from contract."),
+        Optional[str],
+        typer.Option(help="Override database from contract."),
     ] = None,
     schema: Annotated[
-        Optional[str], typer.Option(help="Override schema from contract."),
+        Optional[str],
+        typer.Option(help="Override schema from contract."),
     ] = None,
     authenticator: Annotated[
         Optional[str],
@@ -634,7 +903,8 @@ def apply_snowflake_command(
         ),
     ] = None,
     dry_run: Annotated[
-        bool, typer.Option(help="Print the SQL without connecting or executing."),
+        bool,
+        typer.Option(help="Print the SQL without connecting or executing."),
     ] = False,
     ddl_mode: Annotated[
         DdlMode,
@@ -667,7 +937,8 @@ def apply_snowflake_command(
         ),
     ] = True,
     include_tags: Annotated[
-        bool, typer.Option(help="Emit ALTER TABLE / MODIFY COLUMN SET TAG statements."),
+        bool,
+        typer.Option(help="Emit ALTER TABLE / MODIFY COLUMN SET TAG statements."),
     ] = True,
     include_quality: Annotated[
         bool,
@@ -678,7 +949,8 @@ def apply_snowflake_command(
         ),
     ] = False,
     create_tags: Annotated[
-        bool, typer.Option(help="Also emit `CREATE TAG IF NOT EXISTS` for each tag used."),
+        bool,
+        typer.Option(help="Also emit `CREATE TAG IF NOT EXISTS` for each tag used."),
     ] = False,
     tag_namespace: Annotated[
         Optional[str],
@@ -693,7 +965,8 @@ def apply_snowflake_command(
         ),
     ] = None,
     metric_schedule: Annotated[
-        str, typer.Option(help="DATA_METRIC_SCHEDULE clause to set on tables with DMFs."),
+        str,
+        typer.Option(help="DATA_METRIC_SCHEDULE clause to set on tables with DMFs."),
     ] = "USING CRON 0 0 * * * UTC",
 ) -> None:
     """Apply a data contract to Snowflake.
@@ -714,8 +987,12 @@ def apply_snowflake_command(
         result = apply_snowflake(
             contract,
             server_name=server,
-            user=user, role=role,
-            warehouse=warehouse, account=account, database=database, schema=schema,
+            user=user,
+            role=role,
+            warehouse=warehouse,
+            account=account,
+            database=database,
+            schema=schema,
             authenticator=authenticator,
             connection_name=connection_name,
             dry_run=dry_run,

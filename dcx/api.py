@@ -25,6 +25,7 @@ not make these `async` unless their bodies become truly non-blocking.
 """
 
 import contextvars
+from enum import Enum
 import inspect
 import tempfile
 import typing
@@ -42,6 +43,11 @@ from pydantic import BaseModel, ConfigDict, Field, create_model
 from dcx import enrich as enrich_module
 from dcx import yaml_style  # noqa: F401  multi-line strings dump as block scalars
 from dcx.apply.snowflake import DdlMode
+from dcx.snowflake_service_auth import (
+    ServiceProfileSource,
+    ServiceProfileError,
+    load_snowflake_service_profile,
+)
 from dcx.target import command as target_module
 
 # Many CLI flags (`--schema`, etc.) intentionally shadow Pydantic BaseModel attributes
@@ -79,7 +85,11 @@ _CONTRACT_FIELD = (
                         "name": "orders",
                         "physicalType": "table",
                         "properties": [
-                            {"name": "id", "logicalType": "integer", "primaryKey": True},
+                            {
+                                "name": "id",
+                                "logicalType": "integer",
+                                "primaryKey": True,
+                            },
                             {"name": "amount", "logicalType": "number"},
                         ],
                     }
@@ -114,12 +124,16 @@ _CONTRACT_EXAMPLE = {
             "physicalType": "table",
             "properties": [
                 {
-                    "name": "id", "logicalType": "integer", "primaryKey": True,
-                    "required": True, "unique": True,
+                    "name": "id",
+                    "logicalType": "integer",
+                    "primaryKey": True,
+                    "required": True,
+                    "unique": True,
                     "description": "Surrogate key uniquely identifying each order.",
                 },
                 {
-                    "name": "amount", "logicalType": "number",
+                    "name": "amount",
+                    "logicalType": "number",
                     "description": "Order total in the account's settlement currency.",
                     "logicalTypeOptions": {"minimum": 0},
                 },
@@ -136,22 +150,34 @@ class ContractResponse(BaseModel):
     a YAML document (media type `text/yaml`) instead.
     """
 
-    contract: Dict[str, Any] = Field(..., description="The resulting ODCS data contract.")
+    contract: Dict[str, Any] = Field(
+        ..., description="The resulting ODCS data contract."
+    )
 
-    model_config = ConfigDict(json_schema_extra={"example": {"contract": _CONTRACT_EXAMPLE}})
+    model_config = ConfigDict(
+        json_schema_extra={"example": {"contract": _CONTRACT_EXAMPLE}}
+    )
 
 
 class ApplySnowflakeResponse(BaseModel):
     """Outcome of an `apply snowflake` run. The SQL is always returned for audit."""
 
-    dry_run: bool = Field(..., description="True when the SQL was returned without executing.")
-    statements_executed: int = Field(..., description="Number of statements run (0 when dry_run).")
-    account: Optional[str] = Field(None, description="The Snowflake account the SQL targeted.")
+    dry_run: bool = Field(
+        ..., description="True when the SQL was returned without executing."
+    )
+    statements_executed: int = Field(
+        ..., description="Number of statements run (0 when dry_run)."
+    )
+    account: Optional[str] = Field(
+        None, description="The Snowflake account the SQL targeted."
+    )
     warnings: list[str] = Field(
         default_factory=list,
         description="Schema-drift notes: columns that differ between the contract and existing tables.",
     )
-    sql: str = Field(..., description="The full SQL script generated (and executed unless dry_run).")
+    sql: str = Field(
+        ..., description="The full SQL script generated (and executed unless dry_run)."
+    )
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -159,7 +185,9 @@ class ApplySnowflakeResponse(BaseModel):
                 "dry_run": False,
                 "statements_executed": 4,
                 "account": "ab12345.eu-west-1",
-                "warnings": ["ORDERS: column 'LEGACY_FLAG' exists in Snowflake but not in the contract."],
+                "warnings": [
+                    "ORDERS: column 'LEGACY_FLAG' exists in Snowflake but not in the contract."
+                ],
                 "sql": "CREATE TABLE IF NOT EXISTS ORDERS (...); COMMENT ON TABLE ORDERS IS '...';",
             }
         }
@@ -170,9 +198,13 @@ class InfoResponse(BaseModel):
     """Installed component versions."""
 
     dcx: str = Field(..., description="Installed dcx version.")
-    datacontract_cli: str = Field(..., description="Underlying datacontract-cli version.")
+    datacontract_cli: str = Field(
+        ..., description="Underlying datacontract-cli version."
+    )
 
-    model_config = ConfigDict(json_schema_extra={"example": {"dcx": "0.1.0", "datacontract_cli": "0.12.5"}})
+    model_config = ConfigDict(
+        json_schema_extra={"example": {"dcx": "0.1.0", "datacontract_cli": "0.12.5"}}
+    )
 
 
 class ErrorResponse(BaseModel):
@@ -180,7 +212,9 @@ class ErrorResponse(BaseModel):
 
     detail: str = Field(..., description="Human-readable error message.")
 
-    model_config = ConfigDict(json_schema_extra={"example": {"detail": "Invalid contract: ..."}})
+    model_config = ConfigDict(
+        json_schema_extra={"example": {"detail": "Invalid contract: ..."}}
+    )
 
 
 _ERROR_DESCRIPTIONS = {
@@ -194,7 +228,10 @@ _ERROR_DESCRIPTIONS = {
 
 def _error_responses(*codes: int) -> dict:
     """Build a `responses=` fragment documenting the given error status codes."""
-    return {c: {"model": ErrorResponse, "description": _ERROR_DESCRIPTIONS[c]} for c in codes}
+    return {
+        c: {"model": ErrorResponse, "description": _ERROR_DESCRIPTIONS[c]}
+        for c in codes
+    }
 
 
 # Advertised on the 200 of contract-returning endpoints alongside the JSON model:
@@ -231,7 +268,9 @@ _EXPORT_RESPONSES = {
             "application/json": {"schema": {"type": "object"}},
             "text/yaml": {"schema": {"type": "string"}},
             "text/plain": {"schema": {"type": "string"}},
-            "application/octet-stream": {"schema": {"type": "string", "format": "binary"}},
+            "application/octet-stream": {
+                "schema": {"type": "string", "format": "binary"}
+            },
         },
     },
     **_error_responses(400, 500),
@@ -297,8 +336,13 @@ def _extract_typer_params(func) -> list[dict]:
         # New-style (Annotated): typer.Option/Argument is in the annotation's metadata
         elif hasattr(annotation, "__metadata__"):
             typer_info = next(
-                (m for m in annotation.__metadata__
-                 if isinstance(m, (typer.models.OptionInfo, typer.models.ArgumentInfo))),
+                (
+                    m
+                    for m in annotation.__metadata__
+                    if isinstance(
+                        m, (typer.models.OptionInfo, typer.models.ArgumentInfo)
+                    )
+                ),
                 None,
             )
             if typer_info is None:
@@ -313,16 +357,20 @@ def _extract_typer_params(func) -> list[dict]:
         else:
             continue
 
-        params.append({
-            "name": name,
-            "annotation": actual_anno,
-            "default": None if required else actual_default,
-            "required": required,
-        })
+        params.append(
+            {
+                "name": name,
+                "annotation": actual_anno,
+                "default": None if required else actual_default,
+                "required": required,
+            }
+        )
     return params
 
 
-def _build_options_model(name: str, params: list[dict], skip: set[str]) -> type[BaseModel]:
+def _build_options_model(
+    name: str, params: list[dict], skip: set[str]
+) -> type[BaseModel]:
     """Build a nested Pydantic model holding the CLI-derived options."""
     fields: dict[str, tuple] = {}
     for p in params:
@@ -399,16 +447,24 @@ def mirror_target_to_fastapi(api_app: FastAPI, prefix: str = "/target") -> None:
         cmd_func = cmd_info.callback
         params = _extract_typer_params(cmd_func)
         request_model = _build_request_model(
-            f"Target{cmd_name.title().replace('_', '')}Request", params,
+            f"Target{cmd_name.title().replace('_', '')}Request",
+            params,
         )
         summary = (cmd_func.__doc__ or "").strip().split("\n")[0] or None
 
         # Closure factory binds the per-iteration values
-        def _make_handler(cmd_name=cmd_name, cmd_func=cmd_func, params=params, RequestModel=request_model):
+        def _make_handler(
+            cmd_name=cmd_name,
+            cmd_func=cmd_func,
+            params=params,
+            RequestModel=request_model,
+        ):
             def handler(
                 body: RequestModel,
                 request: Request,
-                format: Optional[str] = Query(None, description="Response format: `json` (default) or `yaml`."),
+                format: Optional[str] = Query(
+                    None, description="Response format: `json` (default) or `yaml`."
+                ),
             ):
                 contract = _parse_contract_input(body.contract)
                 captured = _run_typer_command_for_api(cmd_func, params, body)
@@ -440,7 +496,8 @@ def mirror_target_to_fastapi(api_app: FastAPI, prefix: str = "/target") -> None:
 # patched `_write_result` (below) stores the ODCS result into the dict instead
 # of writing YAML to stdout or a file.
 _import_capture_var: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
-    "_import_capture_var", default=None,
+    "_import_capture_var",
+    default=None,
 )
 
 
@@ -487,22 +544,24 @@ def _capture_import_call():
 # Binary formats (parquet, excel) cannot be sent as JSON strings — users must
 # provide a server-accessible URL or path in `source` for those.
 _IMPORT_SOURCE_SUFFIX: dict[str, str] = {
-    "json":       ".json",
+    "json": ".json",
     "jsonschema": ".json",
-    "sql":        ".sql",
-    "avro":       ".avsc",
-    "dbml":       ".dbml",
-    "protobuf":   ".proto",
-    "csv":        ".csv",
-    "odcs":       ".yaml",
-    "dbt":        ".json",
+    "sql": ".sql",
+    "avro": ".avsc",
+    "dbml": ".dbml",
+    "protobuf": ".proto",
+    "csv": ".csv",
+    "odcs": ".yaml",
+    "dbt": ".json",
 }
 
 
 def _build_import_request_model(name: str, params: list[dict]) -> type[BaseModel]:
     """Build a Pydantic model for an import endpoint: {source_content, options}."""
     options_model = _build_options_model(
-        f"{name}Options", params, {"output", "debug"},
+        f"{name}Options",
+        params,
+        {"output", "debug"},
     )
     return create_model(
         name,
@@ -532,15 +591,23 @@ def mirror_import_to_fastapi(api_app: FastAPI, prefix: str = "/import") -> None:
         cmd_func = cmd_info.callback
         params = _extract_typer_params(cmd_func)
         request_model = _build_import_request_model(
-            f"Import{cmd_name.title()}Request", params,
+            f"Import{cmd_name.title()}Request",
+            params,
         )
         summary = (cmd_func.__doc__ or "").strip().split("\n")[0] or None
 
-        def _make_handler(cmd_name=cmd_name, cmd_func=cmd_func, params=params, RequestModel=request_model):
+        def _make_handler(
+            cmd_name=cmd_name,
+            cmd_func=cmd_func,
+            params=params,
+            RequestModel=request_model,
+        ):
             def handler(
                 body: RequestModel,
                 request: Request,
-                format: Optional[str] = Query(None, description="Response format: `json` (default) or `yaml`."),
+                format: Optional[str] = Query(
+                    None, description="Response format: `json` (default) or `yaml`."
+                ),
             ):
                 tempfile_path: Optional[str] = None
                 try:
@@ -554,7 +621,10 @@ def mirror_import_to_fastapi(api_app: FastAPI, prefix: str = "/import") -> None:
                     if body.source_content is not None:
                         suffix = _IMPORT_SOURCE_SUFFIX.get(cmd_name, ".txt")
                         with tempfile.NamedTemporaryFile(
-                            mode="w", suffix=suffix, delete=False, encoding="utf-8",
+                            mode="w",
+                            suffix=suffix,
+                            delete=False,
+                            encoding="utf-8",
                         ) as f:
                             f.write(body.source_content)
                             tempfile_path = f.name
@@ -570,7 +640,8 @@ def mirror_import_to_fastapi(api_app: FastAPI, prefix: str = "/import") -> None:
                             )
                         except Exception as exc:
                             raise HTTPException(
-                                status_code=400, detail=f"Import error: {exc}",
+                                status_code=400,
+                                detail=f"Import error: {exc}",
                             )
 
                     if "result" not in captured:
@@ -579,7 +650,9 @@ def mirror_import_to_fastapi(api_app: FastAPI, prefix: str = "/import") -> None:
                             detail=f"Failed to capture import result from {cmd_name}",
                         )
 
-                    return _serialize_response(captured["result"], _wants_yaml(request, format))
+                    return _serialize_response(
+                        captured["result"], _wants_yaml(request, format)
+                    )
 
                 finally:
                     if tempfile_path and Path(tempfile_path).exists():
@@ -588,7 +661,9 @@ def mirror_import_to_fastapi(api_app: FastAPI, prefix: str = "/import") -> None:
             return handler
 
         api_app.post(
-            f"{prefix}/{cmd_name}", summary=summary, tags=["import"],
+            f"{prefix}/{cmd_name}",
+            summary=summary,
+            tags=["import"],
             response_model=ContractResponse,
             responses=_contract_responses(400, 500),
         )(_make_handler())
@@ -600,7 +675,8 @@ def mirror_import_to_fastapi(api_app: FastAPI, prefix: str = "/import") -> None:
 # === Export endpoint registration ===========================================
 
 _export_capture_var: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
-    "_export_capture_var", default=None,
+    "_export_capture_var",
+    default=None,
 )
 
 
@@ -615,31 +691,55 @@ def _install_export_capture() -> None:
     original = upstream_export._export
 
     def patched(
-        export_format, location, output, server, schema_name, schema,
-        sql_server_type="auto", rdf_base=None, engine=None, template=None,
+        export_format,
+        location,
+        output,
+        server,
+        schema_name,
+        schema,
+        sql_server_type="auto",
+        rdf_base=None,
+        engine=None,
+        template=None,
         inline_references=True,
     ):
         capture = _export_capture_var.get()
         if capture is None:
             return original(
-                export_format=export_format, location=location, output=output,
-                server=server, schema_name=schema_name, schema=schema,
-                sql_server_type=sql_server_type, rdf_base=rdf_base, engine=engine,
-                template=template, inline_references=inline_references,
+                export_format=export_format,
+                location=location,
+                output=output,
+                server=server,
+                schema_name=schema_name,
+                schema=schema,
+                sql_server_type=sql_server_type,
+                rdf_base=rdf_base,
+                engine=engine,
+                template=template,
+                inline_references=inline_references,
             )
         # API mode: compute the result but capture instead of writing.
         from datacontract.data_contract import DataContract
+
         result = DataContract(
-            data_contract_file=location, schema_location=schema, server=server,
+            data_contract_file=location,
+            schema_location=schema,
+            server=server,
             inline_references=inline_references,
         ).export(
-            export_format=export_format, schema_name=schema_name, server=server,
-            rdf_base=rdf_base, sql_server_type=sql_server_type, engine=engine,
+            export_format=export_format,
+            schema_name=schema_name,
+            server=server,
+            rdf_base=rdf_base,
+            sql_server_type=sql_server_type,
+            engine=engine,
             template=template,
         )
         capture["result"] = result
         capture["format"] = (
-            export_format.value if hasattr(export_format, "value") else str(export_format)
+            export_format.value
+            if hasattr(export_format, "value")
+            else str(export_format)
         )
 
     patched._dcx_patched = True
@@ -662,7 +762,9 @@ def _capture_export_call():
 def _build_export_request_model(name: str, params: list[dict]) -> type[BaseModel]:
     """Build a Pydantic model for an export endpoint: {contract, options}."""
     options_model = _build_options_model(
-        f"{name}Options", params, {"location", "output", "debug", "ctx"},
+        f"{name}Options",
+        params,
+        {"location", "output", "debug", "ctx"},
     )
     return create_model(
         name,
@@ -673,7 +775,9 @@ def _build_export_request_model(name: str, params: list[dict]) -> type[BaseModel
 
 
 def _serialize_export_response(
-    captured: dict, request: Request, format_query: Optional[str],
+    captured: dict,
+    request: Request,
+    format_query: Optional[str],
 ):
     """Serialize an export result based on its native type and any format preference."""
     import yaml as yamllib
@@ -682,7 +786,9 @@ def _serialize_export_response(
     export_format = captured.get("format", "")
     fmt = (format_query or "").lower()
     accept = request.headers.get("accept", "")
-    wants_yaml = fmt == "yaml" or "text/yaml" in accept or "application/x-yaml" in accept
+    wants_yaml = (
+        fmt == "yaml" or "text/yaml" in accept or "application/x-yaml" in accept
+    )
     wants_json = fmt == "json" or "application/json" in accept
 
     if isinstance(result, bytes):
@@ -712,7 +818,9 @@ def _serialize_export_response(
 def mirror_export_to_fastapi(api_app: FastAPI, prefix: str = "/export") -> None:
     """Register one `POST {prefix}/{format}` route per `dcx export <format>` subcommand."""
     from datacontract.command_export import export_app
-    from dcx.exporters import command  # noqa: F401  registers `export snowflake-full` on export_app
+    from dcx.exporters import (
+        command,
+    )  # noqa: F401  registers `export snowflake-full` on export_app
 
     for cmd_info in export_app.registered_commands:
         cmd_name = cmd_info.name
@@ -723,11 +831,17 @@ def mirror_export_to_fastapi(api_app: FastAPI, prefix: str = "/export") -> None:
             continue
 
         request_model = _build_export_request_model(
-            f"Export{cmd_name.title().replace('-', '')}Request", params,
+            f"Export{cmd_name.title().replace('-', '')}Request",
+            params,
         )
         summary = (cmd_func.__doc__ or "").strip().split("\n")[0] or None
 
-        def _make_handler(cmd_name=cmd_name, cmd_func=cmd_func, params=params, RequestModel=request_model):
+        def _make_handler(
+            cmd_name=cmd_name,
+            cmd_func=cmd_func,
+            params=params,
+            RequestModel=request_model,
+        ):
             def handler(
                 body: RequestModel,
                 request: Request,
@@ -740,7 +854,10 @@ def mirror_export_to_fastapi(api_app: FastAPI, prefix: str = "/export") -> None:
                 tempfile_path: Optional[str] = None
                 try:
                     with tempfile.NamedTemporaryFile(
-                        mode="w", suffix=".yaml", delete=False, encoding="utf-8",
+                        mode="w",
+                        suffix=".yaml",
+                        delete=False,
+                        encoding="utf-8",
                     ) as f:
                         f.write(contract_yaml)
                         tempfile_path = f.name
@@ -763,7 +880,9 @@ def mirror_export_to_fastapi(api_app: FastAPI, prefix: str = "/export") -> None:
                                 detail=f"Export failed (exit code {exc.exit_code})",
                             )
                         except Exception as exc:
-                            raise HTTPException(status_code=400, detail=f"Export error: {exc}")
+                            raise HTTPException(
+                                status_code=400, detail=f"Export error: {exc}"
+                            )
 
                     if "result" not in captured:
                         raise HTTPException(
@@ -779,7 +898,9 @@ def mirror_export_to_fastapi(api_app: FastAPI, prefix: str = "/export") -> None:
             return handler
 
         api_app.post(
-            f"{prefix}/{cmd_name}", summary=summary, tags=["export"],
+            f"{prefix}/{cmd_name}",
+            summary=summary,
+            tags=["export"],
             responses=_EXPORT_RESPONSES,
         )(_make_handler())
 
@@ -815,13 +936,41 @@ def _bearer_token(authorization: Optional[str]) -> Optional[str]:
     return None
 
 
+class SnowflakeAuthMode(str, Enum):
+    caller_oauth = "caller_oauth"
+    service_profile = "service_profile"
+
+
 class SnowflakeImportRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
-    account: str = Field(..., description="Snowflake account identifier.")
+    auth_mode: SnowflakeAuthMode = Field(
+        SnowflakeAuthMode.caller_oauth,
+        description=(
+            "Snowflake auth mode: `caller_oauth` (caller bearer token) or "
+            "`service_profile` (server-side Vault-backed service user)."
+        ),
+    )
+    service_profile: Optional[str] = Field(
+        None,
+        description="Vault service profile name (required when auth_mode=service_profile).",
+    )
+    service_profile_source: ServiceProfileSource = Field(
+        ServiceProfileSource.vault,
+        description=(
+            "Source for service_profile lookup: `vault`, `env`, `file`, or `auto` "
+            "(env -> file -> vault)."
+        ),
+    )
+    account: Optional[str] = Field(
+        None,
+        description="Snowflake account identifier. Required for caller_oauth; optional for service_profile.",
+    )
     schema_: str = Field(..., alias="schema", description="Schema to import.")
     database: str = Field(..., description="Database to import from.")
-    tables: Optional[list[str]] = Field(None, description="Limit to these tables. Default: all.")
+    tables: Optional[list[str]] = Field(
+        None, description="Limit to these tables. Default: all."
+    )
     role: Optional[str] = Field(None, description="Role to assume.")
     warehouse: Optional[str] = Field(None, description="Warehouse for the queries.")
     tags: bool = Field(True, description="Import object tags as NAME=VALUE.")
@@ -829,10 +978,14 @@ class SnowflakeImportRequest(BaseModel):
         False,
         description="Import attached data metric functions as quality rules and SLAs.",
     )
-    server_name: str = Field("production", description="Name for the server entry in the contract.")
+    server_name: str = Field(
+        "production", description="Name for the server entry in the contract."
+    )
 
 
-def mirror_snowflake_import_to_fastapi(api_app: FastAPI, prefix: str = "/import") -> None:
+def mirror_snowflake_import_to_fastapi(
+    api_app: FastAPI, prefix: str = "/import"
+) -> None:
     """Register `POST {prefix}/snowflake` authenticated by a caller OAuth token."""
 
     @api_app.post(
@@ -848,29 +1001,66 @@ def mirror_snowflake_import_to_fastapi(api_app: FastAPI, prefix: str = "/import"
         authorization: Optional[str] = Header(
             None, description="Snowflake OAuth token: `Authorization: Bearer <token>`."
         ),
-        format: Optional[str] = Query(None, description="Response format: `json` (default) or `yaml`."),
+        format: Optional[str] = Query(
+            None, description="Response format: `json` (default) or `yaml`."
+        ),
     ):
         from dcx.importers import snowflake as snowflake_import
 
-        token = _bearer_token(authorization)
-        if not token:
-            raise HTTPException(
-                status_code=401,
-                detail="Provide a Snowflake OAuth token via 'Authorization: Bearer <token>'.",
-            )
         try:
-            contract = snowflake_import.import_snowflake_oauth(
-                token=token,
-                account=body.account,
-                database=body.database,
-                schema=body.schema_,
-                tables=body.tables,
-                role=body.role,
-                warehouse=body.warehouse,
-                tags=body.tags,
-                quality=body.quality,
-                server_name=body.server_name,
-            )
+            if body.auth_mode == SnowflakeAuthMode.caller_oauth:
+                token = _bearer_token(authorization)
+                if not token:
+                    raise HTTPException(
+                        status_code=401,
+                        detail="Provide a Snowflake OAuth token via 'Authorization: Bearer <token>'.",
+                    )
+                if not body.account:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="`account` is required when auth_mode=caller_oauth.",
+                    )
+                contract = snowflake_import.import_snowflake_oauth(
+                    token=token,
+                    account=body.account,
+                    database=body.database,
+                    schema=body.schema_,
+                    tables=body.tables,
+                    role=body.role,
+                    warehouse=body.warehouse,
+                    tags=body.tags,
+                    quality=body.quality,
+                    server_name=body.server_name,
+                )
+            else:
+                if not body.service_profile:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="`service_profile` is required when auth_mode=service_profile.",
+                    )
+                conn_kwargs = load_snowflake_service_profile(
+                    body.service_profile,
+                    source=body.service_profile_source,
+                )
+                if body.account:
+                    conn_kwargs["account"] = body.account
+                if body.role:
+                    conn_kwargs["role"] = body.role
+                if body.warehouse:
+                    conn_kwargs["warehouse"] = body.warehouse
+                contract = snowflake_import.import_snowflake_with_connection(
+                    connection_kwargs=conn_kwargs,
+                    database=body.database,
+                    schema=body.schema_,
+                    tables=body.tables,
+                    role=body.role,
+                    warehouse=body.warehouse,
+                    tags=body.tags,
+                    quality=body.quality,
+                    server_name=body.server_name,
+                )
+        except ServiceProfileError as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
         except snowflake_import.SnowflakeImportError as exc:
             raise HTTPException(status_code=502, detail=str(exc))
 
@@ -890,11 +1080,40 @@ class ApplySnowflakeRequestOptions(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    server_name: Optional[str] = Field(None, description="Named server from the contract.")
-    account: Optional[str] = Field(None, description="Override account (else from server block).")
-    role: Optional[str] = Field(None, description="Role to assume (needs APPLY TAG / table ownership).")
-    warehouse: Optional[str] = Field(None, description="Override warehouse (else from server block).")
-    dry_run: bool = Field(False, description="Return the SQL without executing (no token needed).")
+    auth_mode: SnowflakeAuthMode = Field(
+        SnowflakeAuthMode.caller_oauth,
+        description=(
+            "Snowflake auth mode: `caller_oauth` (caller bearer token) or "
+            "`service_profile` (server-side Vault-backed service user)."
+        ),
+    )
+    service_profile: Optional[str] = Field(
+        None,
+        description="Vault service profile name (required when auth_mode=service_profile).",
+    )
+    service_profile_source: ServiceProfileSource = Field(
+        ServiceProfileSource.vault,
+        description=(
+            "Source for service_profile lookup: `vault`, `env`, `file`, or `auto` "
+            "(env -> file -> vault)."
+        ),
+    )
+
+    server_name: Optional[str] = Field(
+        None, description="Named server from the contract."
+    )
+    account: Optional[str] = Field(
+        None, description="Override account (else from server block)."
+    )
+    role: Optional[str] = Field(
+        None, description="Role to assume (needs APPLY TAG / table ownership)."
+    )
+    warehouse: Optional[str] = Field(
+        None, description="Override warehouse (else from server block)."
+    )
+    dry_run: bool = Field(
+        False, description="Return the SQL without executing (no token needed)."
+    )
     ddl_mode: DdlMode = Field(
         DdlMode.auto,
         description=(
@@ -915,19 +1134,25 @@ class ApplySnowflakeRequestOptions(BaseModel):
         ),
     )
     include_comments: bool = Field(
-        True, description="Emit COMMENT ON TABLE/COLUMN for descriptions (applies to existing tables)."
+        True,
+        description="Emit COMMENT ON TABLE/COLUMN for descriptions (applies to existing tables).",
     )
     include_tags: bool = Field(True, description="Emit SET TAG statements.")
-    include_quality: bool = Field(True, description="Emit Data Metric Function statements (Enterprise).")
+    include_quality: bool = Field(
+        True, description="Emit Data Metric Function statements (Enterprise)."
+    )
     create_tags: bool = Field(False, description="Also emit CREATE TAG IF NOT EXISTS.")
-    tag_namespace: Optional[str] = Field(None, description="Database.schema prefix for tag references.")
+    tag_namespace: Optional[str] = Field(
+        None, description="Database.schema prefix for tag references."
+    )
     tag_namespace_filter: Optional[list[str]] = Field(
         None,
         description="Only emit tags whose namespace (DB.SCHEMA) is in this list; "
         "un-namespaced tags are skipped. Omit to emit all tags.",
     )
     metric_schedule: str = Field(
-        "USING CRON 0 0 * * * UTC", description="DATA_METRIC_SCHEDULE clause for DMF tables."
+        "USING CRON 0 0 * * * UTC",
+        description="DATA_METRIC_SCHEDULE clause for DMF tables.",
     )
 
 
@@ -960,33 +1185,65 @@ def mirror_apply_snowflake_to_fastapi(api_app: FastAPI, prefix: str = "/apply") 
         from dcx.apply import snowflake as apply_module
 
         opts = body.options
-        token = _bearer_token(authorization)
-        if not opts.dry_run and not token:
-            raise HTTPException(
-                status_code=401,
-                detail="Provide a Snowflake OAuth token via 'Authorization: Bearer <token>'.",
-            )
         contract = _parse_contract_input(body.contract)
         try:
-            result = apply_module.apply_snowflake_oauth(
-                contract,
-                token=token or "",
-                server_name=opts.server_name,
-                account=opts.account,
-                role=opts.role,
-                warehouse=opts.warehouse,
-                dry_run=opts.dry_run,
-                ddl_mode=opts.ddl_mode,
-                strict=opts.strict,
-                structured_types=opts.structured_types,
-                include_comments=opts.include_comments,
-                include_tags=opts.include_tags,
-                include_quality=opts.include_quality,
-                create_tags=opts.create_tags,
-                tag_namespace=opts.tag_namespace,
-                tag_namespace_filter=opts.tag_namespace_filter,
-                metric_schedule=opts.metric_schedule,
-            )
+            if opts.auth_mode == SnowflakeAuthMode.caller_oauth:
+                token = _bearer_token(authorization)
+                if not opts.dry_run and not token:
+                    raise HTTPException(
+                        status_code=401,
+                        detail="Provide a Snowflake OAuth token via 'Authorization: Bearer <token>'.",
+                    )
+                result = apply_module.apply_snowflake_oauth(
+                    contract,
+                    token=token or "",
+                    server_name=opts.server_name,
+                    account=opts.account,
+                    role=opts.role,
+                    warehouse=opts.warehouse,
+                    dry_run=opts.dry_run,
+                    ddl_mode=opts.ddl_mode,
+                    strict=opts.strict,
+                    structured_types=opts.structured_types,
+                    include_comments=opts.include_comments,
+                    include_tags=opts.include_tags,
+                    include_quality=opts.include_quality,
+                    create_tags=opts.create_tags,
+                    tag_namespace=opts.tag_namespace,
+                    tag_namespace_filter=opts.tag_namespace_filter,
+                    metric_schedule=opts.metric_schedule,
+                )
+            else:
+                if not opts.service_profile:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="`service_profile` is required when auth_mode=service_profile.",
+                    )
+                conn_kwargs = load_snowflake_service_profile(
+                    opts.service_profile,
+                    source=opts.service_profile_source,
+                )
+                result = apply_module.apply_snowflake_with_connection(
+                    contract,
+                    connection_kwargs=conn_kwargs,
+                    server_name=opts.server_name,
+                    account=opts.account,
+                    role=opts.role,
+                    warehouse=opts.warehouse,
+                    dry_run=opts.dry_run,
+                    ddl_mode=opts.ddl_mode,
+                    strict=opts.strict,
+                    structured_types=opts.structured_types,
+                    include_comments=opts.include_comments,
+                    include_tags=opts.include_tags,
+                    include_quality=opts.include_quality,
+                    create_tags=opts.create_tags,
+                    tag_namespace=opts.tag_namespace,
+                    tag_namespace_filter=opts.tag_namespace_filter,
+                    metric_schedule=opts.metric_schedule,
+                )
+        except ServiceProfileError as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
         except apply_module.ApplyError as exc:
             raise HTTPException(status_code=502, detail=str(exc))
 
@@ -1034,15 +1291,24 @@ def mirror_enrich_to_fastapi(api_app: FastAPI, prefix: str = "/enrich") -> None:
         cmd_func = cmd_info.callback
         params = _extract_typer_params(cmd_func)
         request_model = _build_request_model(
-            f"Enrich{cmd_name.title()}Request", params,
+            f"Enrich{cmd_name.title()}Request",
+            params,
         )
         summary = (cmd_func.__doc__ or "").strip().split("\n")[0] or None
 
-        def _make_handler(cmd_name=cmd_name, cmd_func=cmd_func, params=params, RequestModel=request_model, core=cores[cmd_name]):
+        def _make_handler(
+            cmd_name=cmd_name,
+            cmd_func=cmd_func,
+            params=params,
+            RequestModel=request_model,
+            core=cores[cmd_name],
+        ):
             def handler(
                 body: RequestModel,
                 request: Request,
-                format: Optional[str] = Query(None, description="Response format: `json` (default) or `yaml`."),
+                format: Optional[str] = Query(
+                    None, description="Response format: `json` (default) or `yaml`."
+                ),
             ):
                 contract = _parse_contract_input(body.contract)
 
@@ -1075,7 +1341,9 @@ def mirror_enrich_to_fastapi(api_app: FastAPI, prefix: str = "/enrich") -> None:
             return handler
 
         api_app.post(
-            f"{prefix}/{cmd_name}", summary=summary, tags=["enrich"],
+            f"{prefix}/{cmd_name}",
+            summary=summary,
+            tags=["enrich"],
             response_model=ContractResponse,
             responses=_contract_responses(400, 500, 502),
         )(_make_handler())
@@ -1101,9 +1369,15 @@ _TAG_CATALOG_FIELD = (
                         "description": "Sensitivity of the column.",
                         "multiple": False,
                         "values": [
-                            {"value": "CONFIDENTIAL", "description": "Personal or sensitive business data.",
-                             "examples": ["email", "phone", "full_name"]},
-                            {"value": "PUBLIC", "description": "Non-sensitive, shareable data."},
+                            {
+                                "value": "CONFIDENTIAL",
+                                "description": "Personal or sensitive business data.",
+                                "examples": ["email", "phone", "full_name"],
+                            },
+                            {
+                                "value": "PUBLIC",
+                                "description": "Non-sensitive, shareable data.",
+                            },
                         ],
                     }
                 ]
@@ -1120,14 +1394,17 @@ def mirror_enrich_tags_to_fastapi(api_app: FastAPI, prefix: str = "/enrich") -> 
     has no API equivalent). The provider API key comes from the server's env.
     """
     cmd_info = next(
-        (c for c in enrich_module.enrich_app.registered_commands if c.name == "tags"), None,
+        (c for c in enrich_module.enrich_app.registered_commands if c.name == "tags"),
+        None,
     )
     if cmd_info is None:
         return
     cmd_func = cmd_info.callback
     params = _extract_typer_params(cmd_func)
     options_model = _build_options_model(
-        "EnrichTagsRequestOptions", params, {"location", "output", "catalog"},
+        "EnrichTagsRequestOptions",
+        params,
+        {"location", "output", "catalog"},
     )
     request_model = create_model(
         "EnrichTagsRequest",
@@ -1141,7 +1418,9 @@ def mirror_enrich_tags_to_fastapi(api_app: FastAPI, prefix: str = "/enrich") -> 
     def handler(
         body: request_model,  # type: ignore[valid-type]
         request: Request,
-        format: Optional[str] = Query(None, description="Response format: `json` (default) or `yaml`."),
+        format: Optional[str] = Query(
+            None, description="Response format: `json` (default) or `yaml`."
+        ),
     ):
         contract = _parse_contract_input(body.contract)
         try:
@@ -1166,7 +1445,9 @@ def mirror_enrich_tags_to_fastapi(api_app: FastAPI, prefix: str = "/enrich") -> 
         return _serialize_response(result, _wants_yaml(request, format))
 
     api_app.post(
-        f"{prefix}/tags", summary=summary, tags=["enrich"],
+        f"{prefix}/tags",
+        summary=summary,
+        tags=["enrich"],
         response_model=ContractResponse,
         responses=_contract_responses(400, 502),
     )(handler)
@@ -1179,23 +1460,29 @@ def mirror_enrich_all_to_fastapi(api_app: FastAPI, prefix: str = "/enrich") -> N
     and inline; provider API key comes from the server's env.
     """
     cmd_info = next(
-        (c for c in enrich_module.enrich_app.registered_commands if c.name == "all"), None,
+        (c for c in enrich_module.enrich_app.registered_commands if c.name == "all"),
+        None,
     )
     if cmd_info is None:
         return
     cmd_func = cmd_info.callback
     params = _extract_typer_params(cmd_func)
     options_model = _build_options_model(
-        "EnrichAllRequestOptions", params, {"location", "output", "catalog"},
+        "EnrichAllRequestOptions",
+        params,
+        {"location", "output", "catalog"},
     )
     request_model = create_model(
         "EnrichAllRequest",
         __config__=ConfigDict(extra="forbid", protected_namespaces=()),
         contract=_CONTRACT_FIELD,
-        catalog=(Optional[Union[Dict[str, Any], str]], Field(
-            None,
-            description="Optional tag catalog (same shape as /enrich/tags). Omit to skip tagging.",
-        )),
+        catalog=(
+            Optional[Union[Dict[str, Any], str]],
+            Field(
+                None,
+                description="Optional tag catalog (same shape as /enrich/tags). Omit to skip tagging.",
+            ),
+        ),
         options=(options_model, ...),
     )
     summary = (cmd_func.__doc__ or "").strip().split("\n")[0] or None
@@ -1203,7 +1490,9 @@ def mirror_enrich_all_to_fastapi(api_app: FastAPI, prefix: str = "/enrich") -> N
     def handler(
         body: request_model,  # type: ignore[valid-type]
         request: Request,
-        format: Optional[str] = Query(None, description="Response format: `json` (default) or `yaml`."),
+        format: Optional[str] = Query(
+            None, description="Response format: `json` (default) or `yaml`."
+        ),
     ):
         contract = _parse_contract_input(body.contract)
 
@@ -1233,7 +1522,9 @@ def mirror_enrich_all_to_fastapi(api_app: FastAPI, prefix: str = "/enrich") -> N
         return _serialize_response(result, _wants_yaml(request, format))
 
     api_app.post(
-        f"{prefix}/all", summary=summary, tags=["enrich"],
+        f"{prefix}/all",
+        summary=summary,
+        tags=["enrich"],
         response_model=ContractResponse,
         responses=_contract_responses(400, 502),
     )(handler)
@@ -1246,7 +1537,9 @@ def mount_info_endpoint(api_app: FastAPI) -> None:
     """Register `GET /info` returning the dcx + datacontract-cli versions."""
 
     @api_app.get(
-        "/info", tags=["info"], summary="Get dcx and datacontract-cli versions.",
+        "/info",
+        tags=["info"],
+        summary="Get dcx and datacontract-cli versions.",
         response_model=InfoResponse,
     )
     def info() -> dict:
@@ -1259,11 +1552,26 @@ def mount_info_endpoint(api_app: FastAPI) -> None:
 
 
 _OPENAPI_TAGS = [
-    {"name": "target", "description": "Bind a contract to a platform by setting its server block."},
-    {"name": "import", "description": "Create a contract from a source — a file/document or a live system."},
-    {"name": "export", "description": "Convert a contract to a target format (SQL, JSON Schema, HTML, …)."},
-    {"name": "apply", "description": "Apply tags + data quality to a live system (Snowflake)."},
-    {"name": "enrich", "description": "LLM enrichment: descriptions, type options, tags, and data quality."},
+    {
+        "name": "target",
+        "description": "Bind a contract to a platform by setting its server block.",
+    },
+    {
+        "name": "import",
+        "description": "Create a contract from a source — a file/document or a live system.",
+    },
+    {
+        "name": "export",
+        "description": "Convert a contract to a target format (SQL, JSON Schema, HTML, …).",
+    },
+    {
+        "name": "apply",
+        "description": "Apply tags + data quality to a live system (Snowflake).",
+    },
+    {
+        "name": "enrich",
+        "description": "LLM enrichment: descriptions, type options, tags, and data quality.",
+    },
     {"name": "info", "description": "Component version information."},
 ]
 
@@ -1272,9 +1580,10 @@ _API_DESCRIPTION = (
     "**Request body:** a JSON object. The `contract` field accepts either a parsed "
     "ODCS JSON object or a YAML string.\n\n"
     "**Response:** JSON by default; request `?format=yaml` or send `Accept: text/yaml` "
-    "to receive YAML. Errors use `{\"detail\": \"...\"}`.\n\n"
-    "**Auth:** `/apply/*` and `/import/snowflake` require a caller Snowflake OAuth token "
-    "via `Authorization: Bearer <token>`. `/enrich/*` use the server's provider API key."
+    'to receive YAML. Errors use `{"detail": "..."}`.\n\n'
+    "**Auth:** `/apply/*` and `/import/snowflake` support two modes via `auth_mode`: "
+    "`caller_oauth` (send `Authorization: Bearer <token>`) and `service_profile` "
+    "(server-side Vault-backed service user). `/enrich/*` use the server's provider API key."
 )
 
 

@@ -41,6 +41,7 @@ dependencies = [
     "uvicorn>=0.30,<1.0",
     "pyyaml>=6.0,<7.0",
     "snowflake-connector-python>=3.0,<4.0",
+    "hvac>=2.3,<3.0",
     "litellm>=1.50,<2.0",
 ]
 

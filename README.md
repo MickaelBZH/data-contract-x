@@ -48,7 +48,7 @@ It's **platform-extensible by design** — each platform is a small importer / e
 - ✅ **Executable, portable data quality.** Quality rules prefer ODCS `library` metrics (portable, mappable to platform-native checks) and fall back to portable `sql` checks — across all seven ODCS dimensions.
 - 🔌 **Any LLM provider.** Powered by [litellm](https://github.com/BerriAI/litellm) — Anthropic, OpenAI, Azure, Bedrock, Gemini, Ollama, … behind one `--model` flag.
 - 🧩 **Pluggable platforms, no fork.** You keep all 30+ upstream importers/exporters and `lint` / `test` / `changelog`, and gain the AI + platform layer on top.
-- 🔐 **Auth that makes sense per surface.** Live platform operations over the API use **caller-supplied OAuth**; secrets are never CLI flags.
+- 🔐 **Auth that fits multiple deployments.** Live platform API operations support **caller OAuth** and **service profiles** loaded server-side from Vault, env, or mounted files; secrets are never CLI flags.
 
 ## Install
 
@@ -114,7 +114,7 @@ dcx import sql --source schema.sql --dialect snowflake --output contract.yaml
 ```
 
 **API**
-- `POST /import/snowflake` — live import, authenticated by the caller's Snowflake OAuth token (`Authorization: Bearer <token>`).
+- `POST /import/snowflake` — live import with either `auth_mode: caller_oauth` (`Authorization: Bearer <token>`) or `auth_mode: service_profile` (server-side profile lookup).
 - `POST /import/{format}` — file-based importers; send the document inline as `source_content`.
 - *(Kafka import is CLI-only.)*
 
@@ -235,7 +235,7 @@ Column comments are the catch. Snowflake persists them **only** inside the `CREA
 Materialized and external tables are imported with their real `physicalType`, but are currently governed as tables.
 
 **API**
-- `POST /apply/snowflake` — authenticated by the caller's Snowflake OAuth token. Supports `dry_run`, `ddl_mode`, `strict`, `structured_types`, `tag_namespace_filter`, … (all under `options`) and returns the executed SQL plus any drift `warnings`.
+- `POST /apply/snowflake` — supports `auth_mode: caller_oauth` (caller bearer token) and `auth_mode: service_profile` (server-side profile lookup). Also supports `dry_run`, `ddl_mode`, `strict`, `structured_types`, `tag_namespace_filter`, … (all under `options`) and returns the executed SQL plus any drift `warnings`.
 
 ### `target` — bind a contract to a platform
 
@@ -332,9 +332,152 @@ dcx api --port 4242      # Swagger UI at http://127.0.0.1:4242/docs
 
 Every command above is mirrored to an endpoint, with request **and** response schemas in the OpenAPI spec. Auth model:
 
-- **Live platform operations** (`/import/snowflake`, `/apply/snowflake`) act *as the caller* — the OAuth bearer token comes from the `Authorization` header, so the server never uses ambient credentials for someone else's data.
+- **Live platform operations** (`/import/snowflake`, `/apply/snowflake`) support two modes:
+  - `caller_oauth` — caller sends `Authorization: Bearer <token>`.
+  - `service_profile` — server loads Snowflake credentials for a named profile.
+- **Service profile source** is selected with `service_profile_source`: `vault` | `env` | `file` | `auto`.
 - **Enrichment** (`/enrich/*`) uses the **server's** LLM key (from the environment). Put service-level auth/quota in front of it before exposing it publicly.
 - **The CLI never takes secrets as flags** — platform secrets come from env vars or the platform's own config; LLM keys from the provider's standard env var.
+
+### Service Profile Source Examples
+
+For `auth_mode: service_profile`, pass a profile name and source in the request.
+
+`service_profile_source: vault`:
+
+```json
+{
+  "auth_mode": "service_profile",
+  "service_profile": "svc-import",
+  "service_profile_source": "vault",
+  "database": "DB",
+  "schema": "LOAD"
+}
+```
+
+`service_profile_source: env`:
+
+```json
+{
+  "auth_mode": "service_profile",
+  "service_profile": "svc-apply",
+  "service_profile_source": "env"
+}
+```
+
+`service_profile_source: file`:
+
+```json
+{
+  "auth_mode": "service_profile",
+  "service_profile": "svc-apply",
+  "service_profile_source": "file"
+}
+```
+
+`service_profile_source: auto` (tries env, then file, then Vault):
+
+```json
+{
+  "auth_mode": "service_profile",
+  "service_profile": "svc-apply",
+  "service_profile_source": "auto"
+}
+```
+
+Server-side settings for profile sources:
+
+- `DCX_SNOWFLAKE_SERVICE_PROFILE_SOURCE` (default `vault`)
+- `DCX_SNOWFLAKE_SERVICE_PROFILE_ENV_PREFIX` (default `DCX_SNOWFLAKE_PROFILE_`)
+- `DCX_SNOWFLAKE_SERVICE_PROFILE_DIR` (default `/var/run/secrets/dcx/snowflake`)
+- `DCX_VAULT_ADDR` / `DCX_VAULT_TOKEN` / `DCX_VAULT_KV_MOUNT` / `DCX_SNOWFLAKE_SERVICE_PROFILE_PREFIX`
+
+### Snowflake Credential Fields (service profiles)
+
+Each `service_profile` must include:
+
+- `account`
+- `user` (required unless `authenticator: oauth`)
+- one auth secret: `password` **or** `private_key_file` (optionally with `private_key_file_pwd`) **or** `token`
+
+Optional connection fields:
+
+- `role`
+- `warehouse`
+- `database`
+- `schema`
+- `authenticator`
+
+#### 1) Password auth
+
+Profile object fields:
+
+```json
+{
+  "account": "xy12345.eu-west-1",
+  "user": "svc_dcx_apply",
+  "password": "...",
+  "role": "DCX_APPLY",
+  "warehouse": "COMPUTE_WH",
+  "authenticator": "snowflake"
+}
+```
+
+#### 2) Key-pair auth (private key + passphrase)
+
+Profile object fields:
+
+```json
+{
+  "account": "xy12345.eu-west-1",
+  "user": "svc_dcx_apply",
+  "private_key_file": "/var/run/secrets/snowflake/svc_apply.p8",
+  "private_key_file_pwd": "...",
+  "role": "DCX_APPLY",
+  "warehouse": "COMPUTE_WH",
+  "authenticator": "snowflake"
+}
+```
+
+#### 3) Token/OAuth auth
+
+Profile object fields:
+
+```json
+{
+  "account": "xy12345.eu-west-1",
+  "authenticator": "oauth",
+  "token": "...",
+  "role": "DCX_APPLY",
+  "warehouse": "COMPUTE_WH"
+}
+```
+
+### Env source naming
+
+With `service_profile: svc-apply` and the default env prefix, fields map like this:
+
+- `account` -> `DCX_SNOWFLAKE_PROFILE_SVC_APPLY_ACCOUNT`
+- `user` -> `DCX_SNOWFLAKE_PROFILE_SVC_APPLY_USER`
+- `password` -> `DCX_SNOWFLAKE_PROFILE_SVC_APPLY_PASSWORD`
+- `private_key_file` -> `DCX_SNOWFLAKE_PROFILE_SVC_APPLY_PRIVATE_KEY_FILE`
+- `private_key_file_pwd` -> `DCX_SNOWFLAKE_PROFILE_SVC_APPLY_PRIVATE_KEY_FILE_PWD`
+- `token` -> `DCX_SNOWFLAKE_PROFILE_SVC_APPLY_TOKEN`
+
+### File source format
+
+When `service_profile_source=file`, put one file per profile under
+`DCX_SNOWFLAKE_SERVICE_PROFILE_DIR` (default `/var/run/secrets/dcx/snowflake`):
+
+- `svc-apply.json`, `svc-apply.yaml`, or `svc-apply.yml`
+- file content is the same profile object shown above
+
+### Vault source format
+
+When `service_profile_source=vault`, each secret document at
+`<DCX_VAULT_KV_MOUNT>/<DCX_SNOWFLAKE_SERVICE_PROFILE_PREFIX>/<profile>` must contain
+the same profile object fields (`account`, `user`, `password`, `private_key_file`,
+`private_key_file_pwd`, `token`, ...).
 
 ## How it fits with datacontract-cli
 

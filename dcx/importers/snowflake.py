@@ -33,6 +33,7 @@ from open_data_contract_standard.model import (
 from dcx.apply.snowflake import (
     _ENV_VARS,
     _first,
+    ensure_session_role_warehouse,
     quiet_aws_credential_noise,
     SNOWFLAKE_LOGIN_TIMEOUT,
     SNOWFLAKE_NETWORK_TIMEOUT,
@@ -53,21 +54,36 @@ def _warn(msg: str) -> None:
 # Snowflake INFORMATION_SCHEMA DATA_TYPE → (ODCS logicalType, format). NUMBER is
 # handled separately (scale 0 → integer). Anything unknown falls back to string.
 _SF_TYPE_MAP: dict[str, tuple[str, Optional[str]]] = {
-    "TEXT": ("string", None), "STRING": ("string", None), "VARCHAR": ("string", None),
-    "CHAR": ("string", None), "CHARACTER": ("string", None),
-    "FLOAT": ("number", None), "FLOAT4": ("number", None), "FLOAT8": ("number", None),
-    "DOUBLE": ("number", None), "REAL": ("number", None),
+    "TEXT": ("string", None),
+    "STRING": ("string", None),
+    "VARCHAR": ("string", None),
+    "CHAR": ("string", None),
+    "CHARACTER": ("string", None),
+    "FLOAT": ("number", None),
+    "FLOAT4": ("number", None),
+    "FLOAT8": ("number", None),
+    "DOUBLE": ("number", None),
+    "REAL": ("number", None),
     "BOOLEAN": ("boolean", None),
-    "DATE": ("date", None), "TIME": ("time", None),
-    "TIMESTAMP_NTZ": ("timestamp", None), "TIMESTAMP_LTZ": ("timestamp", None),
-    "TIMESTAMP_TZ": ("timestamp", None), "DATETIME": ("timestamp", None),
-    "BINARY": ("string", "binary"), "VARBINARY": ("string", "binary"),
-    "VARIANT": ("object", None), "OBJECT": ("object", None), "ARRAY": ("array", None),
-    "GEOGRAPHY": ("object", None), "GEOMETRY": ("object", None),
+    "DATE": ("date", None),
+    "TIME": ("time", None),
+    "TIMESTAMP_NTZ": ("timestamp", None),
+    "TIMESTAMP_LTZ": ("timestamp", None),
+    "TIMESTAMP_TZ": ("timestamp", None),
+    "DATETIME": ("timestamp", None),
+    "BINARY": ("string", "binary"),
+    "VARBINARY": ("string", "binary"),
+    "VARIANT": ("object", None),
+    "OBJECT": ("object", None),
+    "ARRAY": ("array", None),
+    "GEOGRAPHY": ("object", None),
+    "GEOMETRY": ("object", None),
 }
 
 
-def _map_type(data_type: Optional[str], scale: Optional[int]) -> tuple[str, Optional[str]]:
+def _map_type(
+    data_type: Optional[str], scale: Optional[int]
+) -> tuple[str, Optional[str]]:
     dt = (data_type or "").upper()
     if dt == "NUMBER":
         return ("integer" if (scale or 0) == 0 else "number", None)
@@ -137,7 +153,9 @@ def _vector_type_from_show_columns(payload: Any) -> Optional[str]:
     return f"VECTOR({ddl_element}, {dimension})"
 
 
-def _physical_type(data_type: Optional[str], char_len, prec, scale, full_type=None) -> str:
+def _physical_type(
+    data_type: Optional[str], char_len, prec, scale, full_type=None
+) -> str:
     """Reconstruct a canonical Snowflake type string for `physicalType`.
 
     `full_type` (from `SHOW COLUMNS`) wins when present: it is the only source for types
@@ -166,12 +184,12 @@ def _physical_type(data_type: Optional[str], char_len, prec, scale, full_type=No
 # reverse direction has to pick one: `nullValues` is canonical. A contract using
 # `missingValues` therefore comes back as `nullValues` — same DMF, same semantics.
 _DMF_TO_QUALITY: dict[str, tuple[str, str, str]] = {
-    "ROW_COUNT":       ("library", "rowCount", "table"),
-    "NULL_COUNT":      ("library", "nullValues", "column"),
+    "ROW_COUNT": ("library", "rowCount", "table"),
+    "NULL_COUNT": ("library", "nullValues", "column"),
     "DUPLICATE_COUNT": ("library", "duplicateValues", "column"),
     "ACCEPTED_VALUES": ("library", "invalidValues", "column"),
-    "BLANK_COUNT":     ("check", "blankCount", "column"),
-    "FRESHNESS":       ("sla", "latency", "table"),
+    "BLANK_COUNT": ("check", "blankCount", "column"),
+    "FRESHNESS": ("sla", "latency", "table"),
 }
 
 # Mirrors dcx.enrich.quality.CHECK_PROPERTY / the exporter's `_CHECK_PROPERTY`.
@@ -251,7 +269,9 @@ def _dmf_ref_condition(ref_arguments: Any) -> Optional[str]:
 # `IN ('A', 'B')` within an ACCEPTED_VALUES condition. Only an IN-list maps onto ODCS
 # `invalidValues` + `arguments.validValues`; any other predicate (BETWEEN, LIKE, ...)
 # has no ODCS equivalent and is preserved as an engine-specific rule instead.
-_ACCEPTED_VALUES_RE = re.compile(r"\bIN\s*\((?P<values>.+)\)\s*$", re.IGNORECASE | re.DOTALL)
+_ACCEPTED_VALUES_RE = re.compile(
+    r"\bIN\s*\((?P<values>.+)\)\s*$", re.IGNORECASE | re.DOTALL
+)
 
 
 def _accepted_values_from_condition(condition: Optional[str]) -> Optional[list[str]]:
@@ -264,7 +284,11 @@ def _accepted_values_from_condition(condition: Optional[str]) -> Optional[list[s
         return None
     values = [v.strip() for v in match.group("values").split(",")]
     unquoted = [
-        v[1:-1].replace("\'\'", "\'") if len(v) >= 2 and v.startswith("\'") and v.endswith("\'") else v
+        (
+            v[1:-1].replace("''", "'")
+            if len(v) >= 2 and v.startswith("'") and v.endswith("'")
+            else v
+        )
         for v in values
         if v
     ]
@@ -288,23 +312,34 @@ def _accepted_values_from_condition(condition: Optional[str]) -> Optional[list[s
 _NUM = r"-?\d+(?:\.\d+)?"
 
 _SQL_OP_TO_ODCS: dict[str, str] = {
-    "=":  "mustBe",
+    "=": "mustBe",
     "<>": "mustNotBe",
     "!=": "mustNotBe",
-    ">":  "mustBeGreaterThan",
+    ">": "mustBeGreaterThan",
     ">=": "mustBeGreaterOrEqualTo",
-    "<":  "mustBeLessThan",
+    "<": "mustBeLessThan",
     "<=": "mustBeLessOrEqualTo",
 }
 
 _EXPECTATION_SIMPLE_RE = re.compile(
-    rf"^\s*VALUE\s*(?P<op><=|>=|<>|!=|=|<|>)\s*(?P<v>{_NUM})\s*$", re.IGNORECASE,
+    rf"^\s*VALUE\s*(?P<op><=|>=|<>|!=|=|<|>)\s*(?P<v>{_NUM})\s*$",
+    re.IGNORECASE,
 )
 _EXPECTATION_RANGE_RES: list[tuple[Any, str]] = [
-    (re.compile(rf"^\s*(?P<a>{_NUM})\s*<=\s*VALUE\s+AND\s+VALUE\s*<=\s*(?P<b>{_NUM})\s*$",
-                re.IGNORECASE), "mustBeBetween"),
-    (re.compile(rf"^\s*VALUE\s*<\s*(?P<a>{_NUM})\s+OR\s+VALUE\s*>\s*(?P<b>{_NUM})\s*$",
-                re.IGNORECASE), "mustNotBeBetween"),
+    (
+        re.compile(
+            rf"^\s*(?P<a>{_NUM})\s*<=\s*VALUE\s+AND\s+VALUE\s*<=\s*(?P<b>{_NUM})\s*$",
+            re.IGNORECASE,
+        ),
+        "mustBeBetween",
+    ),
+    (
+        re.compile(
+            rf"^\s*VALUE\s*<\s*(?P<a>{_NUM})\s+OR\s+VALUE\s*>\s*(?P<b>{_NUM})\s*$",
+            re.IGNORECASE,
+        ),
+        "mustNotBeBetween",
+    ),
 ]
 
 
@@ -329,7 +364,10 @@ def _operator_from_expectation(expression: Optional[str]) -> Optional[tuple[str,
     for pattern, operator in _EXPECTATION_RANGE_RES:
         match = pattern.match(text)
         if match:
-            return operator, [_as_number(match.group("a")), _as_number(match.group("b"))]
+            return operator, [
+                _as_number(match.group("a")),
+                _as_number(match.group("b")),
+            ]
     match = _EXPECTATION_SIMPLE_RE.match(text)
     if match:
         operator = _SQL_OP_TO_ODCS.get(match.group("op"))
@@ -356,7 +394,7 @@ def _bare_cron(schedule: Optional[str]) -> Optional[str]:
         return None
     text = str(schedule).strip()
     if text.upper().startswith("USING CRON"):
-        text = text[len("USING CRON"):].strip()
+        text = text[len("USING CRON") :].strip()
     elif text.upper().endswith("MINUTE") or text.upper() == "TRIGGER_ON_CHANGES":
         return text
     text = _CRON_TIMEZONE_RE.sub("", text).strip()
@@ -364,7 +402,10 @@ def _bare_cron(schedule: Optional[str]) -> Optional[str]:
 
 
 def _quality_from_dmf_references(
-    references: list, *, database: Optional[str], schema: Optional[str],
+    references: list,
+    *,
+    database: Optional[str],
+    schema: Optional[str],
 ) -> tuple[dict, dict, list]:
     """Turn DMF references into `(quality_by_column, quality_by_table, slaProperties)`.
 
@@ -377,7 +418,10 @@ def _quality_from_dmf_references(
     threshold. They are a faithful record of what is *attached*, and `enrich quality`
     or a human supplies the operator.
     """
-    from open_data_contract_standard.model import DataQuality, ServiceLevelAgreementProperty
+    from open_data_contract_standard.model import (
+        DataQuality,
+        ServiceLevelAgreementProperty,
+    )
 
     by_column: dict[tuple, list] = {}
     by_table: dict[str, list] = {}
@@ -396,12 +440,18 @@ def _quality_from_dmf_references(
             # executable only on Snowflake, so there is no portable query to invent.
             unmapped.add(ref.get("qualified") or "?")
             rule = DataQuality(
-                type="custom", engine="snowflake", implementation=ref.get("qualified"),
+                type="custom",
+                engine="snowflake",
+                implementation=ref.get("qualified"),
             )
             if schedule:
                 rule.schedule, rule.scheduler = schedule, "cron"
             target = (table, columns[0]) if columns else None
-            (by_column.setdefault(target, []) if target else by_table.setdefault(table, [])).append(rule)
+            (
+                by_column.setdefault(target, [])
+                if target
+                else by_table.setdefault(table, [])
+            ).append(rule)
             continue
 
         kind, name, _scope = mapping
@@ -409,9 +459,13 @@ def _quality_from_dmf_references(
             # FRESHNESS reports seconds, and its expectation is an upper bound, so
             # `VALUE <= 14400` is exactly the SLA value in seconds.
             operator = _operator_from_expectation(ref.get("expectation"))
-            seconds = operator[1] if operator and not isinstance(operator[1], list) else None
+            seconds = (
+                operator[1] if operator and not isinstance(operator[1], list) else None
+            )
             sla = ServiceLevelAgreementProperty(
-                property=name, value=seconds if seconds is not None else 0, unit="s",
+                property=name,
+                value=seconds if seconds is not None else 0,
+                unit="s",
             )
             sla.element = ".".join(p for p in (database, schema, table) if p)
             if seconds is None:
@@ -456,10 +510,15 @@ def _quality_from_dmf_references(
                     )
                     if schedule:
                         rule.schedule, rule.scheduler = schedule, "cron"
-                    (by_column.setdefault((table, columns[0]), []) if columns
-                     else by_table.setdefault(table, [])).append(rule)
+                    (
+                        by_column.setdefault((table, columns[0]), [])
+                        if columns
+                        else by_table.setdefault(table, [])
+                    ).append(rule)
                     continue
-                rule = DataQuality(type="library", metric=name, arguments={"validValues": values})
+                rule = DataQuality(
+                    type="library", metric=name, arguments={"validValues": values}
+                )
             else:
                 rule = DataQuality(type="library", metric=name)
         operator = _operator_from_expectation(ref.get("expectation"))
@@ -467,7 +526,7 @@ def _quality_from_dmf_references(
             setattr(rule, operator[0], operator[1])
         else:
             missing_operator.append(f"{table}.{columns[0]}" if columns else str(table))
-        
+
         if schedule:
             rule.schedule, rule.scheduler = schedule, "cron"
 
@@ -533,7 +592,8 @@ def build_snowflake_contract(
     view_definitions = view_definitions or {}
     full_types = full_types or {}
     quality_by_column, quality_by_table, sla_properties = _quality_from_dmf_references(
-        dmf_references or [], database=server_info.get("database"),
+        dmf_references or [],
+        database=server_info.get("database"),
         schema=server_info.get("schema"),
     )
     # Group columns by table, preserving first-seen order.
@@ -550,8 +610,10 @@ def build_snowflake_contract(
             prop = SchemaProperty(
                 name=col["name"],
                 physicalType=_physical_type(
-                    col.get("data_type"), col.get("char_len"),
-                    col.get("precision"), col.get("scale"),
+                    col.get("data_type"),
+                    col.get("char_len"),
+                    col.get("precision"),
+                    col.get("scale"),
                     full_types.get((table_name, col["name"])),
                 ),
                 logicalType=logical,
@@ -616,12 +678,18 @@ def build_snowflake_contract(
         warehouse=server_info.get("warehouse"),
     )
     if schema is not None:
-        server.schema_ = schema  # aliased field — set post-construction (see gotcha memory)
+        server.schema_ = (
+            schema  # aliased field — set post-construction (see gotcha memory)
+        )
 
     contract = OpenDataContractStandard(
         apiVersion="v3.1.0",
         kind="DataContract",
-        id=f"{database}.{schema}".lower() if database and schema else "snowflake-import",
+        id=(
+            f"{database}.{schema}".lower()
+            if database and schema
+            else "snowflake-import"
+        ),
         name=schema or "Snowflake import",
         version="1.0.0",
         status="draft",
@@ -641,14 +709,23 @@ def build_snowflake_contract(
 def _resolve_conn_params(import_args: dict) -> dict:
     """Connection kwargs from CLI args + env (CLI wins). Secrets env-only."""
     params: dict[str, Any] = {
-        "account": _first(import_args.get("account"), os.environ.get(_ENV_VARS["account"])),
+        "account": _first(
+            import_args.get("account"), os.environ.get(_ENV_VARS["account"])
+        ),
         "user": _first(import_args.get("user"), os.environ.get(_ENV_VARS["user"])),
         "role": _first(import_args.get("role"), os.environ.get(_ENV_VARS["role"])),
-        "warehouse": _first(import_args.get("warehouse"), os.environ.get(_ENV_VARS["warehouse"])),
-        "database": _first(import_args.get("database"), os.environ.get(_ENV_VARS["database"])),
-        "schema": _first(import_args.get("schema"), os.environ.get(_ENV_VARS["schema"])),
-        "authenticator": _first(import_args.get("authenticator"),
-                                os.environ.get(_ENV_VARS["authenticator"])),
+        "warehouse": _first(
+            import_args.get("warehouse"), os.environ.get(_ENV_VARS["warehouse"])
+        ),
+        "database": _first(
+            import_args.get("database"), os.environ.get(_ENV_VARS["database"])
+        ),
+        "schema": _first(
+            import_args.get("schema"), os.environ.get(_ENV_VARS["schema"])
+        ),
+        "authenticator": _first(
+            import_args.get("authenticator"), os.environ.get(_ENV_VARS["authenticator"])
+        ),
     }
     for kwarg in ("password", "private_key_file", "private_key_file_pwd", "token"):
         v = os.environ.get(_ENV_VARS[kwarg])
@@ -678,7 +755,15 @@ def _connect(import_args: dict):
     connection_name = import_args.get("connection_name")
     if connection_name:
         conn_kwargs: dict[str, Any] = {"connection_name": connection_name}
-        for k in ("account", "user", "role", "warehouse", "database", "schema", "authenticator"):
+        for k in (
+            "account",
+            "user",
+            "role",
+            "warehouse",
+            "database",
+            "schema",
+            "authenticator",
+        ):
             if import_args.get(k):
                 conn_kwargs[k] = import_args[k]
     else:
@@ -688,7 +773,9 @@ def _connect(import_args: dict):
     conn_kwargs.setdefault("network_timeout", SNOWFLAKE_NETWORK_TIMEOUT)
     quiet_aws_credential_noise()
     try:
-        return snowflake.connector.connect(**conn_kwargs)
+        conn = snowflake.connector.connect(**conn_kwargs)
+        ensure_session_role_warehouse(conn, conn_kwargs)
+        return conn
     except Exception as exc:
         raise SnowflakeImportError(f"Snowflake connection failed: {exc}")
 
@@ -703,28 +790,34 @@ def _fetch_metadata(conn, database: str, schema: str, tables: Optional[list[str]
     try:
         # --- columns ---
         col_sql = (
-            f'SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COMMENT, '
-            f'CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE '
+            f"SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COMMENT, "
+            f"CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE "
             f'FROM "{db}".INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = %s '
-            f'ORDER BY TABLE_NAME, ORDINAL_POSITION'
+            f"ORDER BY TABLE_NAME, ORDINAL_POSITION"
         )
         cur.execute(col_sql, (sch,))
         columns: list[dict] = []
         for row in cur.fetchall():
-            (tname, cname, dtype, nullable, comment, char_len, prec, scale) = row
+            tname, cname, dtype, nullable, comment, char_len, prec, scale = row
             if table_filter and tname.upper() not in table_filter:
                 continue
-            columns.append({
-                "table": tname, "name": cname, "data_type": dtype,
-                "nullable": str(nullable).upper() != "NO",
-                "comment": comment, "char_len": char_len,
-                "precision": prec, "scale": scale,
-            })
+            columns.append(
+                {
+                    "table": tname,
+                    "name": cname,
+                    "data_type": dtype,
+                    "nullable": str(nullable).upper() != "NO",
+                    "comment": comment,
+                    "char_len": char_len,
+                    "precision": prec,
+                    "scale": scale,
+                }
+            )
 
         # --- table comments + types (covers tables and views) ---
         cur.execute(
             f'SELECT TABLE_NAME, COMMENT, TABLE_TYPE FROM "{db}".INFORMATION_SCHEMA.TABLES '
-            f'WHERE TABLE_SCHEMA = %s',
+            f"WHERE TABLE_SCHEMA = %s",
             (sch,),
         )
         table_comments: dict = {}
@@ -736,7 +829,7 @@ def _fetch_metadata(conn, database: str, schema: str, tables: Optional[list[str]
         # --- view definitions (the SELECT body, so views can be (re)created) ---
         cur.execute(
             f'SELECT TABLE_NAME, VIEW_DEFINITION FROM "{db}".INFORMATION_SCHEMA.VIEWS '
-            f'WHERE TABLE_SCHEMA = %s',
+            f"WHERE TABLE_SCHEMA = %s",
             (sch,),
         )
         view_definitions = {row[0]: row[1] for row in cur.fetchall() if row[1]}
@@ -760,14 +853,25 @@ def _fetch_metadata(conn, database: str, schema: str, tables: Optional[list[str]
             for row in cur.fetchall():
                 rendered = _vector_type_from_show_columns(row[idx["data_type"]])
                 if rendered:
-                    full_types[(row[idx["table_name"]], row[idx["column_name"]])] = rendered
+                    full_types[(row[idx["table_name"]], row[idx["column_name"]])] = (
+                        rendered
+                    )
         except Exception:
-            logger.debug("SHOW COLUMNS unavailable; parameterised types may be incomplete",
-                         exc_info=True)
+            logger.debug(
+                "SHOW COLUMNS unavailable; parameterised types may be incomplete",
+                exc_info=True,
+            )
     finally:
         cur.close()
 
-    return columns, primary_keys, table_comments, table_types, view_definitions, full_types
+    return (
+        columns,
+        primary_keys,
+        table_comments,
+        table_types,
+        view_definitions,
+        full_types,
+    )
 
 
 def _fq_tag(row: tuple, idx: dict) -> str:
@@ -816,7 +920,11 @@ def _fetch_tags(conn, database: str, schema: str, table_names: list[str]):
                 )
                 idx = {c[0].lower(): i for i, c in enumerate(cur.description)}
                 for row in cur.fetchall():
-                    if "level" in idx and row[idx["level"]] and str(row[idx["level"]]).upper() != "COLUMN":
+                    if (
+                        "level" in idx
+                        and row[idx["level"]]
+                        and str(row[idx["level"]]).upper() != "COLUMN"
+                    ):
                         continue
                     col = row[idx["column_name"]]
                     column_tags.setdefault((table, col), []).append(_fq_tag(row, idx))
@@ -831,7 +939,11 @@ def _fetch_tags(conn, database: str, schema: str, table_names: list[str]):
                 )
                 idx = {c[0].lower(): i for i, c in enumerate(cur.description)}
                 for row in cur.fetchall():
-                    if "level" in idx and row[idx["level"]] and str(row[idx["level"]]).upper() != "TABLE":
+                    if (
+                        "level" in idx
+                        and row[idx["level"]]
+                        and str(row[idx["level"]]).upper() != "TABLE"
+                    ):
                         continue
                     table_tags.setdefault(table, []).append(_fq_tag(row, idx))
             except Exception as exc:  # noqa: BLE001
@@ -890,15 +1002,17 @@ def _fetch_dmf_references(conn, database: str, schema: str, table_names: list[st
                         _col(row, "metric_schema_name"),
                         _col(row, "metric_name"),
                     )
-                    references.append({
-                        "table": table,
-                        "dmf": short,
-                        "qualified": qualified,
-                        "columns": _dmf_ref_columns(ref_arguments),
-                        "condition": _dmf_ref_condition(ref_arguments),
-                        "schedule": _col(row, "schedule"),
-                        "ref_id": _col(row, "ref_id"),
-                    })
+                    references.append(
+                        {
+                            "table": table,
+                            "dmf": short,
+                            "qualified": qualified,
+                            "columns": _dmf_ref_columns(ref_arguments),
+                            "condition": _dmf_ref_condition(ref_arguments),
+                            "schedule": _col(row, "schedule"),
+                            "ref_id": _col(row, "ref_id"),
+                        }
+                    )
             except Exception as exc:  # noqa: BLE001 — graceful degradation
                 errors.append(str(exc))
 
@@ -914,7 +1028,8 @@ def _fetch_dmf_references(conn, database: str, schema: str, table_names: list[st
                     ref_id = row[idx["ref_id"]] if "ref_id" in idx else None
                     expression = (
                         row[idx["expectation_expression"]]
-                        if "expectation_expression" in idx else None
+                        if "expectation_expression" in idx
+                        else None
                     )
                     if ref_id and expression:
                         expectations.setdefault(ref_id, []).append(str(expression))
@@ -963,8 +1078,18 @@ def _contract_from_connection(
     # wrapping it in SnowflakeImportError is what stops a raw ProgrammingError from
     # reaching the API as an unhandled 500.
     try:
-        columns, primary_keys, table_comments, table_types, view_definitions, full_types = _fetch_metadata(
-            conn, database, schema, tables,
+        (
+            columns,
+            primary_keys,
+            table_comments,
+            table_types,
+            view_definitions,
+            full_types,
+        ) = _fetch_metadata(
+            conn,
+            database,
+            schema,
+            tables,
         )
     except SnowflakeImportError:
         raise
@@ -1006,7 +1131,9 @@ def _contract_from_connection(
 
 def import_snowflake(import_args: dict) -> OpenDataContractStandard:
     """Connect to Snowflake (CLI path: CLI flags + env) and build an ODCS contract."""
-    database = _first(import_args.get("database"), os.environ.get(_ENV_VARS["database"]))
+    database = _first(
+        import_args.get("database"), os.environ.get(_ENV_VARS["database"])
+    )
     schema = _first(import_args.get("schema"), os.environ.get(_ENV_VARS["schema"]))
     if not database or not schema:
         raise SnowflakeImportError(
@@ -1023,10 +1150,14 @@ def import_snowflake(import_args: dict) -> OpenDataContractStandard:
             fetch_tags=import_args.get("tags", True),
             fetch_quality=import_args.get("quality", False),
             server_info={
-                "account": _first(import_args.get("account"), os.environ.get(_ENV_VARS["account"])),
+                "account": _first(
+                    import_args.get("account"), os.environ.get(_ENV_VARS["account"])
+                ),
                 "database": database,
                 "schema": schema,
-                "warehouse": _first(import_args.get("warehouse"), os.environ.get(_ENV_VARS["warehouse"])),
+                "warehouse": _first(
+                    import_args.get("warehouse"), os.environ.get(_ENV_VARS["warehouse"])
+                ),
             },
             server_name=import_args.get("server_name") or "production",
         )
@@ -1082,6 +1213,7 @@ def import_snowflake_oauth(
     quiet_aws_credential_noise()
     try:
         conn = snowflake.connector.connect(**conn_kwargs)
+        ensure_session_role_warehouse(conn, conn_kwargs)
     except Exception as exc:
         raise SnowflakeImportError(f"Snowflake connection failed: {exc}")
 
@@ -1093,7 +1225,77 @@ def import_snowflake_oauth(
             tables=tables,
             fetch_tags=tags,
             fetch_quality=quality,
-            server_info={"account": account, "database": database, "schema": schema, "warehouse": warehouse},
+            server_info={
+                "account": account,
+                "database": database,
+                "schema": schema,
+                "warehouse": warehouse,
+            },
+            server_name=server_name,
+        )
+    finally:
+        conn.close()
+
+
+def import_snowflake_with_connection(
+    *,
+    connection_kwargs: dict[str, Any],
+    database: str,
+    schema: str,
+    tables: Optional[list[str]] = None,
+    role: Optional[str] = None,
+    warehouse: Optional[str] = None,
+    tags: bool = True,
+    quality: bool = False,
+    server_name: str = "production",
+) -> OpenDataContractStandard:
+    """Import using explicit connector kwargs (service-user/server-side auth)."""
+    if not (database and schema):
+        raise SnowflakeImportError("database and schema are required.")
+
+    account = connection_kwargs.get("account")
+    if not account:
+        raise SnowflakeImportError("Service connection is missing Snowflake account.")
+
+    try:
+        import snowflake.connector
+    except ImportError:
+        raise SnowflakeImportError(
+            "snowflake-connector-python is not installed. "
+            "Install it via `pip install snowflake-connector-python`."
+        )
+
+    conn_kwargs = dict(connection_kwargs)
+    conn_kwargs["database"] = database
+    conn_kwargs["schema"] = schema
+    if role:
+        conn_kwargs["role"] = role
+    if warehouse:
+        conn_kwargs["warehouse"] = warehouse
+
+    conn_kwargs.setdefault("login_timeout", SNOWFLAKE_LOGIN_TIMEOUT)
+    conn_kwargs.setdefault("network_timeout", SNOWFLAKE_NETWORK_TIMEOUT)
+    quiet_aws_credential_noise()
+    try:
+        conn = snowflake.connector.connect(**conn_kwargs)
+        ensure_session_role_warehouse(conn, conn_kwargs)
+    except Exception as exc:
+        raise SnowflakeImportError(f"Snowflake connection failed: {exc}")
+
+    try:
+        return _contract_from_connection(
+            conn,
+            database=database,
+            schema=schema,
+            tables=tables,
+            fetch_tags=tags,
+            fetch_quality=quality,
+            server_info={
+                "account": account,
+                "database": database,
+                "schema": schema,
+                "warehouse": conn_kwargs.get("warehouse"),
+            },
             server_name=server_name,
         )
     finally:

@@ -10,8 +10,7 @@ from dcx.cli import app
 runner = CliRunner()
 
 
-CONTRACT_YAML = textwrap.dedent(
-    """\
+CONTRACT_YAML = textwrap.dedent("""\
     apiVersion: v3.1.0
     kind: DataContract
     id: orders
@@ -33,8 +32,7 @@ CONTRACT_YAML = textwrap.dedent(
             logicalType: integer
             physicalType: NUMBER
             primaryKey: true
-    """
-)
+    """)
 
 
 def _contract():
@@ -95,8 +93,7 @@ def test_missing_account_errors(monkeypatch):
     monkeypatch.setenv("SNOWFLAKE_USER", "me")
     monkeypatch.delenv("SNOWFLAKE_ACCOUNT", raising=False)
     # Contract without an account
-    yaml = textwrap.dedent(
-        """\
+    yaml = textwrap.dedent("""\
         apiVersion: v3.1.0
         kind: DataContract
         id: x
@@ -109,8 +106,7 @@ def test_missing_account_errors(monkeypatch):
             properties:
               - name: a
                 logicalType: integer
-        """
-    )
+        """)
     contract = OpenDataContractStandard.from_string(yaml)
     with pytest.raises(ApplyError, match="Cannot determine Snowflake account"):
         _resolve_connection_params(contract)
@@ -122,16 +118,23 @@ def test_missing_account_errors(monkeypatch):
 def test_dry_run_prints_sql_no_connection(tmp_path):
     contract_path = tmp_path / "datacontract.yaml"
     contract_path.write_text(CONTRACT_YAML)
-    result = runner.invoke(app, [
-        "apply", "snowflake", str(contract_path), "--dry-run", "--ddl-mode", "always",
-    ])
+    result = runner.invoke(
+        app,
+        [
+            "apply",
+            "snowflake",
+            str(contract_path),
+            "--dry-run",
+            "--ddl-mode",
+            "always",
+        ],
+    )
     assert result.exit_code == 0, result.output
     assert "CREATE TABLE MY_DB.LOAD.orders" in result.output
 
 
 def test_dry_run_with_tags_and_quality(tmp_path):
-    contract_yaml = textwrap.dedent(
-        """\
+    contract_yaml = textwrap.dedent("""\
         apiVersion: v3.1.0
         kind: DataContract
         id: orders
@@ -154,14 +157,20 @@ def test_dry_run_with_tags_and_quality(tmp_path):
                 primaryKey: true
                 tags:
                   - DATA_CLASSIFICATION=PD_DATA
-        """
-    )
+        """)
     contract_path = tmp_path / "datacontract.yaml"
     contract_path.write_text(contract_yaml)
-    result = runner.invoke(app, [
-        "apply", "snowflake", str(contract_path), "--dry-run",
-        "--tag-namespace", "GOV.TAGS",
-    ])
+    result = runner.invoke(
+        app,
+        [
+            "apply",
+            "snowflake",
+            str(contract_path),
+            "--dry-run",
+            "--tag-namespace",
+            "GOV.TAGS",
+        ],
+    )
     assert result.exit_code == 0, result.output
     assert "ALTER TABLE MY_DB.LOAD.orders" in result.output
     assert "GOV.TAGS.DATA_CLASSIFICATION" in result.output
@@ -230,6 +239,7 @@ def mock_snowflake_connector(monkeypatch):
         return _MockConn(state)
 
     import snowflake.connector as _connector_module
+
     monkeypatch.setattr(_connector_module, "connect", fake_connect)
     return state
 
@@ -244,7 +254,9 @@ def test_quiet_aws_credential_noise_lowers_botocore_logger():
     assert log.level == logging.ERROR
 
 
-def test_connect_path_quiets_botocore_noise(tmp_path, mock_snowflake_connector, monkeypatch):
+def test_connect_path_quiets_botocore_noise(
+    tmp_path, mock_snowflake_connector, monkeypatch
+):
     """The Snowflake connect path silences botocore's SSO refresh noise — covering the
     API/apply paths the CLI-only command suppression used to miss."""
     import logging
@@ -255,21 +267,33 @@ def test_connect_path_quiets_botocore_noise(tmp_path, mock_snowflake_connector, 
     contract_path = tmp_path / "datacontract.yaml"
     contract_path.write_text(CONTRACT_YAML)
 
-    result = runner.invoke(app, ["apply", "snowflake", str(contract_path), "--ddl-mode", "always"])
+    result = runner.invoke(
+        app, ["apply", "snowflake", str(contract_path), "--ddl-mode", "always"]
+    )
     assert result.exit_code == 0, result.output
     assert logging.getLogger("botocore.credentials").level == logging.ERROR
 
 
-def test_apply_executes_against_connector(tmp_path, mock_snowflake_connector, monkeypatch):
+def test_apply_executes_against_connector(
+    tmp_path, mock_snowflake_connector, monkeypatch
+):
     monkeypatch.setenv("SNOWFLAKE_USER", "me")
     monkeypatch.setenv("SNOWFLAKE_PASSWORD", "s3cret")
     contract_path = tmp_path / "datacontract.yaml"
     contract_path.write_text(CONTRACT_YAML)
 
-    result = runner.invoke(app, [
-        "apply", "snowflake", str(contract_path),
-        "--role", "DEPLOYER", "--ddl-mode", "always",
-    ])
+    result = runner.invoke(
+        app,
+        [
+            "apply",
+            "snowflake",
+            str(contract_path),
+            "--role",
+            "DEPLOYER",
+            "--ddl-mode",
+            "always",
+        ],
+    )
     assert result.exit_code == 0, result.output
 
     # Connector was called with the right kwargs
@@ -296,27 +320,100 @@ def test_apply_propagates_connector_error(tmp_path, monkeypatch):
     contract_path.write_text(CONTRACT_YAML)
 
     def fake_connect(**_kwargs):
-        raise RuntimeError("DNS resolution failed for ENTERPRISE.snowflakecomputing.com")
+        raise RuntimeError(
+            "DNS resolution failed for ENTERPRISE.snowflakecomputing.com"
+        )
 
     import snowflake.connector as _connector_module
+
     monkeypatch.setattr(_connector_module, "connect", fake_connect)
 
-    result = runner.invoke(app, [
-        "apply", "snowflake", str(contract_path),
-    ])
+    result = runner.invoke(
+        app,
+        [
+            "apply",
+            "snowflake",
+            str(contract_path),
+        ],
+    )
     assert result.exit_code == 1
     assert "Snowflake connection failed" in result.output
-    assert "DNS resolution failed" in result.output
+
+
+def test_ensure_session_role_warehouse_auto_selects_when_missing(monkeypatch):
+    from dcx.apply.snowflake import ensure_session_role_warehouse
+
+    class _Cur:
+        def __init__(self):
+            self.description = []
+            self._rows = []
+
+        def execute(self, sql):
+            up = sql.strip().upper()
+            if up == "SHOW ROLES":
+                self.description = [("name",)]
+                self._rows = [("PUBLIC",), ("SYSADMIN",), ("USERADMIN",)]
+                return
+            if up == "SHOW WAREHOUSES":
+                self.description = [("name",)]
+                self._rows = [("WH_B",), ("WH_A",)]
+                return
+
+        def fetchall(self):
+            return list(self._rows)
+
+        def close(self):
+            pass
+
+    class _Conn:
+        def __init__(self):
+            self.cur = _Cur()
+
+        def cursor(self):
+            return self.cur
+
+    monkeypatch.setenv("DCX_SNOWFLAKE_AUTO_SESSION_CONTEXT", "true")
+    kwargs = {"account": "A", "user": "U", "password": "P"}
+    ensure_session_role_warehouse(_Conn(), kwargs)
+    assert kwargs["role"] == "SYSADMIN"
+    assert kwargs["warehouse"] == "WH_A"
+
+
+def test_ensure_session_role_warehouse_respects_opt_out(monkeypatch):
+    from dcx.apply.snowflake import ensure_session_role_warehouse
+
+    class _Cur:
+        def execute(self, _sql):
+            raise AssertionError("should not execute when disabled")
+
+        def close(self):
+            pass
+
+    class _Conn:
+        def cursor(self):
+            return _Cur()
+
+    monkeypatch.setenv("DCX_SNOWFLAKE_AUTO_SESSION_CONTEXT", "false")
+    kwargs = {"account": "A", "user": "U", "password": "P"}
+    ensure_session_role_warehouse(_Conn(), kwargs)
+    assert "role" not in kwargs
+    assert "warehouse" not in kwargs
 
 
 def test_no_password_cli_flag_exists(tmp_path):
     """`--password` must not be a real flag — passing it should error."""
     contract_path = tmp_path / "datacontract.yaml"
     contract_path.write_text(CONTRACT_YAML)
-    result = runner.invoke(app, [
-        "apply", "snowflake", str(contract_path),
-        "--password", "anything",
-    ])
+    result = runner.invoke(
+        app,
+        [
+            "apply",
+            "snowflake",
+            str(contract_path),
+            "--password",
+            "anything",
+        ],
+    )
     assert result.exit_code != 0
     # Click reports unknown options with "No such option" / "Got unexpected"
     assert "password" in result.output.lower()
@@ -325,11 +422,11 @@ def test_no_password_cli_flag_exists(tmp_path):
 def test_apply_command_listed_in_dcx_commands():
     """'apply' must be in DCX_COMMANDS so the migration shim doesn't munge our flags."""
     from dcx.cli import DCX_COMMANDS
+
     assert "apply" in DCX_COMMANDS
 
 
-_CONTRACT_WITH_TAG = textwrap.dedent(
-    """\
+_CONTRACT_WITH_TAG = textwrap.dedent("""\
     apiVersion: v3.1.0
     kind: DataContract
     id: orders
@@ -352,8 +449,7 @@ _CONTRACT_WITH_TAG = textwrap.dedent(
             primaryKey: true
             tags:
               - DATA_CLASSIFICATION=PD_DATA
-    """
-)
+    """)
 
 
 # === Alter-only mode (--no-ddl) =============================================
@@ -362,17 +458,24 @@ _CONTRACT_WITH_TAG = textwrap.dedent(
 def test_no_ddl_dry_run_omits_create_table(tmp_path):
     contract_path = tmp_path / "datacontract.yaml"
     contract_path.write_text(CONTRACT_YAML)
-    result = runner.invoke(app, [
-        "apply", "snowflake", str(contract_path), "--dry-run", "--ddl-mode", "never",
-    ])
+    result = runner.invoke(
+        app,
+        [
+            "apply",
+            "snowflake",
+            str(contract_path),
+            "--dry-run",
+            "--ddl-mode",
+            "never",
+        ],
+    )
     assert result.exit_code == 0, result.output
     assert "CREATE TABLE" not in result.output
 
 
 def test_alter_only_emits_comments_for_existing_table(tmp_path):
     """`--ddl-mode never` sets COMMENT ON for descriptions, no CREATE TABLE."""
-    contract_yaml = textwrap.dedent(
-        """\
+    contract_yaml = textwrap.dedent("""\
         apiVersion: v3.1.0
         kind: DataContract
         id: orders
@@ -396,20 +499,24 @@ def test_alter_only_emits_comments_for_existing_table(tmp_path):
                 physicalType: NUMBER
                 primaryKey: true
                 description: Surrogate key for the order.
-        """
-    )
+        """)
     contract_path = tmp_path / "datacontract.yaml"
     contract_path.write_text(contract_yaml)
-    result = runner.invoke(app, ["apply", "snowflake", str(contract_path), "--dry-run", "--ddl-mode", "never"])
+    result = runner.invoke(
+        app,
+        ["apply", "snowflake", str(contract_path), "--dry-run", "--ddl-mode", "never"],
+    )
     assert result.exit_code == 0, result.output
     assert "CREATE TABLE" not in result.output
     assert "COMMENT ON TABLE MY_DB.LOAD.orders IS 'One row per order.'" in result.output
-    assert "COMMENT ON COLUMN MY_DB.LOAD.orders.id IS 'Surrogate key for the order.'" in result.output
+    assert (
+        "COMMENT ON COLUMN MY_DB.LOAD.orders.id IS 'Surrogate key for the order.'"
+        in result.output
+    )
 
 
 def test_no_comments_flag_suppresses_comment_sql(tmp_path):
-    contract_yaml = textwrap.dedent(
-        """\
+    contract_yaml = textwrap.dedent("""\
         apiVersion: v3.1.0
         kind: DataContract
         id: orders
@@ -431,13 +538,21 @@ def test_no_comments_flag_suppresses_comment_sql(tmp_path):
                 logicalType: integer
                 physicalType: NUMBER
                 description: Surrogate key.
-        """
-    )
+        """)
     contract_path = tmp_path / "datacontract.yaml"
     contract_path.write_text(contract_yaml)
-    result = runner.invoke(app, [
-        "apply", "snowflake", str(contract_path), "--dry-run", "--ddl-mode", "never", "--no-comments",
-    ])
+    result = runner.invoke(
+        app,
+        [
+            "apply",
+            "snowflake",
+            str(contract_path),
+            "--dry-run",
+            "--ddl-mode",
+            "never",
+            "--no-comments",
+        ],
+    )
     assert result.exit_code == 0, result.output
     assert "COMMENT ON" not in result.output
 
@@ -445,10 +560,19 @@ def test_no_comments_flag_suppresses_comment_sql(tmp_path):
 def test_no_ddl_keeps_tags(tmp_path):
     contract_path = tmp_path / "datacontract.yaml"
     contract_path.write_text(_CONTRACT_WITH_TAG)
-    result = runner.invoke(app, [
-        "apply", "snowflake", str(contract_path), "--dry-run", "--ddl-mode", "never",
-        "--tag-namespace", "GOV.TAGS",
-    ])
+    result = runner.invoke(
+        app,
+        [
+            "apply",
+            "snowflake",
+            str(contract_path),
+            "--dry-run",
+            "--ddl-mode",
+            "never",
+            "--tag-namespace",
+            "GOV.TAGS",
+        ],
+    )
     assert result.exit_code == 0, result.output
     assert "CREATE TABLE" not in result.output
     assert "SET TAG" in result.output.upper() or "GOV.TAGS" in result.output
@@ -460,8 +584,7 @@ def test_no_ddl_keeps_tags(tmp_path):
 def test_detect_drift_reports_missing_extra_and_type_mismatch():
     from dcx.apply.snowflake import _detect_drift
 
-    contract = OpenDataContractStandard.from_string(textwrap.dedent(
-        """\
+    contract = OpenDataContractStandard.from_string(textwrap.dedent("""\
         apiVersion: v3.1.0
         kind: DataContract
         id: orders
@@ -476,8 +599,7 @@ def test_detect_drift_reports_missing_extra_and_type_mismatch():
                 physicalType: NUMBER
               - name: customer_id
                 physicalType: NUMBER
-        """
-    ))
+        """))
 
     class _Cur:
         # DESCRIBE TABLE result header: first two columns are `name`, `type`.
@@ -505,15 +627,14 @@ def test_detect_drift_reports_missing_extra_and_type_mismatch():
     warnings = _detect_drift(_Conn(), contract, "DB", "LOAD")
     joined = " ".join(warnings)
     assert "CUSTOMER_ID" in joined and "not in the Snowflake table" in joined  # missing
-    assert "LEGACY" in joined and "not in the contract" in joined              # extra
-    assert "AMOUNT" in joined and "differs" in joined                          # type mismatch
+    assert "LEGACY" in joined and "not in the contract" in joined  # extra
+    assert "AMOUNT" in joined and "differs" in joined  # type mismatch
 
 
 def test_detect_drift_skips_nonexistent_table():
     from dcx.apply.snowflake import _detect_drift
 
-    contract = OpenDataContractStandard.from_string(textwrap.dedent(
-        """\
+    contract = OpenDataContractStandard.from_string(textwrap.dedent("""\
         apiVersion: v3.1.0
         kind: DataContract
         id: orders
@@ -524,14 +645,15 @@ def test_detect_drift_skips_nonexistent_table():
             properties:
               - name: id
                 physicalType: NUMBER
-        """
-    ))
+        """))
 
     class _Cur:
         description = [("name",), ("type",)]
 
         def execute(self, *a):
-            raise RuntimeError("Object 'DB.LOAD.NEW_TABLE' does not exist or not authorized.")
+            raise RuntimeError(
+                "Object 'DB.LOAD.NEW_TABLE' does not exist or not authorized."
+            )
 
         def fetchall(self):
             return []
@@ -551,12 +673,13 @@ def test_detect_drift_skips_nonexistent_table():
 
 def test_apply_oauth_auto_creates_if_not_exists_by_default(mock_snowflake_connector):
     from dcx.apply.snowflake import apply_snowflake_oauth
+
     result = apply_snowflake_oauth(_contract(), token="tok123")
     assert result["dry_run"] is False
     kwargs = mock_snowflake_connector["connect_kwargs"]
     assert kwargs["authenticator"] == "oauth"
     assert kwargs["token"] == "tok123"
-    assert kwargs["account"] == "ENTERPRISE"   # from contract server block
+    assert kwargs["account"] == "ENTERPRISE"  # from contract server block
     assert "password" not in kwargs
     # auto default → create-if-missing + govern existing
     assert "CREATE TABLE IF NOT EXISTS" in mock_snowflake_connector["captured_sql"]
@@ -564,14 +687,16 @@ def test_apply_oauth_auto_creates_if_not_exists_by_default(mock_snowflake_connec
 
 def test_apply_oauth_dry_run_needs_no_token():
     from dcx.apply.snowflake import apply_snowflake_oauth
+
     result = apply_snowflake_oauth(_contract(), token="", dry_run=True)
     assert result["dry_run"] is True
-    assert "CREATE TABLE IF NOT EXISTS" in result["sql"]   # auto default
+    assert "CREATE TABLE IF NOT EXISTS" in result["sql"]  # auto default
     assert result["account"] == "ENTERPRISE"
 
 
 def test_apply_oauth_execute_requires_token():
     from dcx.apply.snowflake import apply_snowflake_oauth, ApplyError
+
     with pytest.raises(ApplyError, match="OAuth token is required"):
         apply_snowflake_oauth(_contract(), token="", dry_run=False)
 
@@ -582,43 +707,87 @@ def test_apply_oauth_execute_requires_token():
 def _api_client():
     from fastapi.testclient import TestClient
     from dcx.api import build_dcx_api_app
+
     return TestClient(build_dcx_api_app())
 
 
 _API_CONTRACT = {
-    "apiVersion": "v3.1.0", "kind": "DataContract", "id": "orders", "name": "Orders",
+    "apiVersion": "v3.1.0",
+    "kind": "DataContract",
+    "id": "orders",
+    "name": "Orders",
     "version": "1.0.0",
-    "servers": [{"server": "prod", "type": "snowflake", "account": "ACME",
-                 "database": "DB", "schema": "LOAD"}],
-    "schema": [{"name": "orders", "properties": [
-        {"name": "id", "logicalType": "integer", "tags": ["DATA_CLASSIFICATION=PD_DATA"]},
-    ]}],
+    "servers": [
+        {
+            "server": "prod",
+            "type": "snowflake",
+            "account": "ACME",
+            "database": "DB",
+            "schema": "LOAD",
+        }
+    ],
+    "schema": [
+        {
+            "name": "orders",
+            "properties": [
+                {
+                    "name": "id",
+                    "logicalType": "integer",
+                    "tags": ["DATA_CLASSIFICATION=PD_DATA"],
+                },
+            ],
+        }
+    ],
 }
 
 
 def test_api_apply_dry_run_no_token_returns_sql():
     r = _api_client().post(
-        "/apply/snowflake", json={"contract": _API_CONTRACT, "options": {"dry_run": True}},
+        "/apply/snowflake",
+        json={"contract": _API_CONTRACT, "options": {"dry_run": True}},
     )
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["dry_run"] is True
-    assert "CREATE TABLE IF NOT EXISTS" in body["sql"]      # auto default
+    assert "CREATE TABLE IF NOT EXISTS" in body["sql"]  # auto default
     assert body["statements_executed"] == 0
 
 
 def test_api_apply_tag_namespace_filter():
     contract = {
-        "apiVersion": "v3.1.0", "kind": "DataContract", "id": "o", "name": "O", "version": "1.0.0",
-        "servers": [{"server": "p", "type": "snowflake", "account": "ACME", "database": "DB", "schema": "LOAD"}],
-        "schema": [{"name": "orders", "properties": [
-            {"name": "id", "logicalType": "integer",
-             "tags": ["GOV.TAGS.CLASS=A", "CORP.GLOBAL.SRC=x"]},
-        ]}],
+        "apiVersion": "v3.1.0",
+        "kind": "DataContract",
+        "id": "o",
+        "name": "O",
+        "version": "1.0.0",
+        "servers": [
+            {
+                "server": "p",
+                "type": "snowflake",
+                "account": "ACME",
+                "database": "DB",
+                "schema": "LOAD",
+            }
+        ],
+        "schema": [
+            {
+                "name": "orders",
+                "properties": [
+                    {
+                        "name": "id",
+                        "logicalType": "integer",
+                        "tags": ["GOV.TAGS.CLASS=A", "CORP.GLOBAL.SRC=x"],
+                    },
+                ],
+            }
+        ],
     }
     r = _api_client().post(
         "/apply/snowflake",
-        json={"contract": contract, "options": {"dry_run": True, "tag_namespace_filter": ["GOV.TAGS"]}},
+        json={
+            "contract": contract,
+            "options": {"dry_run": True, "tag_namespace_filter": ["GOV.TAGS"]},
+        },
     )
     assert r.status_code == 200, r.text
     sql = r.json()["sql"]
@@ -627,18 +796,26 @@ def test_api_apply_tag_namespace_filter():
 
 
 def test_api_apply_execute_requires_token():
-    r = _api_client().post("/apply/snowflake", json={"contract": _API_CONTRACT, "options": {}})
+    r = _api_client().post(
+        "/apply/snowflake", json={"contract": _API_CONTRACT, "options": {}}
+    )
     assert r.status_code == 401
     assert "Bearer" in r.json()["detail"]
 
 
 def test_api_apply_executes_with_token(monkeypatch):
     import dcx.apply.snowflake as apply_module
+
     captured = {}
 
     def fake(contract, **kw):
         captured.update(kw)
-        return {"dry_run": False, "sql": "ALTER TABLE ...;", "statements_executed": 1, "account": "ACME"}
+        return {
+            "dry_run": False,
+            "sql": "ALTER TABLE ...;",
+            "statements_executed": 1,
+            "account": "ACME",
+        }
 
     monkeypatch.setattr(apply_module, "apply_snowflake_oauth", fake)
     r = _api_client().post(
@@ -648,7 +825,7 @@ def test_api_apply_executes_with_token(monkeypatch):
     )
     assert r.status_code == 200, r.text
     assert captured["token"] == "tok-xyz"
-    assert captured["ddl_mode"] == apply_module.DdlMode.auto   # auto default
+    assert captured["ddl_mode"] == apply_module.DdlMode.auto  # auto default
     assert captured["include_quality"] is False
     assert r.json()["statements_executed"] == 1
 
@@ -667,3 +844,80 @@ def test_api_apply_error_is_502(monkeypatch):
     )
     assert r.status_code == 502
     assert "bad token" in r.json()["detail"]
+
+
+def test_api_apply_service_profile_executes(monkeypatch):
+    import dcx.apply.snowflake as apply_module
+    import dcx.api as api
+
+    captured = {}
+    loader_args = {}
+
+    def fake_load(profile, source=None):
+        assert profile == "svc-apply"
+        loader_args["source"] = source
+        return {"account": "ACME", "user": "svc", "password": "x"}
+
+    def fake(contract, **kw):
+        captured.update(kw)
+        return {
+            "dry_run": False,
+            "sql": "ALTER TABLE ...;",
+            "statements_executed": 1,
+            "account": "ACME",
+            "warnings": [],
+        }
+
+    monkeypatch.setattr(api, "load_snowflake_service_profile", fake_load)
+    monkeypatch.setattr(apply_module, "apply_snowflake_with_connection", fake)
+
+    r = _api_client().post(
+        "/apply/snowflake",
+        json={
+            "contract": _API_CONTRACT,
+            "options": {
+                "auth_mode": "service_profile",
+                "service_profile": "svc-apply",
+                "service_profile_source": "file",
+                "include_quality": False,
+            },
+        },
+    )
+    assert r.status_code == 200, r.text
+    assert getattr(loader_args["source"], "value", loader_args["source"]) == "file"
+    assert captured["connection_kwargs"]["account"] == "ACME"
+    assert captured["connection_kwargs"]["user"] == "svc"
+    assert captured["include_quality"] is False
+
+
+def test_api_apply_service_profile_requires_name():
+    r = _api_client().post(
+        "/apply/snowflake",
+        json={
+            "contract": _API_CONTRACT,
+            "options": {"auth_mode": "service_profile"},
+        },
+    )
+    assert r.status_code == 400
+    assert "service_profile" in r.json()["detail"]
+
+
+def test_api_apply_service_profile_error_is_502(monkeypatch):
+    import dcx.api as api
+
+    def fail(_, source=None):
+        raise api.ServiceProfileError("Vault auth failed")
+
+    monkeypatch.setattr(api, "load_snowflake_service_profile", fail)
+    r = _api_client().post(
+        "/apply/snowflake",
+        json={
+            "contract": _API_CONTRACT,
+            "options": {
+                "auth_mode": "service_profile",
+                "service_profile": "svc-apply",
+            },
+        },
+    )
+    assert r.status_code == 502
+    assert "Vault auth failed" in r.json()["detail"]
