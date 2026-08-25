@@ -307,12 +307,15 @@ Non-secret connection context resolves **CLI flag → env var → contract serve
 
 `--authenticator` selects the method: `snowflake` (password, the default), `externalbrowser` (SSO), `oauth`, `snowflake_jwt` (key-pair). The connector auto-detects when you omit it.
 
-`--secondary-roles` accepts `ALL` or `NONE` (case-insensitive), and resolves as
-**CLI flag → `SNOWFLAKE_SECONDARY_ROLES` → unset**. When set, dcx executes
-`USE SECONDARY ROLES ALL` or `USE SECONDARY ROLES NONE` immediately after connecting,
-before metadata reads, drift checks, or DDL. When omitted, dcx does not execute a
-`USE SECONDARY ROLES` statement. This is session configuration only: it is not stored
-in the Data Contract server block, and dcx never selects, switches, or retries roles.
+`--secondary-roles` accepts `ALL`, `NONE`, or one or more comma-separated Snowflake
+role names (for example, `DATA_READER,DATA_STEWARD` or `"Finance Reader"`), and resolves
+as **CLI flag → `SNOWFLAKE_SECONDARY_ROLES` → unset**. `ALL` and `NONE` are
+case-insensitive; named roles must use valid Snowflake identifier syntax. When set, dcx
+executes `USE SECONDARY ROLES ...` immediately after connecting, before metadata reads,
+drift checks, or DDL. When omitted, dcx does not execute a `USE SECONDARY ROLES`
+statement. This is session configuration only: it is not stored in the Data Contract
+server block, and dcx never selects, switches, or retries roles. Snowflake determines
+whether named roles are granted to the user or permitted by a session policy.
 
 ```bash
 export SNOWFLAKE_ACCOUNT=xy12345.eu-central-1 SNOWFLAKE_USER=me SNOWFLAKE_PASSWORD=...
@@ -422,9 +425,10 @@ Omit `connection_name` to use the server's `default_connection_name`; if it has 
 
 `Authorization: Bearer <token>` is shorthand for `{"type": "oauth"}` and still works on its own; when both are sent, the body wins. `dry_run` on `/apply/snowflake` needs no credentials at all.
 
-Both endpoints accept optional `secondary_roles: "ALL" | "NONE"`: use it at the top
-level for `/import/snowflake`, or in the `options` object for `/apply/snowflake`. API
-requests use only this explicit request value; they never inherit
+Both endpoints accept optional `secondary_roles`: use it at the top level for
+`/import/snowflake`, or in the `options` object for `/apply/snowflake`. Values may be
+`"ALL"`, `"NONE"`, a role name, or a comma-separated list of role names. API requests
+use only this explicit request value; they never inherit
 `SNOWFLAKE_SECONDARY_ROLES` from the API host.
 
 Errors: **401** no credentials · **400** unusable key material · **403** method disabled on this server · **502** Snowflake refused.

@@ -65,7 +65,8 @@ def import_snowflake(
     ] = None,
     role: Annotated[Optional[str], typer.Option(help="Role to assume.")] = None,
     secondary_roles: Annotated[
-        Optional[str], typer.Option(help="Secondary-role mode: ALL or NONE (or SNOWFLAKE_SECONDARY_ROLES)."),
+        Optional[str],
+        typer.Option(help="Secondary roles: ALL, NONE, or comma-separated role names (or SNOWFLAKE_SECONDARY_ROLES)."),
     ] = None,
     warehouse: Annotated[Optional[str], typer.Option(help="Warehouse to use for the queries.")] = None,
     authenticator: Annotated[

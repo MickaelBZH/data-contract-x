@@ -37,11 +37,11 @@ from typing import Any, Dict, Optional, Union
 import typer
 from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
 from open_data_contract_standard.model import OpenDataContractStandard
-from pydantic import BaseModel, ConfigDict, Field, create_model
+from pydantic import BaseModel, ConfigDict, Field, create_model, field_validator
 
 from dcx import enrich as enrich_module
 from dcx import yaml_style  # noqa: F401  multi-line strings dump as block scalars
-from dcx.apply.snowflake import DdlMode
+from dcx.apply.snowflake import DdlMode, normalize_secondary_roles
 from dcx.snowflake_auth import (
     LocalCredentialsDisabled,
     OAuthAuth,
@@ -894,7 +894,9 @@ class SnowflakeImportRequest(BaseModel):
     database: str = Field(..., description="Database to import from.")
     tables: Optional[list[str]] = Field(None, description="Limit to these tables. Default: all.")
     role: Optional[str] = Field(None, description="Role to assume.")
-    secondary_roles: Optional[str] = Field(None, description="Secondary-role mode: ALL or NONE.")
+    secondary_roles: Optional[str] = Field(
+        None, description="Secondary roles: ALL, NONE, or comma-separated Snowflake role names."
+    )
     warehouse: Optional[str] = Field(None, description="Warehouse for the queries.")
     tags: bool = Field(True, description="Import object tags as NAME=VALUE.")
     quality: bool = Field(
@@ -902,6 +904,11 @@ class SnowflakeImportRequest(BaseModel):
         description="Import attached data metric functions as quality rules and SLAs.",
     )
     server_name: str = Field("production", description="Name for the server entry in the contract.")
+
+    @field_validator("secondary_roles", mode="before")
+    @classmethod
+    def validate_secondary_roles(cls, value):
+        return normalize_secondary_roles(value)
 
 
 def mirror_snowflake_import_to_fastapi(api_app: FastAPI, prefix: str = "/import") -> None:
@@ -987,7 +994,9 @@ class ApplySnowflakeRequestOptions(BaseModel):
     server_name: Optional[str] = Field(None, description="Named server from the contract.")
     account: Optional[str] = Field(None, description="Override account (else from server block).")
     role: Optional[str] = Field(None, description="Role to assume (needs APPLY TAG / table ownership).")
-    secondary_roles: Optional[str] = Field(None, description="Secondary-role mode: ALL or NONE.")
+    secondary_roles: Optional[str] = Field(
+        None, description="Secondary roles: ALL, NONE, or comma-separated Snowflake role names."
+    )
     warehouse: Optional[str] = Field(None, description="Override warehouse (else from server block).")
     dry_run: bool = Field(False, description="Return the SQL without executing (no token needed).")
     ddl_mode: DdlMode = Field(
@@ -1024,6 +1033,11 @@ class ApplySnowflakeRequestOptions(BaseModel):
     metric_schedule: str = Field(
         "USING CRON 0 0 * * * UTC", description="DATA_METRIC_SCHEDULE clause for DMF tables."
     )
+
+    @field_validator("secondary_roles", mode="before")
+    @classmethod
+    def validate_secondary_roles(cls, value):
+        return normalize_secondary_roles(value)
 
 
 # Built with `create_model` (like the auto-generated endpoints) so it reuses the

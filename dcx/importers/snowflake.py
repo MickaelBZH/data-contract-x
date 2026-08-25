@@ -36,6 +36,7 @@ from dcx.apply.snowflake import (
     _first,
     configure_secondary_roles,
     default_connection_name,
+    normalize_secondary_roles,
     profile_conn_kwargs,
     quiet_aws_credential_noise,
     SNOWFLAKE_LOGIN_TIMEOUT,
@@ -677,6 +678,13 @@ def _resolve_conn_params(import_args: dict) -> dict:
 
 def _connect(import_args: dict):
     try:
+        normalized_secondary_roles = normalize_secondary_roles(
+            _first(import_args.get("secondary_roles"), os.environ.get(_ENV_VARS["secondary_roles"]))
+        )
+    except ValueError as exc:
+        raise SnowflakeImportError(str(exc))
+
+    try:
         import snowflake.connector
     except ImportError:
         raise SnowflakeImportError(
@@ -722,7 +730,7 @@ def _connect(import_args: dict):
     try:
         configure_secondary_roles(
             conn,
-            _first(import_args.get("secondary_roles"), os.environ.get(_ENV_VARS["secondary_roles"])),
+            normalized_secondary_roles,
         )
     except Exception as exc:
         conn.close()
@@ -1099,6 +1107,11 @@ def import_snowflake_api(
     if not (database and schema):
         raise SnowflakeImportError("database and schema are required.")
 
+    try:
+        normalized_secondary_roles = normalize_secondary_roles(secondary_roles)
+    except ValueError as exc:
+        raise SnowflakeImportError(str(exc))
+
     # Raises SnowflakeAuthError (400) / LocalCredentialsDisabled (403) before we
     # touch the network.
     conn_kwargs: dict[str, Any] = dict(connect_kwargs(auth))
@@ -1132,7 +1145,7 @@ def import_snowflake_api(
         raise SnowflakeImportError(connection_error_message(exc))
 
     try:
-        configure_secondary_roles(conn, secondary_roles)
+        configure_secondary_roles(conn, normalized_secondary_roles)
     except Exception as exc:
         conn.close()
         raise SnowflakeImportError(f"Snowflake session configuration failed: {exc}")
