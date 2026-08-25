@@ -573,6 +573,19 @@ def test_import_connect_invalid_secondary_roles_executes_no_sql(monkeypatch):
     assert calls == []
 
 
+def test_import_connect_rejects_mixed_secondary_role_modes_before_connect(monkeypatch):
+    import dcx.importers.snowflake as si
+    import snowflake.connector as connector
+
+    calls: list[dict] = []
+    monkeypatch.setattr(connector, "connect", lambda **kwargs: calls.append(kwargs))
+
+    with pytest.raises(SnowflakeImportError, match="ALL and NONE must be used alone"):
+        si._connect({"account": "ACME", "user": "SVC", "secondary_roles": "ALL, ROLE_A"})
+
+    assert calls == []
+
+
 def test_import_connect_accepts_named_secondary_roles(monkeypatch):
     import dcx.importers.snowflake as si
     import snowflake.connector as connector

@@ -252,6 +252,8 @@ def test_configure_secondary_roles_none_is_explicit_and_unset_is_a_noop():
     ("DATA_READER, DATA_STEWARD", "DATA_READER,DATA_STEWARD"),
     ('"Finance Reader"', '"Finance Reader"'),
     ('"Finance ""Steward"""', '"Finance ""Steward"""'),
+    ('"ALL", ROLE_A', '"ALL",ROLE_A'),
+    ('ROLE_A, "NONE"', 'ROLE_A,"NONE"'),
 ])
 def test_normalize_secondary_roles_accepts_snowflake_syntax(value, expected):
     assert normalize_secondary_roles(value) == expected
@@ -272,6 +274,18 @@ def test_configure_secondary_roles_rejects_invalid_value_without_sql():
 
     with pytest.raises(ValueError, match="only Snowflake role names"):
         configure_secondary_roles(conn, "NONE; DROP TABLE x")
+
+    assert state["executed"] == []
+    assert conn.cursors == []
+
+
+@pytest.mark.parametrize("value", ["ALL, ROLE_A", "ROLE_A, NONE", "all,NONE"])
+def test_configure_secondary_roles_rejects_mixed_modes_without_sql(value):
+    state: dict = {"executed": []}
+    conn = _MockConn(state)
+
+    with pytest.raises(ValueError, match="ALL and NONE must be used alone"):
+        configure_secondary_roles(conn, value)
 
     assert state["executed"] == []
     assert conn.cursors == []

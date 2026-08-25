@@ -307,15 +307,19 @@ Non-secret connection context resolves **CLI flag → env var → contract serve
 
 `--authenticator` selects the method: `snowflake` (password, the default), `externalbrowser` (SSO), `oauth`, `snowflake_jwt` (key-pair). The connector auto-detects when you omit it.
 
-`--secondary-roles` accepts `ALL`, `NONE`, or one or more comma-separated Snowflake
-role names (for example, `DATA_READER,DATA_STEWARD` or `"Finance Reader"`), and resolves
-as **CLI flag → `SNOWFLAKE_SECONDARY_ROLES` → unset**. `ALL` and `NONE` are
-case-insensitive; named roles must use valid Snowflake identifier syntax. When set, dcx
-executes `USE SECONDARY ROLES ...` immediately after connecting, before metadata reads,
-drift checks, or DDL. When omitted, dcx does not execute a `USE SECONDARY ROLES`
-statement. This is session configuration only: it is not stored in the Data Contract
-server block, and dcx never selects, switches, or retries roles. Snowflake determines
-whether named roles are granted to the user or permitted by a session policy.
+`--secondary-roles` accepts `ALL` or `NONE` alone, or one or more comma-separated
+Snowflake role names (for example, `DATA_READER,DATA_STEWARD`). It resolves as **CLI
+flag → `SNOWFLAKE_SECONDARY_ROLES` → unset**. `ALL` and `NONE` are case-insensitive;
+named roles must use valid Snowflake identifier syntax. A role name with spaces must
+preserve its Snowflake identifier quotes in the shell, for example
+`--secondary-roles '"Finance Reader"'`. When set, dcx executes `USE SECONDARY ROLES ...`
+immediately after connecting, before metadata reads, drift checks, or DDL. When omitted,
+dcx does not execute a `USE SECONDARY ROLES` statement. This is session configuration
+only: it is not stored in the Data Contract server block, and dcx never selects,
+switches, or retries roles. Snowflake determines whether named roles are granted to the
+user or permitted by a session policy. This setting applies to dcx's Snowflake `import`
+and `apply` commands; upstream `dcx test` uses datacontract-cli's connection path and
+does not honor `SNOWFLAKE_SECONDARY_ROLES`.
 
 ```bash
 export SNOWFLAKE_ACCOUNT=xy12345.eu-central-1 SNOWFLAKE_USER=me SNOWFLAKE_PASSWORD=...

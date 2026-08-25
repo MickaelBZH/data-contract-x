@@ -103,7 +103,7 @@ def _first(*candidates: Optional[str]) -> Optional[str]:
 
 
 _SECONDARY_ROLE_IDENTIFIER = re.compile(
-    r'(?:[A-Za-z_][A-Za-z0-9_$]*|"(?:[^"]|"")*")\Z'
+    r'(?:[A-Za-z_][A-Za-z0-9_$]*|"(?:[^"]|"")*")'
 )
 
 
@@ -157,6 +157,8 @@ def normalize_secondary_roles(secondary_roles: Optional[str]) -> Optional[str]:
         raise ValueError("secondary_roles must contain one or more Snowflake role names")
     if any(not _SECONDARY_ROLE_IDENTIFIER.fullmatch(identifier) for identifier in identifiers):
         raise ValueError("secondary_roles must contain only valid Snowflake role names")
+    if any(identifier[0] != '"' and identifier.upper() in {"ALL", "NONE"} for identifier in identifiers):
+        raise ValueError("secondary_roles ALL and NONE must be used alone")
     return ",".join(identifiers)
 
 
