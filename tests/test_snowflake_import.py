@@ -564,6 +564,19 @@ def test_import_connect_invalid_secondary_roles_executes_no_sql(monkeypatch):
     import dcx.importers.snowflake as si
     import snowflake.connector as connector
 
+    calls: list[dict] = []
+    monkeypatch.setattr(connector, "connect", lambda **kwargs: calls.append(kwargs))
+
+    with pytest.raises(SnowflakeImportError, match="only Snowflake role names"):
+        si._connect({"account": "ACME", "user": "SVC", "secondary_roles": "NONE; DROP TABLE x"})
+
+    assert calls == []
+
+
+def test_import_connect_accepts_named_secondary_roles(monkeypatch):
+    import dcx.importers.snowflake as si
+    import snowflake.connector as connector
+
     executed: list[str] = []
 
     class RecordingCursor(_FakeCursor):
@@ -575,14 +588,14 @@ def test_import_connect_invalid_secondary_roles_executes_no_sql(monkeypatch):
         def cursor(self):
             return RecordingCursor(self.data)
 
-    conn = RecordingConn(_fake_data())
-    monkeypatch.setattr(connector, "connect", lambda **kwargs: conn)
-
-    with pytest.raises(SnowflakeImportError, match="secondary_roles must be either ALL or NONE"):
-        si._connect({"account": "ACME", "user": "SVC", "secondary_roles": "ROLE_A"})
-
-    assert executed == []
-    assert conn.closed is True
+    monkeypatch.setattr(connector, "connect", lambda **kwargs: RecordingConn(_fake_data()))
+    conn = si._connect({
+        "account": "ACME", "user": "SVC", "secondary_roles": 'DATA_READER, "Finance Reader"',
+    })
+    try:
+        assert executed == ['USE SECONDARY ROLES DATA_READER,"Finance Reader"']
+    finally:
+        conn.close()
 
 
 def test_import_connect_secondary_role_failure_stops_before_metadata(monkeypatch):
