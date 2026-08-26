@@ -462,6 +462,45 @@ def test_cli_no_password_flag(monkeypatch):
     assert "password" in result.output.lower()
 
 
+def test_cli_snowflake_import_error_is_user_facing(monkeypatch, strip_ansi):
+    from datacontract.data_contract import DataContract
+
+    error = SnowflakeImportError(
+        "No accessible columns found in D.S. The schema may be empty, or the active "
+        "primary/secondary roles may lack privileges to view its tables and columns."
+    )
+    monkeypatch.setattr(
+        DataContract,
+        "import_from_source",
+        staticmethod(lambda *args, **kwargs: (_ for _ in ()).throw(error)),
+    )
+
+    result = runner.invoke(app, ["import", "snowflake", "--database", "D", "--schema", "S"])
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 1
+    assert str(error) in output
+    assert "Traceback" not in output
+
+
+def test_cli_snowflake_import_error_reraises_in_debug_mode(monkeypatch):
+    from datacontract.data_contract import DataContract
+
+    error = SnowflakeImportError("Snowflake metadata query failed: test failure")
+    monkeypatch.setattr(
+        DataContract,
+        "import_from_source",
+        staticmethod(lambda *args, **kwargs: (_ for _ in ()).throw(error)),
+    )
+
+    with pytest.raises(SnowflakeImportError, match="test failure"):
+        runner.invoke(
+            app,
+            ["import", "snowflake", "--database", "D", "--schema", "S", "--debug"],
+            catch_exceptions=False,
+        )
+
+
 def test_cli_quiets_botocore_credential_noise(monkeypatch):
     import logging
     from datacontract.data_contract import DataContract
@@ -533,6 +572,105 @@ def _capture_connect(monkeypatch):
 
     monkeypatch.setattr(connector, "connect", fake_connect)
     return captured
+
+
+def test_import_connect_configures_env_secondary_roles_before_metadata(monkeypatch):
+    import dcx.importers.snowflake as si
+    import snowflake.connector as connector
+
+    executed: list[str] = []
+
+    class RecordingCursor(_FakeCursor):
+        def execute(self, sql, params=None):
+            executed.append(sql)
+            return super().execute(sql, params)
+
+    class RecordingConn(_FakeConn):
+        def cursor(self):
+            return RecordingCursor(self.data)
+
+    monkeypatch.setenv("SNOWFLAKE_SECONDARY_ROLES", "all")
+    monkeypatch.setattr(connector, "connect", lambda **kwargs: RecordingConn(_fake_data()))
+
+    conn = si._connect({"account": "ACME", "user": "SVC"})
+    try:
+        assert executed == ["USE SECONDARY ROLES ALL"]
+    finally:
+        conn.close()
+
+
+def test_import_connect_invalid_secondary_roles_executes_no_sql(monkeypatch):
+    import dcx.importers.snowflake as si
+    import snowflake.connector as connector
+
+    calls: list[dict] = []
+    monkeypatch.setattr(connector, "connect", lambda **kwargs: calls.append(kwargs))
+
+    with pytest.raises(SnowflakeImportError, match="only Snowflake role names"):
+        si._connect({"account": "ACME", "user": "SVC", "secondary_roles": "NONE; DROP TABLE x"})
+
+    assert calls == []
+
+
+def test_import_connect_rejects_mixed_secondary_role_modes_before_connect(monkeypatch):
+    import dcx.importers.snowflake as si
+    import snowflake.connector as connector
+
+    calls: list[dict] = []
+    monkeypatch.setattr(connector, "connect", lambda **kwargs: calls.append(kwargs))
+
+    with pytest.raises(SnowflakeImportError, match="ALL and NONE must be used alone"):
+        si._connect({"account": "ACME", "user": "SVC", "secondary_roles": "ALL, ROLE_A"})
+
+    assert calls == []
+
+
+def test_import_connect_accepts_named_secondary_roles(monkeypatch):
+    import dcx.importers.snowflake as si
+    import snowflake.connector as connector
+
+    executed: list[str] = []
+
+    class RecordingCursor(_FakeCursor):
+        def execute(self, sql, params=None):
+            executed.append(sql)
+            return super().execute(sql, params)
+
+    class RecordingConn(_FakeConn):
+        def cursor(self):
+            return RecordingCursor(self.data)
+
+    monkeypatch.setattr(connector, "connect", lambda **kwargs: RecordingConn(_fake_data()))
+    conn = si._connect({
+        "account": "ACME", "user": "SVC", "secondary_roles": 'DATA_READER, "Finance Reader"',
+    })
+    try:
+        assert executed == ['USE SECONDARY ROLES DATA_READER,"Finance Reader"']
+    finally:
+        conn.close()
+
+
+def test_import_connect_secondary_role_failure_stops_before_metadata(monkeypatch):
+    import dcx.importers.snowflake as si
+    import snowflake.connector as connector
+
+    class FailingCursor(_FakeCursor):
+        def execute(self, sql, params=None):
+            if sql == "USE SECONDARY ROLES ALL":
+                raise RuntimeError("not allowed")
+            return super().execute(sql, params)
+
+    class FailingConn(_FakeConn):
+        def cursor(self):
+            return FailingCursor(self.data)
+
+    conn = FailingConn(_fake_data())
+    monkeypatch.setattr(connector, "connect", lambda **kwargs: conn)
+
+    with pytest.raises(SnowflakeImportError, match="session configuration failed: not allowed"):
+        si._connect({"account": "ACME", "user": "SVC", "secondary_roles": "ALL"})
+
+    assert conn.closed is True
 
 
 def test_import_snowflake_api_uses_oauth_token(monkeypatch):
@@ -650,13 +788,17 @@ def test_api_snowflake_works(monkeypatch):
     r = _client().post(
         "/import/snowflake",
         headers={"Authorization": "Bearer tok-xyz"},
-        json={"account": "ACME", "database": "DB", "schema": "SCH", "tables": ["T"]},
+        json={
+            "account": "ACME", "database": "DB", "schema": "SCH", "tables": ["T"],
+            "secondary_roles": "NONE",
+        },
     )
     assert r.status_code == 200, r.text
     assert captured["auth"].token.get_secret_value() == "tok-xyz"
     assert captured["account"] == "ACME"
     assert captured["schema"] == "SCH"       # body "schema" → schema_ → schema kwarg
     assert captured["tables"] == ["T"]
+    assert captured["secondary_roles"] == "NONE"
     assert captured["quality"] is False      # opt-in; off unless requested
 
 

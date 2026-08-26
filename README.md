@@ -292,6 +292,7 @@ Non-secret connection context resolves **CLI flag → env var → contract serve
 | `--account` | `SNOWFLAKE_ACCOUNT` | ✅ |
 | `--user` | `SNOWFLAKE_USER` | — |
 | `--role` | `SNOWFLAKE_ROLE` | — |
+| `--secondary-roles` | `SNOWFLAKE_SECONDARY_ROLES` | — |
 | `--warehouse` | `SNOWFLAKE_WAREHOUSE` | ✅ |
 | `--authenticator` | `SNOWFLAKE_AUTHENTICATOR` | — |
 
@@ -306,11 +307,25 @@ Non-secret connection context resolves **CLI flag → env var → contract serve
 
 `--authenticator` selects the method: `snowflake` (password, the default), `externalbrowser` (SSO), `oauth`, `snowflake_jwt` (key-pair). The connector auto-detects when you omit it.
 
+`--secondary-roles` accepts `ALL` or `NONE` alone, or one or more comma-separated
+Snowflake role names (for example, `DATA_READER,DATA_STEWARD`). It resolves as **CLI
+flag → `SNOWFLAKE_SECONDARY_ROLES` → unset**. `ALL` and `NONE` are case-insensitive;
+named roles must use valid Snowflake identifier syntax. A role name with spaces must
+preserve its Snowflake identifier quotes in the shell, for example
+`--secondary-roles '"Finance Reader"'`. When set, dcx executes `USE SECONDARY ROLES ...`
+immediately after connecting, before metadata reads, drift checks, or DDL. When omitted,
+dcx does not execute a `USE SECONDARY ROLES` statement. This is session configuration
+only: it is not stored in the Data Contract server block, and dcx never selects,
+switches, or retries roles. Snowflake determines whether named roles are granted to the
+user or permitted by a session policy. This setting applies to dcx's Snowflake `import`
+and `apply` commands; upstream `dcx test` uses datacontract-cli's connection path and
+does not honor `SNOWFLAKE_SECONDARY_ROLES`.
+
 ```bash
 export SNOWFLAKE_ACCOUNT=xy12345.eu-central-1 SNOWFLAKE_USER=me SNOWFLAKE_PASSWORD=...
 dcx import snowflake --database MY_DB --schema LOAD --output contract.yaml
 
-dcx apply snowflake contract.yaml --authenticator externalbrowser --role TRANSFORMER
+dcx apply snowflake contract.yaml --authenticator externalbrowser --role TRANSFORMER --secondary-roles NONE
 ```
 
 ### Connection profiles (`config.toml`)
@@ -388,6 +403,7 @@ The live endpoints (`POST /import/snowflake`, `POST /apply/snowflake`) take an `
 POST /import/snowflake
 {
   "account": "xy12345.eu-central-1", "database": "MY_DB", "schema": "LOAD",
+  "secondary_roles": "NONE",
   "auth": {
     "type": "key_pair",
     "user": "SVC_DCX",
@@ -412,6 +428,12 @@ Omit `connection_name` to use the server's `default_connection_name`; if it has 
 `private_key` is PEM text or base64-encoded PKCS#8 DER. There is no `private_key_file`: a path would make the server read *its own* filesystem on a caller's behalf.
 
 `Authorization: Bearer <token>` is shorthand for `{"type": "oauth"}` and still works on its own; when both are sent, the body wins. `dry_run` on `/apply/snowflake` needs no credentials at all.
+
+Both endpoints accept optional `secondary_roles`: use it at the top level for
+`/import/snowflake`, or in the `options` object for `/apply/snowflake`. Values may be
+`"ALL"`, `"NONE"`, a role name, or a comma-separated list of role names. API requests
+use only this explicit request value; they never inherit
+`SNOWFLAKE_SECONDARY_ROLES` from the API host.
 
 Errors: **401** no credentials · **400** unusable key material · **403** method disabled on this server · **502** Snowflake refused.
 

@@ -34,7 +34,9 @@ from open_data_contract_standard.model import (
 from dcx.apply.snowflake import (
     _ENV_VARS,
     _first,
+    configure_secondary_roles,
     default_connection_name,
+    normalize_secondary_roles,
     profile_conn_kwargs,
     quiet_aws_credential_noise,
     SNOWFLAKE_LOGIN_TIMEOUT,
@@ -676,6 +678,13 @@ def _resolve_conn_params(import_args: dict) -> dict:
 
 def _connect(import_args: dict):
     try:
+        normalized_secondary_roles = normalize_secondary_roles(
+            _first(import_args.get("secondary_roles"), os.environ.get(_ENV_VARS["secondary_roles"]))
+        )
+    except ValueError as exc:
+        raise SnowflakeImportError(str(exc))
+
+    try:
         import snowflake.connector
     except ImportError:
         raise SnowflakeImportError(
@@ -714,9 +723,19 @@ def _connect(import_args: dict):
     conn_kwargs.setdefault("network_timeout", SNOWFLAKE_NETWORK_TIMEOUT)
     quiet_aws_credential_noise()
     try:
-        return snowflake.connector.connect(**conn_kwargs)
+        conn = snowflake.connector.connect(**conn_kwargs)
     except Exception as exc:
         raise SnowflakeImportError(connection_error_message(exc))
+
+    try:
+        configure_secondary_roles(
+            conn,
+            normalized_secondary_roles,
+        )
+    except Exception as exc:
+        conn.close()
+        raise SnowflakeImportError(f"Snowflake session configuration failed: {exc}")
+    return conn
 
 
 def _fetch_metadata(conn, database: str, schema: str, tables: Optional[list[str]]):
@@ -999,8 +1018,10 @@ def _contract_from_connection(
 
     if not columns:
         raise SnowflakeImportError(
-            f"No columns found in {database}.{schema}"
+            f"No accessible columns found in {database}.{schema}"
             + (f" for tables {tables}." if tables else ".")
+            + " The schema may be empty, or the active primary/secondary roles may lack "
+            "privileges to view its tables and columns."
         )
 
     # Both the tag and DMF lookups are per-entity table functions, so they share one
@@ -1068,6 +1089,7 @@ def import_snowflake_api(
     account: Optional[str] = None,
     tables: Optional[list[str]] = None,
     role: Optional[str] = None,
+    secondary_roles: Optional[str] = None,
     warehouse: Optional[str] = None,
     tags: bool = True,
     quality: bool = False,
@@ -1086,6 +1108,11 @@ def import_snowflake_api(
     """
     if not (database and schema):
         raise SnowflakeImportError("database and schema are required.")
+
+    try:
+        normalized_secondary_roles = normalize_secondary_roles(secondary_roles)
+    except ValueError as exc:
+        raise SnowflakeImportError(str(exc))
 
     # Raises SnowflakeAuthError (400) / LocalCredentialsDisabled (403) before we
     # touch the network.
@@ -1118,6 +1145,12 @@ def import_snowflake_api(
         conn = snowflake.connector.connect(**conn_kwargs)
     except Exception as exc:
         raise SnowflakeImportError(connection_error_message(exc))
+
+    try:
+        configure_secondary_roles(conn, normalized_secondary_roles)
+    except Exception as exc:
+        conn.close()
+        raise SnowflakeImportError(f"Snowflake session configuration failed: {exc}")
 
     try:
         return _contract_from_connection(

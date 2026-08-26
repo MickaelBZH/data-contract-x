@@ -69,14 +69,15 @@ class ApplyError(Exception):
     """An apply-time failure with a user-actionable message."""
 
 
-# Snowflake connector kwarg → env var name. The connector itself doesn't
-# auto-read these, so we resolve them here.
+# Snowflake runtime setting → env var name. The connector itself doesn't
+# auto-read connection values; secondary_roles is configured after connecting.
 _ENV_VARS: dict[str, str] = {
     "user":                  "SNOWFLAKE_USER",
     "password":              "SNOWFLAKE_PASSWORD",
     "account":               "SNOWFLAKE_ACCOUNT",
     "role":                  "SNOWFLAKE_ROLE",
     "warehouse":             "SNOWFLAKE_WAREHOUSE",
+    "secondary_roles":       "SNOWFLAKE_SECONDARY_ROLES",
     "database":              "SNOWFLAKE_DATABASE",
     "schema":                "SNOWFLAKE_SCHEMA",
     "authenticator":         "SNOWFLAKE_AUTHENTICATOR",
@@ -99,6 +100,79 @@ def _first(*candidates: Optional[str]) -> Optional[str]:
         if c is not None and c != "":
             return c
     return None
+
+
+_SECONDARY_ROLE_IDENTIFIER = re.compile(
+    r'(?:[A-Za-z_][A-Za-z0-9_$]*|"(?:[^"]|"")*")'
+)
+
+
+def _split_secondary_role_identifiers(value: str) -> list[str]:
+    """Split a comma-separated identifier list without splitting quoted names."""
+    identifiers: list[str] = []
+    current: list[str] = []
+    quoted = False
+    index = 0
+    while index < len(value):
+        char = value[index]
+        current.append(char)
+        if char == '"':
+            if quoted and index + 1 < len(value) and value[index + 1] == '"':
+                current.append('"')
+                index += 1
+            else:
+                quoted = not quoted
+        elif char == "," and not quoted:
+            current.pop()
+            identifiers.append("".join(current).strip())
+            current = []
+        index += 1
+
+    if quoted:
+        raise ValueError("secondary_roles contains an unterminated quoted role name")
+    identifiers.append("".join(current).strip())
+    return identifiers
+
+
+def normalize_secondary_roles(secondary_roles: Optional[str]) -> Optional[str]:
+    """Return a safe Snowflake `USE SECONDARY ROLES` argument, or ``None``."""
+    if secondary_roles is None:
+        return None
+    if not isinstance(secondary_roles, str):
+        raise ValueError("secondary_roles must be a string")
+
+    value = secondary_roles.strip()
+    if not value:
+        raise ValueError("secondary_roles must be ALL, NONE, or Snowflake role names")
+
+    keyword = value.upper()
+    if keyword in {"ALL", "NONE"}:
+        return keyword
+
+    if any(token in value for token in (";", "--", "/*", "*/")):
+        raise ValueError("secondary_roles must contain only Snowflake role names")
+
+    identifiers = _split_secondary_role_identifiers(value)
+    if not identifiers or any(not identifier for identifier in identifiers):
+        raise ValueError("secondary_roles must contain one or more Snowflake role names")
+    if any(not _SECONDARY_ROLE_IDENTIFIER.fullmatch(identifier) for identifier in identifiers):
+        raise ValueError("secondary_roles must contain only valid Snowflake role names")
+    if any(identifier[0] != '"' and identifier.upper() in {"ALL", "NONE"} for identifier in identifiers):
+        raise ValueError("secondary_roles ALL and NONE must be used alone")
+    return ",".join(identifiers)
+
+
+def configure_secondary_roles(conn, secondary_roles: Optional[str]) -> None:
+    """Configure an explicitly requested Snowflake secondary-role mode."""
+    value = normalize_secondary_roles(secondary_roles)
+    if value is None:
+        return
+
+    cur = conn.cursor()
+    try:
+        cur.execute(f"USE SECONDARY ROLES {value}")
+    finally:
+        cur.close()
 
 
 def profile_conn_kwargs(
@@ -314,6 +388,7 @@ def apply_snowflake(
     server_name: Optional[str] = None,
     user: Optional[str] = None,
     role: Optional[str] = None,
+    secondary_roles: Optional[str] = None,
     warehouse: Optional[str] = None,
     account: Optional[str] = None,
     authenticator: Optional[str] = None,
@@ -340,6 +415,13 @@ def apply_snowflake(
     `strict=True` drift raises `ApplyError` and nothing is executed. Raises
     `ApplyError` on connection/configuration problems.
     """
+    try:
+        normalized_secondary_roles = normalize_secondary_roles(
+            _first(secondary_roles, os.environ.get(_ENV_VARS["secondary_roles"]))
+        )
+    except ValueError as exc:
+        raise ApplyError(str(exc))
+
     sql = to_snowflake_full_sql(
         contract,
         **ddl_mode.to_sql_kwargs(),
@@ -395,7 +477,12 @@ def apply_snowflake(
             )
 
     statements_executed, warnings = _connect_apply(
-        sql, conn_kwargs, contract=contract, server_name=server_name, strict=strict,
+        sql,
+        conn_kwargs,
+        secondary_roles=normalized_secondary_roles,
+        contract=contract,
+        server_name=server_name,
+        strict=strict,
     )
     return {
         "dry_run": False,
@@ -413,6 +500,7 @@ def apply_snowflake_api(
     server_name: Optional[str] = None,
     account: Optional[str] = None,
     role: Optional[str] = None,
+    secondary_roles: Optional[str] = None,
     warehouse: Optional[str] = None,
     dry_run: bool = False,
     # SQL-generation options. `auto` (default) creates missing tables and governs
@@ -439,6 +527,11 @@ def apply_snowflake_api(
 
     `dry_run=True` returns the SQL without connecting, so it needs no `auth`.
     """
+    try:
+        normalized_secondary_roles = normalize_secondary_roles(secondary_roles)
+    except ValueError as exc:
+        raise ApplyError(str(exc))
+
     srv = _find_snowflake_server(contract, server_name)
     account = account or (srv.account if srv else None)
     warehouse = warehouse or (srv.warehouse if srv else None)
@@ -489,7 +582,12 @@ def apply_snowflake_api(
         conn_kwargs["schema"] = srv.schema_
 
     statements_executed, warnings = _connect_apply(
-        sql, conn_kwargs, contract=contract, server_name=server_name, strict=strict,
+        sql,
+        conn_kwargs,
+        secondary_roles=normalized_secondary_roles,
+        contract=contract,
+        server_name=server_name,
+        strict=strict,
     )
     return {
         "dry_run": False,
@@ -595,6 +693,7 @@ def _connect_apply(
     sql: str,
     conn_kwargs: dict[str, Any],
     *,
+    secondary_roles: Optional[str] = None,
     contract: Optional[OpenDataContractStandard] = None,
     server_name: Optional[str] = None,
     check_drift: bool = True,
@@ -623,6 +722,11 @@ def _connect_apply(
         raise ApplyError(connection_error_message(exc))
 
     try:
+        try:
+            configure_secondary_roles(conn, secondary_roles)
+        except Exception as exc:
+            raise ApplyError(f"Snowflake session configuration failed: {exc}")
+
         warnings: list[str] = []
         if check_drift and contract is not None:
             try:
@@ -681,6 +785,10 @@ def apply_snowflake_command(
     ] = None,
     role: Annotated[
         Optional[str], typer.Option(help="Snowflake role to assume."),
+    ] = None,
+    secondary_roles: Annotated[
+        Optional[str],
+        typer.Option(help="Secondary roles: ALL, NONE, or comma-separated role names (or SNOWFLAKE_SECONDARY_ROLES)."),
     ] = None,
     warehouse: Annotated[
         Optional[str], typer.Option(help="Override warehouse from contract."),
@@ -785,6 +893,7 @@ def apply_snowflake_command(
             contract,
             server_name=server,
             user=user, role=role,
+            secondary_roles=secondary_roles,
             warehouse=warehouse, account=account,
             authenticator=authenticator,
             connection_name=connection_name,

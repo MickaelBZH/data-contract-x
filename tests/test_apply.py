@@ -4,7 +4,12 @@ import pytest
 from open_data_contract_standard.model import OpenDataContractStandard
 from typer.testing import CliRunner
 
-from dcx.apply.snowflake import ApplyError, _resolve_connection_params
+from dcx.apply.snowflake import (
+    ApplyError,
+    _resolve_connection_params,
+    configure_secondary_roles,
+    normalize_secondary_roles,
+)
 from dcx.cli import app
 
 runner = CliRunner()
@@ -220,6 +225,77 @@ class _MockConn:
         self.closed = True
 
 
+def test_configure_secondary_roles_normalizes_and_closes_cursor():
+    state: dict = {"executed": []}
+    conn = _MockConn(state)
+
+    configure_secondary_roles(conn, "all")
+
+    assert state["executed"] == ["USE SECONDARY ROLES ALL"]
+    assert conn.cursors[0].closed is True
+
+
+def test_configure_secondary_roles_none_is_explicit_and_unset_is_a_noop():
+    state: dict = {"executed": []}
+    conn = _MockConn(state)
+
+    configure_secondary_roles(conn, None)
+    configure_secondary_roles(conn, "none")
+
+    assert state["executed"] == ["USE SECONDARY ROLES NONE"]
+
+
+@pytest.mark.parametrize(("value", "expected"), [
+    (" ALL ", "ALL"),
+    ("none", "NONE"),
+    ("DATA_READER", "DATA_READER"),
+    ("DATA_READER, DATA_STEWARD", "DATA_READER,DATA_STEWARD"),
+    ('"Finance Reader"', '"Finance Reader"'),
+    ('"Finance ""Steward"""', '"Finance ""Steward"""'),
+    ('"ALL", ROLE_A', '"ALL",ROLE_A'),
+    ('ROLE_A, "NONE"', 'ROLE_A,"NONE"'),
+])
+def test_normalize_secondary_roles_accepts_snowflake_syntax(value, expected):
+    assert normalize_secondary_roles(value) == expected
+
+
+def test_configure_secondary_roles_accepts_named_roles():
+    state: dict = {"executed": []}
+    conn = _MockConn(state)
+
+    configure_secondary_roles(conn, 'DATA_READER, "Finance Reader"')
+
+    assert state["executed"] == ['USE SECONDARY ROLES DATA_READER,"Finance Reader"']
+
+
+def test_configure_secondary_roles_rejects_invalid_value_without_sql():
+    state: dict = {"executed": []}
+    conn = _MockConn(state)
+
+    with pytest.raises(ValueError, match="only Snowflake role names"):
+        configure_secondary_roles(conn, "NONE; DROP TABLE x")
+
+    assert state["executed"] == []
+    assert conn.cursors == []
+
+
+@pytest.mark.parametrize("value", ["ALL, ROLE_A", "ROLE_A, NONE", "all,NONE"])
+def test_configure_secondary_roles_rejects_mixed_modes_without_sql(value):
+    state: dict = {"executed": []}
+    conn = _MockConn(state)
+
+    with pytest.raises(ValueError, match="ALL and NONE must be used alone"):
+        configure_secondary_roles(conn, value)
+
+    assert state["executed"] == []
+    assert conn.cursors == []
+
+
+def test_normalize_secondary_roles_rejects_non_string_values():
+    with pytest.raises(ValueError, match="must be a string"):
+        normalize_secondary_roles(1)
+
+
 @pytest.fixture
 def mock_snowflake_connector(monkeypatch):
     """Patch snowflake.connector.connect to capture its kwargs and return a fake conn."""
@@ -227,7 +303,7 @@ def mock_snowflake_connector(monkeypatch):
 
     def fake_connect(**kwargs):
         state["connect_kwargs"] = kwargs
-        return _MockConn(state)
+        return _MockConn(state, errors=state.get("errors"))
 
     import snowflake.connector as _connector_module
     monkeypatch.setattr(_connector_module, "connect", fake_connect)
@@ -287,6 +363,44 @@ def test_apply_executes_against_connector(tmp_path, mock_snowflake_connector, mo
     # Summary line printed to stderr
     assert "Applied" in result.output
     assert "ENTERPRISE" in result.output
+
+
+def test_apply_configures_secondary_roles_before_drift_and_ddl(
+    mock_snowflake_connector, monkeypatch,
+):
+    from dcx.apply.snowflake import apply_snowflake
+
+    monkeypatch.setenv("SNOWFLAKE_USER", "me")
+    apply_snowflake(_contract(), secondary_roles="none")
+
+    executed = mock_snowflake_connector["executed"]
+    assert executed.count("USE SECONDARY ROLES NONE") == 1
+    assert executed[0] == "USE SECONDARY ROLES NONE"
+
+
+def test_apply_secondary_role_failure_stops_before_drift_and_ddl(
+    mock_snowflake_connector, monkeypatch,
+):
+    from dcx.apply.snowflake import apply_snowflake
+
+    monkeypatch.setenv("SNOWFLAKE_USER", "me")
+    mock_snowflake_connector["errors"] = {"USE SECONDARY ROLES ALL": RuntimeError("not allowed")}
+
+    with pytest.raises(ApplyError, match="session configuration failed: not allowed"):
+        apply_snowflake(_contract(), secondary_roles="ALL")
+
+    assert mock_snowflake_connector["executed"] == []
+
+
+def test_apply_rejects_invalid_secondary_roles_before_connect(mock_snowflake_connector, monkeypatch):
+    from dcx.apply.snowflake import apply_snowflake
+
+    monkeypatch.setenv("SNOWFLAKE_USER", "me")
+
+    with pytest.raises(ApplyError, match="only Snowflake role names"):
+        apply_snowflake(_contract(), secondary_roles="NONE; DROP TABLE x")
+
+    assert mock_snowflake_connector["connect_kwargs"] is None
 
 
 def test_apply_propagates_connector_error(tmp_path, monkeypatch):
@@ -798,13 +912,50 @@ def test_api_apply_executes_with_bearer_token(monkeypatch):
     r = _api_client().post(
         "/apply/snowflake",
         headers={"Authorization": "Bearer tok-xyz"},
-        json={"contract": _API_CONTRACT, "options": {"include_quality": False}},
+        json={
+            "contract": _API_CONTRACT,
+            "options": {"include_quality": False, "secondary_roles": " data_reader,DATA_STEWARD "},
+        },
     )
     assert r.status_code == 200, r.text
     assert captured["auth"].token.get_secret_value() == "tok-xyz"
     assert captured["ddl_mode"] == apply_module.DdlMode.auto   # auto default
     assert captured["include_quality"] is False
+    assert captured["secondary_roles"] == "data_reader,DATA_STEWARD"
     assert r.json()["statements_executed"] == 1
+
+
+def test_api_apply_rejects_invalid_secondary_roles_before_core_call(monkeypatch):
+    import dcx.apply.snowflake as apply_module
+
+    called = False
+
+    def fake(*args, **kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(apply_module, "apply_snowflake_api", fake)
+    r = _api_client().post(
+        "/apply/snowflake",
+        headers={"Authorization": "Bearer tok-xyz"},
+        json={
+            "contract": _API_CONTRACT,
+            "options": {"secondary_roles": "NONE; DROP TABLE x"},
+        },
+    )
+
+    assert r.status_code == 422
+    assert called is False
+
+
+def test_api_apply_rejects_non_string_secondary_roles():
+    r = _api_client().post(
+        "/apply/snowflake",
+        headers={"Authorization": "Bearer tok-xyz"},
+        json={"contract": _API_CONTRACT, "options": {"secondary_roles": 1}},
+    )
+
+    assert r.status_code == 422
 
 
 def test_api_apply_error_is_502(monkeypatch):
