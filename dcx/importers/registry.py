@@ -23,7 +23,7 @@ from datacontract.imports.importer_factory import importer_factory
 from typing_extensions import Annotated
 
 from dcx.importers.kafka import KafkaImporter
-from dcx.importers.snowflake import SnowflakeImporter
+from dcx.importers.snowflake import SnowflakeImportError, SnowflakeImporter
 
 importer_factory.register_importer("snowflake", SnowflakeImporter)
 importer_factory.register_importer("kafka", KafkaImporter)
@@ -105,25 +105,31 @@ def import_snowflake(
     """
     enable_debug_logging(debug)
     _quiet_aws_credential_noise(debug)
-    result = DataContract.import_from_source(
-        format="snowflake",
-        source=None,
-        database=database,
-        schema=schema,
-        tables=table,
-        account=account,
-        user=user,
-        role=role,
-        secondary_roles=secondary_roles,
-        warehouse=warehouse,
-        authenticator=authenticator,
-        connection_name=connection_name,
-        tags=tags,
-        quality=quality,
-        server_name=server_name,
-        owner=owner,
-        id=id,
-    )
+    try:
+        result = DataContract.import_from_source(
+            format="snowflake",
+            source=None,
+            database=database,
+            schema=schema,
+            tables=table,
+            account=account,
+            user=user,
+            role=role,
+            secondary_roles=secondary_roles,
+            warehouse=warehouse,
+            authenticator=authenticator,
+            connection_name=connection_name,
+            tags=tags,
+            quality=quality,
+            server_name=server_name,
+            owner=owner,
+            id=id,
+        )
+    except SnowflakeImportError as exc:
+        if debug:
+            raise
+        typer.secho(f"Error: {exc}", err=True, fg=typer.colors.RED)
+        raise typer.Exit(1)
     _write_result(result, output)
 
 

@@ -1018,8 +1018,10 @@ def _contract_from_connection(
 
     if not columns:
         raise SnowflakeImportError(
-            f"No columns found in {database}.{schema}"
+            f"No accessible columns found in {database}.{schema}"
             + (f" for tables {tables}." if tables else ".")
+            + " The schema may be empty, or the active primary/secondary roles may lack "
+            "privileges to view its tables and columns."
         )
 
     # Both the tag and DMF lookups are per-entity table functions, so they share one

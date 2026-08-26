@@ -462,6 +462,45 @@ def test_cli_no_password_flag(monkeypatch):
     assert "password" in result.output.lower()
 
 
+def test_cli_snowflake_import_error_is_user_facing(monkeypatch, strip_ansi):
+    from datacontract.data_contract import DataContract
+
+    error = SnowflakeImportError(
+        "No accessible columns found in D.S. The schema may be empty, or the active "
+        "primary/secondary roles may lack privileges to view its tables and columns."
+    )
+    monkeypatch.setattr(
+        DataContract,
+        "import_from_source",
+        staticmethod(lambda *args, **kwargs: (_ for _ in ()).throw(error)),
+    )
+
+    result = runner.invoke(app, ["import", "snowflake", "--database", "D", "--schema", "S"])
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 1
+    assert str(error) in output
+    assert "Traceback" not in output
+
+
+def test_cli_snowflake_import_error_reraises_in_debug_mode(monkeypatch):
+    from datacontract.data_contract import DataContract
+
+    error = SnowflakeImportError("Snowflake metadata query failed: test failure")
+    monkeypatch.setattr(
+        DataContract,
+        "import_from_source",
+        staticmethod(lambda *args, **kwargs: (_ for _ in ()).throw(error)),
+    )
+
+    with pytest.raises(SnowflakeImportError, match="test failure"):
+        runner.invoke(
+            app,
+            ["import", "snowflake", "--database", "D", "--schema", "S", "--debug"],
+            catch_exceptions=False,
+        )
+
+
 def test_cli_quiets_botocore_credential_noise(monkeypatch):
     import logging
     from datacontract.data_contract import DataContract
