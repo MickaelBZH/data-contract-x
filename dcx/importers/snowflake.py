@@ -51,6 +51,8 @@ from dcx.snowflake_auth import (
 
 logger = logging.getLogger(__name__)
 
+logger = logging.getLogger(__name__)
+
 
 class SnowflakeImportError(Exception):
     """A live-import failure with a user-actionable message."""

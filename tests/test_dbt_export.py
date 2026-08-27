@@ -345,6 +345,164 @@ def test_api_export_dbt():
     assert doc["models"][0]["columns"][1]["config"]["meta"]["data_classification"] == "PD_DATA"
 
 
+# === Quality → data_tests ====================================================
+
+
+def _quality_contract(schema_quality: list = (), column_quality: list = ()) -> OpenDataContractStandard:
+    """Build a one-table, one-column contract with `quality:` blocks inserted at the
+    schema-object and/or column level. Each argument is a list of already-relative
+    YAML lines for a `quality:` block (e.g. `["quality:", "  - type: library", ...]`),
+    indented here to the right absolute column — avoids fragile nested `dedent()`
+    calls when the block is empty vs. populated.
+    """
+    lines = [
+        "apiVersion: v3.1.0", "kind: DataContract", "id: q", "name: Q",
+        "version: 1.0.0", "status: draft",
+        "schema:", "  - name: ORDERS", "    physicalType: table",
+    ]
+    lines.extend(f"    {line}" for line in schema_quality)
+    lines.extend(["    properties:", "      - name: amount", "        logicalType: number"])
+    lines.extend(f"        {line}" for line in column_quality)
+    return OpenDataContractStandard.from_string("\n".join(lines) + "\n")
+
+
+def test_null_values_must_be_zero_becomes_not_null():
+    contract = _quality_contract(column_quality=[
+        "quality:", "  - type: library", "    metric: nullValues", "    mustBe: 0",
+    ])
+    doc = yamllib.safe_load(to_dbt_yaml(contract, kind=DbtKind.models))
+    assert "not_null" in _column(doc, "amount")["data_tests"]
+
+
+def test_blank_count_must_be_zero_becomes_not_empty_string():
+    contract = _quality_contract(column_quality=[
+        "quality:", "  - type: library", "    metric: blankCount", "    mustBe: 0",
+    ])
+    doc = yamllib.safe_load(to_dbt_yaml(contract, kind=DbtKind.models))
+    assert "dbt_utils.not_empty_string" in _column(doc, "amount")["data_tests"]
+
+
+def test_sql_blank_count_check_becomes_not_empty_string():
+    contract = _quality_contract(column_quality=[
+        "quality:", "  - type: sql", "    query: select count(*) from ${table}",
+        "    mustBe: 0", "    customProperties:",
+        "      - property: check", "        value: blankCount",
+    ])
+    doc = yamllib.safe_load(to_dbt_yaml(contract, kind=DbtKind.models))
+    assert "dbt_utils.not_empty_string" in _column(doc, "amount")["data_tests"]
+
+
+def test_quality_tests_are_additive_to_required_and_unique_flags():
+    contract = _quality_contract(column_quality=[
+        "required: true", "unique: true", "quality:",
+        "  - type: library", "    metric: blankCount", "    mustBe: 0",
+        "  - type: library", "    metric: nullValues", "    mustBe: 0",
+        "  - type: library", "    metric: duplicateValues", "    mustBe: 0",
+    ])
+    doc = yamllib.safe_load(to_dbt_yaml(contract, kind=DbtKind.models))
+    tests = _column(doc, "amount")["data_tests"]
+    assert "not_null" in tests
+    assert "unique" in tests
+    assert "dbt_utils.not_empty_string" in tests
+
+
+def test_null_values_with_threshold_becomes_model_level_expression():
+    contract = _quality_contract(column_quality=[
+        "quality:", "  - type: library", "    metric: nullValues", "    mustBeLessOrEqualTo: 5",
+    ])
+    doc = yamllib.safe_load(to_dbt_yaml(contract, kind=DbtKind.models))
+    model = doc["models"][0]
+    assert {"dbt_utils.expression_is_true": {
+        "expression": "(select count(*) from {{ this }} where amount is null) <= 5",
+    }} in model["data_tests"]
+    # not on the column — it's an aggregate check, not a per-row one
+    col_tests = _column(doc, "amount").get("data_tests", [])
+    assert "not_null" not in col_tests
+
+
+def test_duplicate_values_must_be_zero_becomes_unique():
+    contract = _quality_contract(column_quality=[
+        "quality:", "  - type: library", "    metric: duplicateValues", "    mustBe: 0",
+    ])
+    doc = yamllib.safe_load(to_dbt_yaml(contract, kind=DbtKind.models))
+    assert "unique" in _column(doc, "amount")["data_tests"]
+
+
+def test_duplicate_values_with_threshold_becomes_model_level_expression():
+    contract = _quality_contract(column_quality=[
+        "quality:", "  - type: library", "    metric: duplicateValues", "    mustBeLessOrEqualTo: 3",
+    ])
+    doc = yamllib.safe_load(to_dbt_yaml(contract, kind=DbtKind.models))
+    tests = doc["models"][0]["data_tests"]
+    assert any(
+        "group by amount having count(*) > 1" in t.get("dbt_utils.expression_is_true", {}).get("expression", "")
+        for t in tests
+    )
+
+
+def test_row_count_becomes_model_level_expression():
+    contract = _quality_contract(schema_quality=[
+        "quality:", "  - type: library", "    metric: rowCount", "    mustBeGreaterThan: 0",
+    ])
+    doc = yamllib.safe_load(to_dbt_yaml(contract, kind=DbtKind.models))
+    assert {"dbt_utils.expression_is_true": {
+        "expression": "(select count(*) from {{ this }}) > 0",
+    }} in doc["models"][0]["data_tests"]
+
+
+def test_type_sql_rule_becomes_model_level_expression_with_operator():
+    contract = _quality_contract(schema_quality=[
+        "quality:", "  - type: sql",
+        '    query: "select count(*) from ${table} where amount < 0"',
+        "    mustBe: 0",
+    ])
+    doc = yamllib.safe_load(to_dbt_yaml(contract, kind=DbtKind.models))
+    assert {"dbt_utils.expression_is_true": {
+        "expression": "(select count(*) from {{ this }} where amount < 0) = 0",
+    }} in doc["models"][0]["data_tests"]
+
+
+def test_type_custom_dbt_engine_passes_implementation_through():
+    contract = _quality_contract(schema_quality=[
+        "quality:", "  - type: custom", "    engine: dbt", "    implementation:",
+        "      dbt_utils.equal_rowcount:", "        arguments:",
+        "          compare_model: \"ref('other_table')\"",
+    ])
+    doc = yamllib.safe_load(to_dbt_yaml(contract, kind=DbtKind.models))
+    tests = doc["models"][0]["data_tests"]
+    assert any("dbt_utils.equal_rowcount" in t for t in tests)
+
+
+def test_type_custom_non_dbt_engine_warns_instead_of_silently_dropping():
+    contract = _quality_contract(schema_quality=[
+        "quality:", "  - type: custom", "    engine: snowflake",
+        "    implementation: MY_DB.GOV.SOME_DMF",
+    ])
+    sql = to_dbt_yaml(contract, kind=DbtKind.models)
+    assert "# WARNING:" in sql
+    assert "engine=snowflake" in sql
+    doc = yamllib.safe_load(sql)
+    assert "data_tests" not in doc["models"][0]
+
+
+def test_unmapped_metric_warns_instead_of_silently_dropping():
+    contract = _quality_contract(column_quality=[
+        "quality:", "  - type: library", "    metric: someUnknownMetric",
+    ])
+    sql = to_dbt_yaml(contract, kind=DbtKind.models)
+    assert "# WARNING:" in sql
+    assert "someUnknownMetric" in sql
+
+
+def test_quality_mapping_applies_to_sources_too():
+    contract = _quality_contract(column_quality=[
+        "quality:", "  - type: library", "    metric: nullValues", "    mustBe: 0",
+    ])
+    doc = yamllib.safe_load(to_dbt_yaml(contract, kind=DbtKind.sources))
+    col = _column(doc, "amount", kind="sources")
+    assert "not_null" in col["data_tests"]
+
+
 # === Back-compat ============================================================
 
 
