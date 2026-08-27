@@ -1186,9 +1186,9 @@ def test_real_expectation_expressions_parse_verbatim():
     assert _operator_from_expectation("VALUE < 86400") == ("mustBeLessThan", 86400)
 
 
-def test_second_expectation_on_one_association_is_reported(monkeypatch, capsys):
-    """Real state on a live table: one association carried both a hand-made
-    EXP__CUSTOMER_ID__NONULLS and a second expectation. ODCS holds one operator."""
+def test_multiple_expectations_on_one_association_become_separate_rules(monkeypatch, capsys):
+    """One association can carry several expectations (e.g. two thresholds). Each imports
+    as its own ODCS rule — one operator per rule — instead of collapsing to the first."""
     import dcx.importers.snowflake as si
 
     class _Cur(_FakeCursor):
@@ -1198,7 +1198,7 @@ def test_second_expectation_on_one_association_is_reported(monkeypatch, capsys):
                 self.description = [(c,) for c in _EXPECTATION_COLUMNS]
                 self._rows = [
                     ("523a27cf", "EXP__CUSTOMER_ID__NONULLS", "VALUE = 0"),
-                    ("523a27cf", "EXP__DCX__PROBE", "VALUE = 0"),
+                    ("523a27cf", "EXP__DCX__PROBE", "VALUE < 100"),
                 ] if mine else []
                 return
             if "DATA_METRIC_FUNCTION_REFERENCES" in sql:
@@ -1215,9 +1215,62 @@ def test_second_expectation_on_one_association_is_reported(monkeypatch, capsys):
 
     monkeypatch.setattr(si, "_connect", lambda import_args: _Conn(_fake_data()))
     contract = import_snowflake({"database": "DB", "schema": "SCH", "account": "ACME", "quality": True})
-    rule = {p.name: p for p in _obj(contract).properties}["ID"].quality[0]
-    assert rule.mustBe == 0
-    assert "2 expectations" in capsys.readouterr().err
+    rules = {p.name: p for p in _obj(contract).properties}["ID"].quality
+    assert len(rules) == 2
+    assert all(r.metric == "nullValues" for r in rules)
+    assert any(r.mustBe == 0 for r in rules)
+    assert any(r.mustBeLessThan == 100 for r in rules)
+    assert "expectations" not in capsys.readouterr().err
+
+
+def test_multiple_same_metric_rules_and_slas_pass_odcs_schema():
+    """The expectation-expansion emits multiple same-metric quality rules and multiple
+    `latency` SLAs on one table. Both must validate against the ODCS 3.1.0 JSON schema —
+    the exact schema datacontract-cli lints against — so the change stays ODCS-valid."""
+    import importlib.resources as resources
+    import json
+
+    import jsonschema
+
+    instance = {
+        "apiVersion": "v3.1.0",
+        "kind": "DataContract",
+        "id": "db.sch",
+        "name": "SCH",
+        "version": "1.0.0",
+        "status": "draft",
+        "servers": [
+            {"server": "production", "type": "snowflake",
+             "account": "ACME", "database": "DB", "schema": "SCH"},
+        ],
+        "schema": [
+            {
+                "name": "T",
+                "physicalType": "table",
+                "quality": [
+                    {"type": "library", "metric": "rowCount", "mustBeGreaterThan": 0},
+                    {"type": "library", "metric": "rowCount", "mustBeGreaterThan": 5},
+                ],
+                "properties": [
+                    {
+                        "name": "EMAIL", "physicalType": "VARCHAR", "logicalType": "string",
+                        "quality": [
+                            {"type": "library", "metric": "nullValues", "mustBe": 0},
+                            {"type": "library", "metric": "nullValues", "mustBeLessThan": 100},
+                        ],
+                    },
+                ],
+            },
+        ],
+        "slaProperties": [
+            {"property": "latency", "value": 86400, "unit": "s", "element": "DB.SCH.T"},
+            {"property": "latency", "value": 1209600, "unit": "s", "element": "DB.SCH.T"},
+        ],
+    }
+    schema_path = resources.files("datacontract").joinpath("schemas", "odcs-3.1.0.schema.json")
+    schema = json.loads(schema_path.read_text())
+    # Raises jsonschema.ValidationError if the same-metric / same-SLA multiplicity is rejected.
+    jsonschema.validate(instance=instance, schema=schema)
 
 
 # === Query failures surface as SnowflakeImportError, not a 500 ==============
