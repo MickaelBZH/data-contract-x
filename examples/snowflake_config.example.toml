@@ -1,0 +1,87 @@
+# ---------------------------------------------------------------------------
+# Example Snowflake connection config for dcx.
+#
+# This is snowflake-connector-python's OWN format (`config.toml`) — dcx defines
+# no config file of its own and never parses this one. `--connection-name <name>`
+# simply hands the name to the connector, which reads the file itself.
+#
+# Every value below is a placeholder. Replace them, and never commit real
+# credentials: this file is an example, not a live config.
+# ---------------------------------------------------------------------------
+#
+# WHERE THE CONNECTOR LOOKS FOR IT
+#   1. $SNOWFLAKE_HOME, if that directory exists (defaults to ~/.snowflake/)
+#   2. otherwise the platform config dir — ~/.config/snowflake/ on Linux,
+#      ~/Library/Application Support/snowflake/ on macOS
+#   Print the path your install resolves:
+#     python -c "from snowflake.connector.constants import CONFIG_FILE; print(CONFIG_FILE)"
+#
+# USING THIS FILE
+#   Throwaway, without touching your home dir:
+#     mkdir -p /tmp/sfhome
+#     cp examples/snowflake_config.example.toml /tmp/sfhome/config.toml
+#     chmod 0600 /tmp/sfhome/config.toml          # or the connector warns
+#     export SNOWFLAKE_HOME=/tmp/sfhome
+#     dcx apply snowflake tests/vehicle_telemetry_contract.yaml --dry-run
+#
+#   Or install it for real:
+#     mkdir -p ~/.snowflake && cp examples/snowflake_config.example.toml ~/.snowflake/config.toml
+#     chmod 0600 ~/.snowflake/config.toml
+#
+# HOW dcx PICKS A PROFILE
+#   dcx apply snowflake contract.yaml --connection-name sso   # this profile
+#   dcx apply snowflake contract.yaml                         # default_connection_name
+#   Setting any of --account/--user or SNOWFLAKE_* opts out of the profile
+#   entirely and resolves the connection from flags → env → contract instead.
+#
+# WHAT THE PROFILE DOES *NOT* CONTROL
+#   Where objects land. Generated SQL is qualified DATABASE.SCHEMA.OBJECT from
+#   the contract's server block, so a profile only decides who you connect as.
+#   Pick the target with --server <name> against the contract's server blocks.
+
+# Used when no profile is named and nothing else identifies a connection.
+default_connection_name = "dev"
+
+
+# --- Key-pair (recommended for automation) ---------------------------------
+[connections.dev]
+account = "myorg-myaccount"          # or the legacy xy12345.eu-central-1 form
+user = "SVC_DCX"
+authenticator = "SNOWFLAKE_JWT"
+# NOTE: an absolute path. The connector opens this file directly and does NOT
+# expand `~`, so a tilde path fails with "No such file or directory".
+private_key_file = "/home/me/.snowflake/rsa_key.p8"
+# private_key_file_pwd = "..."       # only if the key is encrypted
+role = "TRANSFORMER"
+warehouse = "DEV_WH"
+database = "MY_DB"                   # session context only — see the note above
+schema = "LOAD"
+
+
+# --- Browser SSO (interactive; CLI only, never the API) ---------------------
+[connections.sso]
+account = "myorg-myaccount"
+user = "first.last@example.com"
+authenticator = "externalbrowser"
+role = "ANALYST"
+warehouse = "DEV_WH"
+
+
+# --- Password --------------------------------------------------------------
+# Snowflake is phasing out single-factor password sign-in; prefer key-pair.
+[connections.pw]
+account = "myorg-myaccount"
+user = "SVC_DCX"
+password = "replace-me"
+role = "TRANSFORMER"
+warehouse = "DEV_WH"
+
+
+# --- OAuth token -----------------------------------------------------------
+# The API's `auth: {"type": "oauth"}` is the same method, supplied per request
+# instead of from a file.
+[connections.oauth]
+account = "myorg-myaccount"
+authenticator = "oauth"
+token = "replace-me"
+warehouse = "DEV_WH"

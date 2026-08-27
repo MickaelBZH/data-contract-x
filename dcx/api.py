@@ -37,11 +37,17 @@ from typing import Any, Dict, Optional, Union
 import typer
 from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
 from open_data_contract_standard.model import OpenDataContractStandard
-from pydantic import BaseModel, ConfigDict, Field, create_model
+from pydantic import BaseModel, ConfigDict, Field, create_model, field_validator
 
 from dcx import enrich as enrich_module
 from dcx import yaml_style  # noqa: F401  multi-line strings dump as block scalars
-from dcx.apply.snowflake import DdlMode
+from dcx.apply.snowflake import DdlMode, normalize_secondary_roles
+from dcx.snowflake_auth import (
+    LocalCredentialsDisabled,
+    OAuthAuth,
+    SnowflakeAuth,
+    SnowflakeAuthError,
+)
 from dcx.target import command as target_module
 
 # Many CLI flags (`--schema`, etc.) intentionally shadow Pydantic BaseModel attributes
@@ -184,8 +190,9 @@ class ErrorResponse(BaseModel):
 
 
 _ERROR_DESCRIPTIONS = {
-    400: "Invalid request — e.g. a malformed contract, tag catalog, or source document.",
-    401: "Missing or invalid authentication token.",
+    400: "Invalid request — e.g. a malformed contract, tag catalog, source document, or unusable credentials (bad key material, wrong passphrase, empty token).",
+    401: "Missing or invalid credentials.",
+    403: "The credential method is disabled on this server.",
     409: "The requested change conflicts with the existing contract.",
     500: "Internal error while capturing the command result.",
     502: "Upstream failure — the LLM provider or Snowflake returned an error.",
@@ -798,12 +805,39 @@ def _contract_to_yaml_string(value: Any) -> str:
     )
 
 
-# === Live Snowflake import (caller-supplied OAuth) ==========================
+# === Live Snowflake import (caller-supplied credentials) ====================
 # Unlike the file-based importers, this is exposed with per-caller auth: the
-# caller sends their own Snowflake OAuth bearer token in the `Authorization`
-# header, so the server connects on their behalf and never uses ambient/server
-# credentials. (The CLI `import snowflake` supports more auth methods, including
-# interactive externalbrowser, which make no sense server-side.)
+# credentials ride on the request — an `auth` block (oauth / key_pair /
+# password) or, for oauth, the `Authorization: Bearer` header — so the server
+# connects on the caller's behalf and never uses ambient/server credentials.
+# `auth.type: config` is the one exception and is disabled unless the
+# server was started with `--allow-local-credentials`; see `dcx.snowflake_auth`.
+# (The CLI's `--authenticator externalbrowser` has no server-side meaning: the
+# browser would have to open on the API host.)
+
+
+_AUTH_FIELD_TYPE = Optional[SnowflakeAuth]
+
+# Shown as the request body's `auth` in Swagger "Try it out". A discriminated union
+# has no default shape, so without this Swagger fills `{}` and every Execute fails
+# with `union_tag_not_found` before reaching our code.
+_AUTH_EXAMPLE = {"type": "oauth", "token": "<snowflake-oauth-token>"}
+
+
+def _auth_field(tail: str):
+    """The `auth` field, described identically on every live-Snowflake endpoint."""
+    return Field(
+        None,
+        description=(
+            "Credentials for this request, tagged by `type`: `oauth` (`token`), "
+            "`key_pair` (`user`, `private_key`, `private_key_passphrase?`), "
+            "`password` (`user`, `password`), or `config` (`connection_name` — a profile "
+            "from the server's own Snowflake config, or its default if omitted; "
+            "403 unless the server runs with `--allow-local-credentials`). "
+            "`type` is required — an empty object is rejected with 422. " + tail
+        ),
+        json_schema_extra={"example": _AUTH_EXAMPLE},
+    )
 
 
 def _bearer_token(authorization: Optional[str]) -> Optional[str]:
@@ -815,68 +849,140 @@ def _bearer_token(authorization: Optional[str]) -> Optional[str]:
     return None
 
 
+def _resolve_auth(body_auth, authorization: Optional[str]):
+    """Pick the credentials for a live-Snowflake request.
+
+    The body's `auth` block wins; a bearer header is the shorthand for
+    `{"type": "oauth"}` and keeps pre-`auth` callers working. Returns None when
+    the request carries no credentials at all (the caller decides whether that
+    is fatal — `apply` allows it for `dry_run`).
+    """
+    if body_auth is not None:
+        return body_auth
+    token = _bearer_token(authorization)
+    return OAuthAuth(type="oauth", token=token) if token else None
+
+
+# Credential problems are the caller's to fix, so they are 4xx rather than the
+# 502 used for "Snowflake said no": 403 when the server forbids the method,
+# 400 for unusable material (bad PEM, wrong passphrase, empty token).
+def _auth_http_error(exc: SnowflakeAuthError) -> HTTPException:
+    status = 403 if isinstance(exc, LocalCredentialsDisabled) else 400
+    return HTTPException(status_code=status, detail=str(exc))
+
+
+_MISSING_CREDENTIALS = (
+    "Provide credentials: an `auth` block in the body, or a Snowflake OAuth "
+    "token via 'Authorization: Bearer <token>'."
+)
+
+
 class SnowflakeImportRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
-    account: str = Field(..., description="Snowflake account identifier.")
+    auth: _AUTH_FIELD_TYPE = _auth_field(
+        "Omit to fall back to the `Authorization: Bearer` header."
+    )
+    account: Optional[str] = Field(
+        None,
+        description=(
+            "Snowflake account identifier. Required except with "
+            "`connection_name` auth, which carries its own."
+        ),
+    )
     schema_: str = Field(..., alias="schema", description="Schema to import.")
     database: str = Field(..., description="Database to import from.")
     tables: Optional[list[str]] = Field(None, description="Limit to these tables. Default: all.")
     role: Optional[str] = Field(None, description="Role to assume.")
+    secondary_roles: Optional[str] = Field(
+        None, description="Secondary roles: ALL, NONE, or comma-separated Snowflake role names."
+    )
     warehouse: Optional[str] = Field(None, description="Warehouse for the queries.")
     tags: bool = Field(True, description="Import object tags as NAME=VALUE.")
+    quality: bool = Field(
+        False,
+        description="Import attached data metric functions as quality rules and SLAs.",
+    )
     server_name: str = Field("production", description="Name for the server entry in the contract.")
+
+    @field_validator("secondary_roles", mode="before")
+    @classmethod
+    def validate_secondary_roles(cls, value):
+        return normalize_secondary_roles(value)
 
 
 def mirror_snowflake_import_to_fastapi(api_app: FastAPI, prefix: str = "/import") -> None:
-    """Register `POST {prefix}/snowflake` authenticated by a caller OAuth token."""
+    """Register `POST {prefix}/snowflake` authenticated by caller-supplied credentials."""
 
     @api_app.post(
         f"{prefix}/snowflake",
         tags=["import"],
-        summary="Import a contract from a live Snowflake schema (OAuth bearer token).",
+        summary="Import a contract from a live Snowflake schema (caller-supplied credentials).",
         response_model=ContractResponse,
-        responses=_contract_responses(401, 502),
+        responses=_contract_responses(400, 401, 403, 502),
     )
     def import_snowflake_endpoint(
         body: SnowflakeImportRequest,
         request: Request,
         authorization: Optional[str] = Header(
-            None, description="Snowflake OAuth token: `Authorization: Bearer <token>`."
+            None,
+            description=(
+                "Snowflake OAuth token: `Authorization: Bearer <token>`. Shorthand "
+                "for `auth: {type: oauth}`; the body's `auth` block wins if both are sent."
+            ),
         ),
         format: Optional[str] = Query(None, description="Response format: `json` (default) or `yaml`."),
     ):
+        """Build an ODCS contract from a live Snowflake schema.
+
+        Reads `INFORMATION_SCHEMA`, primary keys, and — with `tags` — object tags as
+        `NAME=VALUE`. With `quality`, attached data metric functions come back as
+        quality rules and SLAs.
+
+        **Credentials come from the request, never from the server.** Send an `auth`
+        block (`oauth` · `key_pair` · `password`), or an `Authorization: Bearer
+        <token>` header for OAuth. If both are present the body wins.
+
+        `auth.type: config` is different: it uses a profile from the
+        *server's* own Snowflake config, so it is rejected with **403** unless the
+        server was started with `dcx api --allow-local-credentials`.
+
+        `account` is required for every method except `connection_name`, which
+        carries its own.
+        """
         from dcx.importers import snowflake as snowflake_import
 
-        token = _bearer_token(authorization)
-        if not token:
-            raise HTTPException(
-                status_code=401,
-                detail="Provide a Snowflake OAuth token via 'Authorization: Bearer <token>'.",
-            )
+        auth = _resolve_auth(body.auth, authorization)
+        if auth is None:
+            raise HTTPException(status_code=401, detail=_MISSING_CREDENTIALS)
         try:
-            contract = snowflake_import.import_snowflake_oauth(
-                token=token,
+            contract = snowflake_import.import_snowflake_api(
+                auth=auth,
                 account=body.account,
                 database=body.database,
                 schema=body.schema_,
                 tables=body.tables,
                 role=body.role,
+                secondary_roles=body.secondary_roles,
                 warehouse=body.warehouse,
                 tags=body.tags,
+                quality=body.quality,
                 server_name=body.server_name,
             )
+        except SnowflakeAuthError as exc:
+            raise _auth_http_error(exc)
         except snowflake_import.SnowflakeImportError as exc:
             raise HTTPException(status_code=502, detail=str(exc))
 
         return _serialize_response(contract, _wants_yaml(request, format))
 
 
-# === Live Snowflake apply (caller-supplied OAuth) ==========================
+# === Live Snowflake apply (caller-supplied credentials) ====================
 # Closes the loop over HTTP: write tags + data-quality back to the caller's
-# Snowflake using their own OAuth token. Defaults to alter-only (no CREATE
-# TABLE), so it is safe against existing tables. `dry_run` returns the SQL for
-# review and needs no token.
+# Snowflake using their own credentials — the same `auth` block as the import
+# endpoint, or a bearer token. Defaults to alter-only (no CREATE TABLE), so it
+# is safe against existing tables. `dry_run` returns the SQL for review and
+# needs no credentials at all.
 
 
 class ApplySnowflakeRequestOptions(BaseModel):
@@ -888,6 +994,9 @@ class ApplySnowflakeRequestOptions(BaseModel):
     server_name: Optional[str] = Field(None, description="Named server from the contract.")
     account: Optional[str] = Field(None, description="Override account (else from server block).")
     role: Optional[str] = Field(None, description="Role to assume (needs APPLY TAG / table ownership).")
+    secondary_roles: Optional[str] = Field(
+        None, description="Secondary roles: ALL, NONE, or comma-separated Snowflake role names."
+    )
     warehouse: Optional[str] = Field(None, description="Override warehouse (else from server block).")
     dry_run: bool = Field(False, description="Return the SQL without executing (no token needed).")
     ddl_mode: DdlMode = Field(
@@ -925,50 +1034,87 @@ class ApplySnowflakeRequestOptions(BaseModel):
         "USING CRON 0 0 * * * UTC", description="DATA_METRIC_SCHEDULE clause for DMF tables."
     )
 
+    @field_validator("secondary_roles", mode="before")
+    @classmethod
+    def validate_secondary_roles(cls, value):
+        return normalize_secondary_roles(value)
+
 
 # Built with `create_model` (like the auto-generated endpoints) so it reuses the
 # shared `_CONTRACT_FIELD` and lands on the same `{contract, options}` body shape.
+# `auth` is a sibling of `contract`/`options` rather than an option: it is a
+# credential, not a knob on the generated SQL, and `dry_run` needs none.
 ApplySnowflakeRequest = create_model(
     "ApplySnowflakeRequest",
     __config__=ConfigDict(extra="forbid"),
     contract=_CONTRACT_FIELD,
     options=(ApplySnowflakeRequestOptions, ...),
+    auth=(
+        _AUTH_FIELD_TYPE,
+        _auth_field(
+            "Omit to fall back to the `Authorization: Bearer` header, or entirely "
+            "when `options.dry_run` is true."
+        ),
+    ),
 )
 
 
 def mirror_apply_snowflake_to_fastapi(api_app: FastAPI, prefix: str = "/apply") -> None:
-    """Register `POST {prefix}/snowflake` authenticated by a caller OAuth token."""
+    """Register `POST {prefix}/snowflake` authenticated by caller-supplied credentials."""
 
     @api_app.post(
         f"{prefix}/snowflake",
         tags=["apply"],
-        summary="Apply tags + data quality to live Snowflake (OAuth bearer token).",
+        summary="Apply tags + data quality to live Snowflake (caller-supplied credentials).",
         response_model=ApplySnowflakeResponse,
-        responses=_error_responses(401, 502),
+        responses={
+            200: {"description": "The SQL that was generated, and executed unless `dry_run`."},
+            **_error_responses(400, 401, 403, 502),
+        },
     )
     def apply_snowflake_endpoint(
         body: ApplySnowflakeRequest,
         authorization: Optional[str] = Header(
-            None, description="Snowflake OAuth token: `Authorization: Bearer <token>`."
+            None,
+            description=(
+                "Snowflake OAuth token: `Authorization: Bearer <token>`. Shorthand "
+                "for `auth: {type: oauth}`; the body's `auth` block wins if both are sent."
+            ),
         ),
     ):
+        """Execute a contract's governance against a live Snowflake account.
+
+        Generates the SQL — `ddl_mode: auto` creates missing tables and governs
+        existing ones — then runs it, returning the full script for audit plus any
+        schema-drift `warnings`. With `strict`, drift fails the request before
+        anything is executed.
+
+        **Credentials come from the request, never from the server**: the same `auth`
+        block as `/import/snowflake` (`oauth` · `key_pair` · `password`), or an
+        `Authorization: Bearer` header. `auth.type: config` needs the server
+        to run with `--allow-local-credentials`, else **403**. `options.dry_run`
+        returns the SQL without connecting and needs no credentials at all.
+
+        **Where the SQL lands is decided by the contract, not the connection.** Every
+        statement is qualified `DATABASE.SCHEMA.OBJECT` from the contract's Snowflake
+        server block; `options.server_name` picks among several such blocks.
+        Credentials only decide *who* connects.
+        """
         from dcx.apply import snowflake as apply_module
 
         opts = body.options
-        token = _bearer_token(authorization)
-        if not opts.dry_run and not token:
-            raise HTTPException(
-                status_code=401,
-                detail="Provide a Snowflake OAuth token via 'Authorization: Bearer <token>'.",
-            )
+        auth = _resolve_auth(body.auth, authorization)
+        if not opts.dry_run and auth is None:
+            raise HTTPException(status_code=401, detail=_MISSING_CREDENTIALS)
         contract = _parse_contract_input(body.contract)
         try:
-            result = apply_module.apply_snowflake_oauth(
+            result = apply_module.apply_snowflake_api(
                 contract,
-                token=token or "",
+                auth=auth,
                 server_name=opts.server_name,
                 account=opts.account,
                 role=opts.role,
+                secondary_roles=opts.secondary_roles,
                 warehouse=opts.warehouse,
                 dry_run=opts.dry_run,
                 ddl_mode=opts.ddl_mode,
@@ -982,6 +1128,8 @@ def mirror_apply_snowflake_to_fastapi(api_app: FastAPI, prefix: str = "/apply") 
                 tag_namespace_filter=opts.tag_namespace_filter,
                 metric_schedule=opts.metric_schedule,
             )
+        except SnowflakeAuthError as exc:
+            raise _auth_http_error(exc)
         except apply_module.ApplyError as exc:
             raise HTTPException(status_code=502, detail=str(exc))
 

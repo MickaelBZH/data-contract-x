@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 # PyPI distribution name. The import package and CLI stay `dcx`.
 name = "datacontract-x"
-version = "0.1.5"
+version = "0.1.8"
 description = "Data Contract eXtended — AI-native, platform-extensible data contracts: LLM enrichment (descriptions, tags, data quality), live import, and apply. Built on datacontract-cli."
 license = "MIT"
 license-files = ["LICENSE"]
@@ -67,6 +67,15 @@ exclude = ["tests*"]
 [tool.ruff]
 line-length = 120
 target-version = "py310"
+
+[tool.ruff.lint]
+# Pin the rule set explicitly. Without this, ruff applies whatever its *default*
+# selection happens to be, and CI installs ruff unpinned (`ruff>=0.6`) — so a ruff
+# release that widens the defaults turns CI red on branches that changed nothing.
+# That is exactly what 0.16 did by adding UP/B/I/SIM/RUF to the defaults.
+# These four are ruff's long-standing defaults: pyflakes plus the pycodestyle
+# errors that catch real breakage. Widening this is a deliberate, separate change.
+select = ["E4", "E7", "E9", "F"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
