@@ -1227,10 +1227,10 @@ def test_real_literal_profile_keeps_connector_managed_path(tmp_path):
     config_file = snowflake_home / "config.toml"
     config_file.write_text(textwrap.dedent("""\
         [connections.literal]
-        account = "volvocars-enterprise"
-        user = "PROD_DP_GPEXP_USR"
-        warehouse = "PROD_DP_GPEXP_WHS"
-        role = "CLD-SNOWFLAKE-PROD-DP-GPEXP-SG"
+        account = "example-account"
+        user = "SERVICE_USER"
+        warehouse = "EXAMPLE_WH"
+        role = "EXAMPLE_ROLE"
     """))
     config_file.chmod(0o600)
     environment = {**os.environ, "SNOWFLAKE_HOME": str(snowflake_home)}
@@ -1253,10 +1253,10 @@ def test_real_literal_profile_keeps_connector_managed_path(tmp_path):
     )
     values = json.loads(result.stdout)
     assert values["profile"] == {
-        "account": "volvocars-enterprise",
-        "user": "PROD_DP_GPEXP_USR",
-        "warehouse": "PROD_DP_GPEXP_WHS",
-        "role": "CLD-SNOWFLAKE-PROD-DP-GPEXP-SG",
+        "account": "example-account",
+        "user": "SERVICE_USER",
+        "warehouse": "EXAMPLE_WH",
+        "role": "EXAMPLE_ROLE",
     }
     assert values["kwargs"] == {"connection_name": "literal"}
 
