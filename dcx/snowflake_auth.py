@@ -200,11 +200,23 @@ def profile_connection_kwargs(
     legacy = {"connection_name": connection_name, **explicit}
     try:
         from snowflake.connector.config_manager import CONFIG_MANAGER
+        from snowflake.connector.errors import (
+            ConfigManagerError,
+            ConfigSourceError,
+            MissingConfigOptionError,
+        )
 
-        profile = copy.deepcopy(CONFIG_MANAGER["connections"][connection_name])
-    except Exception:
+        connections = CONFIG_MANAGER["connections"]
+    except (ConfigManagerError, ConfigSourceError, MissingConfigOptionError):
+        # Preserve the connector's legacy connection_name handling when
+        # DCX cannot inspect the configured profiles.
         return legacy
 
+    profile = connections.get(connection_name)
+    if profile is None:
+        return legacy
+
+    profile = copy.deepcopy(profile)
     if not _contains_env_reference(profile):
         return legacy
 

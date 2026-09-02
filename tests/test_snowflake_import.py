@@ -880,6 +880,49 @@ def test_config_profile_only_expands_whole_value_references(monkeypatch):
     assert profile_connection_kwargs("dev") == {"connection_name": "dev"}
 
 
+def test_config_profile_lookup_error_falls_back_to_connector(monkeypatch):
+    import snowflake.connector.config_manager as config_manager
+    from snowflake.connector.errors import ConfigManagerError
+
+    from dcx.snowflake_auth import profile_connection_kwargs
+
+    class UnavailableConfigManager:
+        def __getitem__(self, key):
+            raise ConfigManagerError("connections are unavailable")
+
+    monkeypatch.setattr(config_manager, "CONFIG_MANAGER", UnavailableConfigManager())
+
+    assert profile_connection_kwargs("dev") == {"connection_name": "dev"}
+
+
+def test_config_profile_unexpected_lookup_error_is_not_swallowed(monkeypatch):
+    import snowflake.connector.config_manager as config_manager
+
+    from dcx.snowflake_auth import profile_connection_kwargs
+
+    class BrokenConfigManager:
+        def __getitem__(self, key):
+            raise RuntimeError("unexpected lookup failure")
+
+    monkeypatch.setattr(config_manager, "CONFIG_MANAGER", BrokenConfigManager())
+
+    with pytest.raises(RuntimeError, match="unexpected lookup failure"):
+        profile_connection_kwargs("dev")
+
+
+def test_config_profile_deepcopy_error_is_not_swallowed(monkeypatch):
+    from dcx.snowflake_auth import profile_connection_kwargs
+
+    class BrokenProfile(dict):
+        def __deepcopy__(self, memo):
+            raise RuntimeError("unexpected deepcopy failure")
+
+    _set_connection_profiles(monkeypatch, {"dev": BrokenProfile(password="${PASSWORD}")})
+
+    with pytest.raises(RuntimeError, match="unexpected deepcopy failure"):
+        profile_connection_kwargs("dev")
+
+
 def test_api_config_profile_missing_environment_variable_is_safe_400(monkeypatch):
     from dcx.snowflake_auth import ALLOW_LOCAL_CREDENTIALS_ENV
 
