@@ -310,6 +310,18 @@ def mock_snowflake_connector(monkeypatch):
     return state
 
 
+def _set_connection_profiles(monkeypatch, profiles):
+    import snowflake.connector.config_manager as config_manager
+
+    class FakeConfigManager:
+        def __getitem__(self, key):
+            if key == "connections":
+                return profiles
+            raise KeyError(key)
+
+    monkeypatch.setattr(config_manager, "CONFIG_MANAGER", FakeConfigManager())
+
+
 def test_quiet_aws_credential_noise_lowers_botocore_logger():
     import logging
     from dcx.apply.snowflake import quiet_aws_credential_noise
@@ -1011,6 +1023,57 @@ def test_api_apply_config_auth_disabled_by_default(monkeypatch):
     assert "--allow-local-credentials" in r.json()["detail"]
 
 
+def test_api_apply_config_auth_interpolates_profile_with_request_overrides(
+    mock_snowflake_connector, monkeypatch,
+):
+    from dcx.snowflake_auth import ALLOW_LOCAL_CREDENTIALS_ENV
+
+    profiles = {
+        "dev": {
+            "account": "${PROFILE_ACCOUNT}",
+            "user": "service-user",
+            "password": "${PROFILE_PASSWORD}",
+            "role": "${PROFILE_ROLE}",
+        }
+    }
+    monkeypatch.setenv(ALLOW_LOCAL_CREDENTIALS_ENV, "1")
+    monkeypatch.setenv("PROFILE_ACCOUNT", "PROFILE_ACCOUNT")
+    monkeypatch.setenv("PROFILE_PASSWORD", "resolved-password")
+    monkeypatch.setenv("PROFILE_ROLE", "profile-role")
+    _set_connection_profiles(monkeypatch, profiles)
+
+    response = _api_client().post(
+        "/apply/snowflake",
+        json={
+            "contract": _API_CONTRACT,
+            "options": {"role": "request-role", "include_quality": False},
+            "auth": {"type": "config", "connection_name": "dev"},
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    kwargs = mock_snowflake_connector["connect_kwargs"]
+    assert kwargs["password"] == "resolved-password"
+    assert kwargs["account"] == "ACME"
+    assert kwargs["role"] == "request-role"
+    assert "connection_name" not in kwargs
+    assert profiles["dev"]["password"] == "${PROFILE_PASSWORD}"
+
+
+def test_cli_apply_missing_profile_environment_variable_is_apply_error(monkeypatch):
+    from dcx.apply.snowflake import apply_snowflake
+
+    profiles = {"dev": {"password": "${MISSING_APPLY_PASSWORD}"}}
+    monkeypatch.delenv("MISSING_APPLY_PASSWORD", raising=False)
+    _set_connection_profiles(monkeypatch, profiles)
+
+    with pytest.raises(
+        ApplyError,
+        match="Environment variable 'MISSING_APPLY_PASSWORD' is not defined",
+    ):
+        apply_snowflake(_contract(), connection_name="dev")
+
+
 def test_api_apply_dry_run_skips_credential_checks(monkeypatch):
     """dry_run never connects, so credentials are not evaluated at all — a profile
     that a real apply would reject with 403 still returns SQL here. Consistent
@@ -1105,6 +1168,97 @@ def _sfhome(tmp_path, filename="config.toml"):
     f.write_text('default_connection_name = "dev"\n[connections.dev]\naccount = "A"\n')
     f.chmod(0o600)          # Snowflake warns loudly on a world-readable config
     return d
+
+
+def test_connector_profile_is_literal_and_dcx_resolves_a_copy(tmp_path):
+    import json
+    import os
+    import subprocess
+    import sys
+
+    snowflake_home = tmp_path / "sfhome"
+    snowflake_home.mkdir()
+    config_file = snowflake_home / "config.toml"
+    config_file.write_text(textwrap.dedent("""\
+        [connections.dev]
+        account = "literal-account"
+        private_key_file_pwd = "${TEST_PROFILE_SECRET}"
+    """))
+    config_file.chmod(0o600)
+    environment = {
+        **os.environ,
+        "SNOWFLAKE_HOME": str(snowflake_home),
+        "TEST_PROFILE_SECRET": "resolved-secret",
+    }
+    script = textwrap.dedent("""\
+        import json
+        from snowflake.connector.config_manager import CONFIG_MANAGER
+        from dcx.snowflake_auth import profile_connection_kwargs
+
+        before = CONFIG_MANAGER["connections"]["dev"]["private_key_file_pwd"]
+        resolved = profile_connection_kwargs("dev")["private_key_file_pwd"]
+        after = CONFIG_MANAGER["connections"]["dev"]["private_key_file_pwd"]
+        print(json.dumps({"before": before, "resolved": resolved, "after": after}))
+    """)
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    values = json.loads(result.stdout)
+    assert values == {
+        "before": "${TEST_PROFILE_SECRET}",
+        "resolved": "resolved-secret",
+        "after": "${TEST_PROFILE_SECRET}",
+    }
+
+
+def test_real_literal_profile_keeps_connector_managed_path(tmp_path):
+    import json
+    import os
+    import subprocess
+    import sys
+
+    snowflake_home = tmp_path / "sfhome"
+    snowflake_home.mkdir()
+    config_file = snowflake_home / "config.toml"
+    config_file.write_text(textwrap.dedent("""\
+        [connections.literal]
+        account = "volvocars-enterprise"
+        user = "PROD_DP_GPEXP_USR"
+        warehouse = "PROD_DP_GPEXP_WHS"
+        role = "CLD-SNOWFLAKE-PROD-DP-GPEXP-SG"
+    """))
+    config_file.chmod(0o600)
+    environment = {**os.environ, "SNOWFLAKE_HOME": str(snowflake_home)}
+    script = textwrap.dedent("""\
+        import json
+        from snowflake.connector.config_manager import CONFIG_MANAGER
+        from dcx.snowflake_auth import profile_connection_kwargs
+
+        profile = CONFIG_MANAGER["connections"]["literal"]
+        kwargs = profile_connection_kwargs("literal")
+        print(json.dumps({"profile": profile, "kwargs": kwargs}))
+    """)
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    values = json.loads(result.stdout)
+    assert values["profile"] == {
+        "account": "volvocars-enterprise",
+        "user": "PROD_DP_GPEXP_USR",
+        "warehouse": "PROD_DP_GPEXP_WHS",
+        "role": "CLD-SNOWFLAKE-PROD-DP-GPEXP-SG",
+    }
+    assert values["kwargs"] == {"connection_name": "literal"}
 
 
 def test_api_snowflake_config_sets_snowflake_home(tmp_path, monkeypatch):

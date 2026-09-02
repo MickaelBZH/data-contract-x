@@ -27,12 +27,18 @@ Four methods:
   accepted — never a path, which would hand callers a file-read primitive
   against the server.
 
+Named profiles may use exact ``${ENV_VAR}`` values. dcx resolves those values
+from a per-connection copy before calling the connector; literal profiles remain
+fully connector-managed.
+
 Secrets are `SecretStr` so they do not leak through model reprs, logs, or
 FastAPI validation error echoes.
 """
 
 import base64
+import copy
 import os
+import re
 from pathlib import Path
 from typing import Any, Literal, Optional, Union
 
@@ -146,6 +152,66 @@ def default_connection_name() -> Optional[str]:
     return None
 
 
+_ENV_REFERENCE = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
+
+
+def _contains_env_reference(value: Any) -> bool:
+    if isinstance(value, str):
+        return _ENV_REFERENCE.fullmatch(value) is not None
+    if isinstance(value, dict):
+        return any(_contains_env_reference(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_env_reference(item) for item in value)
+    return False
+
+
+def _resolve_env_references(value: Any) -> Any:
+    if isinstance(value, str):
+        match = _ENV_REFERENCE.fullmatch(value)
+        if match is None:
+            return value
+        variable_name = match.group(1)
+        try:
+            return os.environ[variable_name]
+        except KeyError:
+            raise SnowflakeAuthError(
+                f"Environment variable '{variable_name}' is not defined"
+            ) from None
+    if isinstance(value, dict):
+        return {key: _resolve_env_references(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_resolve_env_references(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_resolve_env_references(item) for item in value)
+    return value
+
+
+def profile_connection_kwargs(
+    connection_name: str,
+    overrides: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Resolve environment-backed profile values into per-connection kwargs.
+
+    Literal profiles stay connector-managed. Profiles containing exact
+    ``${ENV_VAR}`` values are copied and resolved without mutating or caching the
+    connector's global configuration.
+    """
+    explicit = {key: value for key, value in (overrides or {}).items() if value is not None}
+    legacy = {"connection_name": connection_name, **explicit}
+    try:
+        from snowflake.connector.config_manager import CONFIG_MANAGER
+
+        profile = copy.deepcopy(CONFIG_MANAGER["connections"][connection_name])
+    except Exception:
+        return legacy
+
+    if not _contains_env_reference(profile):
+        return legacy
+
+    resolved = _resolve_env_references(profile)
+    return {**resolved, **explicit}
+
+
 def _load_private_key_der(material: str, passphrase: Optional[str]) -> bytes:
     """Normalise PEM text or base64-DER to unencrypted PKCS#8 DER bytes."""
     from cryptography.hazmat.primitives import serialization
@@ -232,7 +298,7 @@ def connect_kwargs(auth: Any) -> dict[str, Any]:
                 "No `connection_name` given and the server has no "
                 "`default_connection_name` configured — name a profile explicitly."
             )
-        return {"connection_name": name}
+        return profile_connection_kwargs(name)
 
     raise SnowflakeAuthError(f"Unsupported auth type: {type(auth).__name__}")
 

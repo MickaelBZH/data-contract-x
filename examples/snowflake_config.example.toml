@@ -1,9 +1,9 @@
 # ---------------------------------------------------------------------------
 # Example Snowflake connection config for dcx.
 #
-# This is snowflake-connector-python's OWN format (`config.toml`) — dcx defines
-# no config file of its own and never parses this one. `--connection-name <name>`
-# simply hands the name to the connector, which reads the file itself.
+# This is snowflake-connector-python's OWN format (`config.toml`). The connector
+# locates and parses it; dcx resolves exact `${ENV_VAR}` profile values before
+# connecting when a profile contains them.
 #
 # Every value below is a placeholder. Replace them, and never commit real
 # credentials: this file is an example, not a live config.
@@ -51,7 +51,7 @@ authenticator = "SNOWFLAKE_JWT"
 # NOTE: an absolute path. The connector opens this file directly and does NOT
 # expand `~`, so a tilde path fails with "No such file or directory".
 private_key_file = "/home/me/.snowflake/rsa_key.p8"
-# private_key_file_pwd = "..."       # only if the key is encrypted
+private_key_file_pwd = "${DEV_PRIVATE_KEY_PASSPHRASE}"
 role = "TRANSFORMER"
 warehouse = "DEV_WH"
 database = "MY_DB"                   # session context only — see the note above
@@ -81,7 +81,11 @@ warehouse = "DEV_WH"
 # The API's `auth: {"type": "oauth"}` is the same method, supplied per request
 # instead of from a file.
 [connections.oauth]
-account = "myorg-myaccount"
+account = "${OAUTH_SNOWFLAKE_ACCOUNT}"
 authenticator = "oauth"
-token = "replace-me"
+token = "${OAUTH_SNOWFLAKE_TOKEN}"
 warehouse = "DEV_WH"
+
+# Interpolation is whole-value only. Literal values are unchanged; forms such
+# as prefix-${VAR}, $VAR, ${VAR:-default}, $(command), and backticks stay literal.
+# Missing variables fail before the connector is called, without logging values.

@@ -9,7 +9,8 @@ to build the script, then runs it via `snowflake-connector-python`.
   (`SNOWFLAKE_PASSWORD`, `SNOWFLAKE_PRIVATE_KEY_PATH`, `SNOWFLAKE_TOKEN`, ...) or
   Snowflake's own `config.toml` connection profile (located by the connector:
   `$SNOWFLAKE_HOME` or `~/.snowflake/` when it exists, else the platform config
-  dir such as `~/.config/snowflake/` — dcx never parses these files itself).
+    dir such as `~/.config/snowflake/`). The connector remains the config parser;
+    dcx only resolves exact `${ENV_VAR}` profile values when present.
 - Precedence for connection parameters: **CLI flag > env var > contract server
   block**. CLI flags exist for non-secret context (`--user`, `--role`,
   `--warehouse`, `--account`, `--authenticator`); env vars carry the secrets.
@@ -47,6 +48,8 @@ from dcx.snowflake_auth import (
     connect_kwargs,
     connection_error_message,
     default_connection_name,  # re-exported: importers and tests patch it here
+    profile_connection_kwargs,
+    SnowflakeAuthError,
     uses_server_config,
 )
 
@@ -187,19 +190,15 @@ def profile_conn_kwargs(
 ) -> dict[str, Any]:
     """Connector kwargs for a named profile, with explicit overrides layered on.
 
-    `connection_name` makes the connector read its own `config.toml` itself, so
-    nothing else is resolved from env or contract — only the values passed here
-    override the profile.
+    Literal profiles remain connector-managed. Profiles containing exact
+    ``${ENV_VAR}`` values are resolved by dcx into per-connection kwargs.
     """
-    conn_kwargs: dict[str, Any] = {"connection_name": connection_name}
-    for k, v in {
+    overrides = {
         "user": user, "role": role, "warehouse": warehouse,
         "account": account, "authenticator": authenticator,
         **(extra or {}),
-    }.items():
-        if v is not None:
-            conn_kwargs[k] = v
-    return conn_kwargs
+    }
+    return profile_connection_kwargs(connection_name, overrides)
 
 
 # Head of our generated `ALTER ... ADD DATA METRIC FUNCTION <assoc> EXPECTATION <exp>`.
@@ -449,10 +448,13 @@ def apply_snowflake(
         # Snowflake's `connection_name` reads the connector's own config.toml; ignore
         # other resolution and let the connector do the work. CLI overrides still
         # layer on top.
-        conn_kwargs: dict[str, Any] = profile_conn_kwargs(
-            connection_name, user=user, role=role, warehouse=warehouse,
-            account=account, authenticator=authenticator,
-        )
+        try:
+            conn_kwargs: dict[str, Any] = profile_conn_kwargs(
+                connection_name, user=user, role=role, warehouse=warehouse,
+                account=account, authenticator=authenticator,
+            )
+        except SnowflakeAuthError as exc:
+            raise ApplyError(str(exc)) from None
     else:
         try:
             conn_kwargs = _resolve_connection_params(
@@ -468,13 +470,16 @@ def apply_snowflake(
             if not fallback:
                 raise
             srv = _find_snowflake_server(contract, server_name)
-            conn_kwargs = profile_conn_kwargs(
-                fallback, user=user, role=role, warehouse=warehouse,
-                # The contract still names the account it targets, so it is layered
-                # on top rather than letting the profile silently cross accounts.
-                account=account or (srv.account if srv else None),
-                authenticator=authenticator,
-            )
+            try:
+                conn_kwargs = profile_conn_kwargs(
+                    fallback, user=user, role=role, warehouse=warehouse,
+                    # The contract still names the account it targets, so it is layered
+                    # on top rather than letting the profile silently cross accounts.
+                    account=account or (srv.account if srv else None),
+                    authenticator=authenticator,
+                )
+            except SnowflakeAuthError as exc:
+                raise ApplyError(str(exc)) from None
 
     statements_executed, warnings = _connect_apply(
         sql,
