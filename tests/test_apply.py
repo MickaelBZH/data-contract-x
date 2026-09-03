@@ -310,18 +310,6 @@ def mock_snowflake_connector(monkeypatch):
     return state
 
 
-def _set_connection_profiles(monkeypatch, profiles):
-    import snowflake.connector.config_manager as config_manager
-
-    class FakeConfigManager:
-        def __getitem__(self, key):
-            if key == "connections":
-                return profiles
-            raise KeyError(key)
-
-    monkeypatch.setattr(config_manager, "CONFIG_MANAGER", FakeConfigManager())
-
-
 def test_quiet_aws_credential_noise_lowers_botocore_logger():
     import logging
     from dcx.apply.snowflake import quiet_aws_credential_noise
@@ -1024,7 +1012,7 @@ def test_api_apply_config_auth_disabled_by_default(monkeypatch):
 
 
 def test_api_apply_config_auth_interpolates_profile_with_request_overrides(
-    mock_snowflake_connector, monkeypatch,
+    mock_snowflake_connector, monkeypatch, set_connection_profiles,
 ):
     from dcx.snowflake_auth import ALLOW_LOCAL_CREDENTIALS_ENV
 
@@ -1037,10 +1025,10 @@ def test_api_apply_config_auth_interpolates_profile_with_request_overrides(
         }
     }
     monkeypatch.setenv(ALLOW_LOCAL_CREDENTIALS_ENV, "1")
-    monkeypatch.setenv("PROFILE_ACCOUNT", "PROFILE_ACCOUNT")
+    monkeypatch.setenv("PROFILE_ACCOUNT", "profile-only-account")
     monkeypatch.setenv("PROFILE_PASSWORD", "resolved-password")
     monkeypatch.setenv("PROFILE_ROLE", "profile-role")
-    _set_connection_profiles(monkeypatch, profiles)
+    set_connection_profiles(profiles)
 
     response = _api_client().post(
         "/apply/snowflake",
@@ -1060,12 +1048,14 @@ def test_api_apply_config_auth_interpolates_profile_with_request_overrides(
     assert profiles["dev"]["password"] == "${PROFILE_PASSWORD}"
 
 
-def test_cli_apply_missing_profile_environment_variable_is_apply_error(monkeypatch):
+def test_cli_apply_missing_profile_environment_variable_is_apply_error(
+    monkeypatch, set_connection_profiles,
+):
     from dcx.apply.snowflake import apply_snowflake
 
     profiles = {"dev": {"password": "${MISSING_APPLY_PASSWORD}"}}
     monkeypatch.delenv("MISSING_APPLY_PASSWORD", raising=False)
-    _set_connection_profiles(monkeypatch, profiles)
+    set_connection_profiles(profiles)
 
     with pytest.raises(
         ApplyError,
@@ -1216,7 +1206,7 @@ def test_connector_profile_is_literal_and_dcx_resolves_a_copy(tmp_path):
     }
 
 
-def test_real_literal_profile_keeps_connector_managed_path(tmp_path):
+def test_real_literal_profile_is_materialized_as_explicit_kwargs(tmp_path):
     import json
     import os
     import subprocess
@@ -1258,7 +1248,8 @@ def test_real_literal_profile_keeps_connector_managed_path(tmp_path):
         "warehouse": "EXAMPLE_WH",
         "role": "EXAMPLE_ROLE",
     }
-    assert values["kwargs"] == {"connection_name": "literal"}
+    assert values["kwargs"] == values["profile"]
+    assert "connection_name" not in values["kwargs"]
 
 
 def test_api_snowflake_config_sets_snowflake_home(tmp_path, monkeypatch):

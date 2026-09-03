@@ -190,8 +190,8 @@ def profile_conn_kwargs(
 ) -> dict[str, Any]:
     """Connector kwargs for a named profile, with explicit overrides layered on.
 
-    Literal profiles remain connector-managed. Profiles containing exact
-    ``${ENV_VAR}`` values are resolved by dcx into per-connection kwargs.
+    Every inspectable profile is materialized into per-connection kwargs. Exact
+    ``${ENV_VAR}`` values are resolved before explicit overrides are applied.
     """
     overrides = {
         "user": user, "role": role, "warehouse": warehouse,

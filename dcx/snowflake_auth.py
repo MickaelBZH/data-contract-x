@@ -27,12 +27,14 @@ Four methods:
   accepted — never a path, which would hand callers a file-read primitive
   against the server.
 
-Named profiles may use exact ``${ENV_VAR}`` values. dcx resolves those values
-from a per-connection copy before calling the connector; literal profiles remain
-fully connector-managed.
+Named profiles are materialized from a per-connection copy before calling the
+connector. Exact ``${ENV_VAR}`` values are resolved from the environment; literal
+values are passed through unchanged.
 
-Secrets are `SecretStr` so they do not leak through model reprs, logs, or
-FastAPI validation error echoes.
+Caller-supplied secrets in API auth models use `SecretStr`, preventing their
+values from appearing in model reprs and FastAPI validation errors. Materialized
+profile values are plain connector kwargs; dcx passes them directly to the
+Snowflake Connector and does not log those kwargs.
 """
 
 import base64
@@ -155,17 +157,7 @@ def default_connection_name() -> Optional[str]:
 _ENV_REFERENCE = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
 
 
-def _contains_env_reference(value: Any) -> bool:
-    if isinstance(value, str):
-        return _ENV_REFERENCE.fullmatch(value) is not None
-    if isinstance(value, dict):
-        return any(_contains_env_reference(item) for item in value.values())
-    if isinstance(value, (list, tuple)):
-        return any(_contains_env_reference(item) for item in value)
-    return False
-
-
-def _resolve_env_references(value: Any) -> Any:
+def _resolve_env_reference(value: Any) -> Any:
     if isinstance(value, str):
         match = _ENV_REFERENCE.fullmatch(value)
         if match is None:
@@ -177,12 +169,6 @@ def _resolve_env_references(value: Any) -> Any:
             raise SnowflakeAuthError(
                 f"Environment variable '{variable_name}' is not defined"
             ) from None
-    if isinstance(value, dict):
-        return {key: _resolve_env_references(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_resolve_env_references(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_resolve_env_references(item) for item in value)
     return value
 
 
@@ -190,37 +176,33 @@ def profile_connection_kwargs(
     connection_name: str,
     overrides: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
-    """Resolve environment-backed profile values into per-connection kwargs.
+    """Materialize an inspectable profile into per-connection kwargs.
 
-    Literal profiles stay connector-managed. Profiles containing exact
-    ``${ENV_VAR}`` values are copied and resolved without mutating or caching the
-    connector's global configuration.
+    Profile values are copied and exact ``${ENV_VAR}`` references are resolved
+    without mutating or caching the connector's global configuration.
     """
     explicit = {key: value for key, value in (overrides or {}).items() if value is not None}
     legacy = {"connection_name": connection_name, **explicit}
     try:
         from snowflake.connector.config_manager import CONFIG_MANAGER
-        from snowflake.connector.errors import (
-            ConfigManagerError,
-            ConfigSourceError,
-            MissingConfigOptionError,
-        )
+        from snowflake.connector import errors as snowflake_errors
+    except ImportError:
+        return legacy
 
+    try:
         connections = CONFIG_MANAGER["connections"]
-    except (ConfigManagerError, ConfigSourceError, MissingConfigOptionError):
+    except (snowflake_errors.ConfigManagerError, snowflake_errors.ConfigSourceError):
         # Preserve the connector's legacy connection_name handling when
         # DCX cannot inspect the configured profiles.
         return legacy
 
     profile = connections.get(connection_name)
     if profile is None:
+        # Preserve Snowflake Connector's native invalid-connection-name behavior.
         return legacy
 
     profile = copy.deepcopy(profile)
-    if not _contains_env_reference(profile):
-        return legacy
-
-    resolved = _resolve_env_references(profile)
+    resolved = {key: _resolve_env_reference(value) for key, value in profile.items()}
     return {**resolved, **explicit}
 
 

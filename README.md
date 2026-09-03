@@ -332,7 +332,7 @@ dcx apply snowflake contract.yaml --authenticator externalbrowser --role TRANSFO
 
 A ready-to-edit template with all four methods lives in [`examples/snowflake_config.example.toml`](examples/snowflake_config.example.toml).
 
-`--connection-name` uses a named profile from **the connector's own config file**. Snowflake Connector remains responsible for locating and parsing the TOML file; dcx additionally resolves exact `${ENV_VAR}` profile values before connecting:
+`--connection-name` uses a named profile from **the connector's own config file**. Snowflake Connector remains responsible for locating and parsing the TOML file. When dcx can inspect the named profile, it copies every profile value into explicit connection kwargs and resolves exact `${ENV_VAR}` values before connecting:
 
 ```toml
 # config.toml — see "Where the file lives" below
@@ -357,7 +357,8 @@ The profile supplies the whole connection; only `--user`, `--role`, `--warehouse
 Environment interpolation is deliberately narrow:
 
 - Only a whole string of the form `${ENV_VAR}` is resolved.
-- Literal values remain unchanged and keep the connector's legacy profile-loading path.
+- Every inspectable profile follows the same explicit-kwargs path; interpolation changes values, never the connection path.
+- Literal values remain unchanged. If dcx cannot inspect the connector configuration or the named profile does not exist, it preserves the connector's legacy `connection_name` handling.
 - Prefix/suffix interpolation (`prefix-${ENV_VAR}`), `$ENV_VAR`, `${VAR:-default}`, `$(command)` and backticks are not expanded or executed.
 - Every reference is looked up independently for every connection, so profiles can use different variables without sharing resolved credentials.
 - A missing variable fails before connecting with `Environment variable 'ENV_VAR' is not defined`.
