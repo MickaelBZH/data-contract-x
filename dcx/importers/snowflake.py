@@ -46,6 +46,7 @@ from dcx.exporters.snowflake import _view_select_body
 from dcx.snowflake_auth import (
     connect_kwargs,
     connection_error_message,
+    SnowflakeAuthError,
     uses_server_config,
 )
 
@@ -706,18 +707,21 @@ def _connect(import_args: dict):
                 raise
 
     if conn_kwargs is None:
-        conn_kwargs = profile_conn_kwargs(
-            connection_name,
-            user=import_args.get("user"),
-            role=import_args.get("role"),
-            warehouse=import_args.get("warehouse"),
-            account=import_args.get("account"),
-            authenticator=import_args.get("authenticator"),
-            # `--database`/`--schema` are required on import: they name what to
-            # read, so they override the profile's own context.
-            extra={"database": import_args.get("database"),
-                   "schema": import_args.get("schema")},
-        )
+        try:
+            conn_kwargs = profile_conn_kwargs(
+                connection_name,
+                user=import_args.get("user"),
+                role=import_args.get("role"),
+                warehouse=import_args.get("warehouse"),
+                account=import_args.get("account"),
+                authenticator=import_args.get("authenticator"),
+                # `--database`/`--schema` are required on import: they name what to
+                # read, so they override the profile's own context.
+                extra={"database": import_args.get("database"),
+                       "schema": import_args.get("schema")},
+            )
+        except SnowflakeAuthError as exc:
+            raise SnowflakeImportError(str(exc)) from None
 
     conn_kwargs.setdefault("login_timeout", SNOWFLAKE_LOGIN_TIMEOUT)
     conn_kwargs.setdefault("network_timeout", SNOWFLAKE_NETWORK_TIMEOUT)

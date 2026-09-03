@@ -27,12 +27,20 @@ Four methods:
   accepted — never a path, which would hand callers a file-read primitive
   against the server.
 
-Secrets are `SecretStr` so they do not leak through model reprs, logs, or
-FastAPI validation error echoes.
+Named profiles are materialized from a per-connection copy before calling the
+connector. Exact ``${ENV_VAR}`` values are resolved from the environment; literal
+values are passed through unchanged.
+
+Caller-supplied secrets in API auth models use `SecretStr`, preventing their
+values from appearing in model reprs and FastAPI validation errors. Materialized
+profile values are plain connector kwargs; dcx passes them directly to the
+Snowflake Connector and does not log those kwargs.
 """
 
 import base64
+import copy
 import os
+import re
 from pathlib import Path
 from typing import Any, Literal, Optional, Union
 
@@ -146,6 +154,58 @@ def default_connection_name() -> Optional[str]:
     return None
 
 
+_ENV_REFERENCE = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
+
+
+def _resolve_env_reference(value: Any) -> Any:
+    if isinstance(value, str):
+        match = _ENV_REFERENCE.fullmatch(value)
+        if match is None:
+            return value
+        variable_name = match.group(1)
+        try:
+            return os.environ[variable_name]
+        except KeyError:
+            raise SnowflakeAuthError(
+                f"Environment variable '{variable_name}' is not defined"
+            ) from None
+    return value
+
+
+def profile_connection_kwargs(
+    connection_name: str,
+    overrides: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Materialize an inspectable profile into per-connection kwargs.
+
+    Profile values are copied and exact ``${ENV_VAR}`` references are resolved
+    without mutating or caching the connector's global configuration.
+    """
+    explicit = {key: value for key, value in (overrides or {}).items() if value is not None}
+    legacy = {"connection_name": connection_name, **explicit}
+    try:
+        from snowflake.connector.config_manager import CONFIG_MANAGER
+        from snowflake.connector import errors as snowflake_errors
+    except ImportError:
+        return legacy
+
+    try:
+        connections = CONFIG_MANAGER["connections"]
+    except (snowflake_errors.ConfigManagerError, snowflake_errors.ConfigSourceError):
+        # Preserve the connector's legacy connection_name handling when
+        # DCX cannot inspect the configured profiles.
+        return legacy
+
+    profile = connections.get(connection_name)
+    if profile is None:
+        # Preserve Snowflake Connector's native invalid-connection-name behavior.
+        return legacy
+
+    profile = copy.deepcopy(profile)
+    resolved = {key: _resolve_env_reference(value) for key, value in profile.items()}
+    return {**resolved, **explicit}
+
+
 def _load_private_key_der(material: str, passphrase: Optional[str]) -> bytes:
     """Normalise PEM text or base64-DER to unencrypted PKCS#8 DER bytes."""
     from cryptography.hazmat.primitives import serialization
@@ -232,7 +292,7 @@ def connect_kwargs(auth: Any) -> dict[str, Any]:
                 "No `connection_name` given and the server has no "
                 "`default_connection_name` configured — name a profile explicitly."
             )
-        return {"connection_name": name}
+        return profile_connection_kwargs(name)
 
     raise SnowflakeAuthError(f"Unsupported auth type: {type(auth).__name__}")
 

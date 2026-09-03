@@ -332,7 +332,7 @@ dcx apply snowflake contract.yaml --authenticator externalbrowser --role TRANSFO
 
 A ready-to-edit template with all four methods lives in [`examples/snowflake_config.example.toml`](examples/snowflake_config.example.toml).
 
-`--connection-name` uses a named profile from **the connector's own config file** — dcx defines no config format of its own and never parses these files; `snowflake-connector-python` resolves them:
+`--connection-name` uses a named profile from **the connector's own config file**. Snowflake Connector remains responsible for locating and parsing the TOML file. When dcx can inspect the named profile, it copies every profile value into explicit connection kwargs and resolves exact `${ENV_VAR}` values before connecting:
 
 ```toml
 # config.toml — see "Where the file lives" below
@@ -341,16 +341,54 @@ account = "xy12345.eu-central-1"
 user = "SVC_DCX"
 authenticator = "SNOWFLAKE_JWT"
 private_key_file = "/home/me/.snowflake/rsa_key.p8"   # absolute: `~` is NOT expanded
+private_key_file_pwd = "${DEV_PRIVATE_KEY_PASSPHRASE}"
 role = "TRANSFORMER"
 warehouse = "DEV_WH"
 ```
 
 ```bash
+export DEV_PRIVATE_KEY_PASSPHRASE='...'
 dcx import snowflake --connection-name dev --database MY_DB --schema LOAD
 dcx apply snowflake contract.yaml --connection-name dev --server dev
 ```
 
-The profile supplies the whole connection; only `--user`, `--role`, `--warehouse`, `--account` and `--authenticator` layer on top of it — plus `--database` / `--schema` on `import`, which name what to read. Env vars are not consulted at all on this path.
+The profile supplies the whole connection; only `--user`, `--role`, `--warehouse`, `--account` and `--authenticator` layer on top of it — plus `--database` / `--schema` on `import`, which name what to read. These explicit values continue to override profile values.
+
+Environment interpolation is deliberately narrow:
+
+- Only a whole string of the form `${ENV_VAR}` is resolved.
+- Every inspectable profile follows the same explicit-kwargs path; interpolation changes values, never the connection path.
+- Literal values remain unchanged. If dcx cannot inspect the connector configuration or the named profile does not exist, it preserves the connector's legacy `connection_name` handling.
+- Prefix/suffix interpolation (`prefix-${ENV_VAR}`), `$ENV_VAR`, `${VAR:-default}`, `$(command)` and backticks are not expanded or executed.
+- Every reference is looked up independently for every connection, so profiles can use different variables without sharing resolved credentials.
+- A missing variable fails before connecting with `Environment variable 'ENV_VAR' is not defined`.
+- dcx resolves a copied profile and never mutates the connector's global config or caches resolved secrets.
+- Error messages include a missing variable's name, never its resolved value or neighboring profile values.
+
+This supports deployment systems that inject secrets into the process environment without adding platform-specific secret-management logic to dcx:
+
+```toml
+[connections.account_a]
+account = "${ACCOUNT_A_SNOWFLAKE_ACCOUNT}"
+user = "SVC_ACCOUNT_A"
+authenticator = "SNOWFLAKE_JWT"
+private_key_file = "/vault/account_a/key.p8"
+private_key_file_pwd = "${ACCOUNT_A_PRIVATE_KEY_PASSPHRASE}"
+
+[connections.account_b]
+account = "${ACCOUNT_B_SNOWFLAKE_ACCOUNT}"
+user = "SVC_ACCOUNT_B"
+authenticator = "SNOWFLAKE_JWT"
+private_key_file = "/vault/account_b/key.p8"
+private_key_file_pwd = "${ACCOUNT_B_PRIVATE_KEY_PASSPHRASE}"
+```
+
+```bash
+export ACCOUNT_A_SNOWFLAKE_ACCOUNT=org-account-a
+export ACCOUNT_A_PRIVATE_KEY_PASSPHRASE='...'
+export ACCOUNT_B_SNOWFLAKE_ACCOUNT=org-account-b
+export ACCOUNT_B_PRIVATE_KEY_PASSPHRASE='...'
+```
 
 Profiles may equally live in `connections.toml` alongside it (same tables, without the `connections.` prefix) — the connector reads both.
 
@@ -424,6 +462,8 @@ POST /import/snowflake
 ```
 
 Omit `connection_name` to use the server's `default_connection_name`; if it has none configured, that is a 400.
+
+Server-side `config` auth uses the same profile interpolation described above. Missing environment variables return HTTP 400 before Snowflake is contacted. Resolved values are scoped to that request and are not stored in the connector's global configuration.
 
 `private_key` is PEM text or base64-encoded PKCS#8 DER. There is no `private_key_file`: a path would make the server read *its own* filesystem on a caller's behalf.
 
