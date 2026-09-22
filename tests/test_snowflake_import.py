@@ -501,6 +501,25 @@ def test_cli_snowflake_import_error_reraises_in_debug_mode(monkeypatch):
         )
 
 
+def test_cli_missing_profile_environment_variable_is_safe(monkeypatch):
+    from datacontract.data_contract import DataContract
+
+    def fake(format, source=None, **kw):
+        raise SnowflakeImportError(
+            "Environment variable 'MISSING_PROFILE_SECRET' is not defined"
+        )
+
+    monkeypatch.setattr(DataContract, "import_from_source", staticmethod(fake))
+    result = runner.invoke(app, [
+        "import", "snowflake", "--database", "D", "--schema", "S",
+        "--connection-name", "dev",
+    ])
+
+    assert result.exit_code == 1
+    assert "Environment variable 'MISSING_PROFILE_SECRET' is not defined" in result.output
+    assert "resolved-secret" not in result.output
+
+
 def test_cli_quiets_botocore_credential_noise(monkeypatch):
     import logging
     from datacontract.data_contract import DataContract
@@ -723,20 +742,299 @@ def test_import_snowflake_api_uses_password(monkeypatch):
     assert "authenticator" not in captured       # connector default
 
 
-def test_import_snowflake_api_connection_profile_needs_no_account(monkeypatch):
+def test_import_snowflake_api_connection_profile_needs_no_account(
+    monkeypatch, set_connection_profiles,
+):
     """A profile carries its own account; we read it back off the connection."""
     from dcx.importers.snowflake import import_snowflake_api
     from dcx.snowflake_auth import ALLOW_LOCAL_CREDENTIALS_ENV, ConfigAuth
 
     monkeypatch.setenv(ALLOW_LOCAL_CREDENTIALS_ENV, "1")
+    set_connection_profiles({"dev": {"account": "PROFILE_ACCT"}})
     captured = _capture_connect(monkeypatch)
     contract = import_snowflake_api(
         auth=ConfigAuth(type="config", connection_name="dev"),
         database="DB", schema="SCH",
     )
-    assert captured["connection_name"] == "dev"
-    assert "account" not in captured
+    assert captured["account"] == "PROFILE_ACCT"
+    assert "connection_name" not in captured
     assert contract.servers[0].account == _FakeConn.account
+
+
+def test_config_profile_interpolates_environment_values_without_global_mutation(
+    monkeypatch, set_connection_profiles,
+):
+    from dcx.importers.snowflake import import_snowflake_api
+    from dcx.snowflake_auth import ALLOW_LOCAL_CREDENTIALS_ENV, ConfigAuth
+
+    profiles = {
+        "account_a": {
+            "account": "${ACCOUNT_A}",
+            "user": "literal-user",
+            "private_key_file": "/vault/account_a/key.p8",
+            "private_key_file_pwd": "${ACCOUNT_A_PRIVATE_KEY_PASSPHRASE}",
+        }
+    }
+    monkeypatch.setenv(ALLOW_LOCAL_CREDENTIALS_ENV, "1")
+    monkeypatch.setenv("ACCOUNT_A", "resolved-account")
+    monkeypatch.setenv("ACCOUNT_A_PRIVATE_KEY_PASSPHRASE", "resolved-secret")
+    set_connection_profiles(profiles)
+    captured = _capture_connect(monkeypatch)
+
+    import_snowflake_api(
+        auth=ConfigAuth(type="config", connection_name="account_a"),
+        database="DB", schema="SCH",
+    )
+
+    assert captured["account"] == "resolved-account"
+    assert captured["user"] == "literal-user"
+    assert captured["private_key_file_pwd"] == "resolved-secret"
+    assert "connection_name" not in captured
+    assert profiles["account_a"]["account"] == "${ACCOUNT_A}"
+    assert profiles["account_a"]["private_key_file_pwd"] == "${ACCOUNT_A_PRIVATE_KEY_PASSPHRASE}"
+
+
+def test_config_profiles_resolve_independent_environment_variables(
+    monkeypatch, set_connection_profiles,
+):
+    from dcx.snowflake_auth import profile_connection_kwargs
+
+    profiles = {
+        "account_a": {"password": "${ACCOUNT_A_PASSWORD}"},
+        "account_b": {"password": "${ACCOUNT_B_PASSWORD}"},
+    }
+    monkeypatch.setenv("ACCOUNT_A_PASSWORD", "secret-a")
+    monkeypatch.setenv("ACCOUNT_B_PASSWORD", "secret-b")
+    set_connection_profiles(profiles)
+
+    assert profile_connection_kwargs("account_a")["password"] == "secret-a"
+    assert profile_connection_kwargs("account_b")["password"] == "secret-b"
+    monkeypatch.setenv("ACCOUNT_A_PASSWORD", "rotated-secret-a")
+    assert profile_connection_kwargs("account_a")["password"] == "rotated-secret-a"
+    assert profiles["account_a"]["password"] == "${ACCOUNT_A_PASSWORD}"
+    assert profiles["account_b"]["password"] == "${ACCOUNT_B_PASSWORD}"
+
+
+def test_literal_and_environment_profiles_use_equivalent_explicit_kwargs(
+    monkeypatch, set_connection_profiles,
+):
+    from dcx.snowflake_auth import profile_connection_kwargs
+
+    profiles = {
+        "literal": {"account": "example-account", "warehouse": "EXAMPLE_WH"},
+        "environment": {"account": "${PROFILE_ACCOUNT}", "warehouse": "EXAMPLE_WH"},
+    }
+    monkeypatch.setenv("PROFILE_ACCOUNT", "example-account")
+    set_connection_profiles(profiles)
+
+    literal_kwargs = profile_connection_kwargs("literal")
+    environment_kwargs = profile_connection_kwargs("environment")
+
+    assert literal_kwargs == environment_kwargs
+    assert "connection_name" not in literal_kwargs
+    assert "connection_name" not in environment_kwargs
+    assert profiles["environment"]["account"] == "${PROFILE_ACCOUNT}"
+
+
+def test_config_auth_default_profile_interpolates_environment_values(
+    monkeypatch, set_connection_profiles,
+):
+    import dcx.snowflake_auth as snowflake_auth
+
+    profiles = {"server_default": {"password": "${DEFAULT_PROFILE_PASSWORD}"}}
+    monkeypatch.setenv(snowflake_auth.ALLOW_LOCAL_CREDENTIALS_ENV, "1")
+    monkeypatch.setenv("DEFAULT_PROFILE_PASSWORD", "default-secret")
+    monkeypatch.setattr(
+        snowflake_auth,
+        "default_connection_name",
+        lambda: "server_default",
+    )
+    set_connection_profiles(profiles)
+
+    kwargs = snowflake_auth.connect_kwargs(snowflake_auth.ConfigAuth(type="config"))
+    assert kwargs == {"password": "default-secret"}
+    assert profiles["server_default"]["password"] == "${DEFAULT_PROFILE_PASSWORD}"
+
+
+def test_config_profile_only_expands_whole_value_references(
+    monkeypatch, set_connection_profiles,
+):
+    from dcx.snowflake_auth import profile_connection_kwargs
+
+    profiles = {
+        "dev": {
+            "literal": "MY_WH",
+            "mixed": "prefix-${VALUE}-suffix",
+            "dollar": "$VALUE",
+            "command": "$(command)",
+            "backticks": "`command`",
+        }
+    }
+    monkeypatch.setenv("VALUE", "expanded")
+    set_connection_profiles(profiles)
+
+    assert profile_connection_kwargs("dev") == profiles["dev"]
+
+
+def test_empty_config_profile_is_materialized(set_connection_profiles):
+    from dcx.snowflake_auth import profile_connection_kwargs
+
+    set_connection_profiles({"empty": {}})
+
+    assert profile_connection_kwargs("empty") == {}
+    assert profile_connection_kwargs("empty", {"role": "READER"}) == {"role": "READER"}
+
+
+def test_missing_config_profile_falls_back_to_connector(set_connection_profiles):
+    from dcx.snowflake_auth import profile_connection_kwargs
+
+    set_connection_profiles({"other": {}})
+
+    assert profile_connection_kwargs("missing", {"role": "READER"}) == {
+        "connection_name": "missing",
+        "role": "READER",
+    }
+
+
+def test_literal_config_profile_explicit_overrides_win(set_connection_profiles):
+    from dcx.snowflake_auth import profile_connection_kwargs
+
+    set_connection_profiles(
+        {"dev": {"account": "profile-account", "role": "PROFILE_ROLE"}},
+    )
+
+    assert profile_connection_kwargs(
+        "dev",
+        {"account": "explicit-account", "role": None},
+    ) == {
+        "account": "explicit-account",
+        "role": "PROFILE_ROLE",
+    }
+
+
+@pytest.mark.parametrize("unavailable_module", ["config_manager", "errors"])
+def test_config_profile_connector_import_error_falls_back_without_name_error(
+    monkeypatch, unavailable_module,
+):
+    import builtins
+
+    from dcx.snowflake_auth import profile_connection_kwargs
+
+    original_import = builtins.__import__
+
+    def import_without_connector_module(name, globals=None, locals=None, fromlist=(), level=0):
+        config_manager_missing = (
+            unavailable_module == "config_manager"
+            and name == "snowflake.connector.config_manager"
+        )
+        errors_missing = (
+            unavailable_module == "errors"
+            and name == "snowflake.connector"
+            and "errors" in fromlist
+        )
+        if config_manager_missing or errors_missing:
+            raise ImportError(f"connector {unavailable_module} module is unavailable")
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_connector_module)
+
+    assert profile_connection_kwargs("dev", {"role": "READER"}) == {
+        "connection_name": "dev",
+        "role": "READER",
+    }
+
+
+def test_config_profile_lookup_error_falls_back_to_connector(monkeypatch):
+    import snowflake.connector.config_manager as config_manager
+    from snowflake.connector.errors import ConfigManagerError
+
+    from dcx.snowflake_auth import profile_connection_kwargs
+
+    class UnavailableConfigManager:
+        def __getitem__(self, key):
+            raise ConfigManagerError("connections are unavailable")
+
+    monkeypatch.setattr(config_manager, "CONFIG_MANAGER", UnavailableConfigManager())
+
+    assert profile_connection_kwargs("dev") == {"connection_name": "dev"}
+
+
+def test_config_profile_unexpected_lookup_error_is_not_swallowed(monkeypatch):
+    import snowflake.connector.config_manager as config_manager
+
+    from dcx.snowflake_auth import profile_connection_kwargs
+
+    class BrokenConfigManager:
+        def __getitem__(self, key):
+            raise RuntimeError("unexpected lookup failure")
+
+    monkeypatch.setattr(config_manager, "CONFIG_MANAGER", BrokenConfigManager())
+
+    with pytest.raises(RuntimeError, match="unexpected lookup failure"):
+        profile_connection_kwargs("dev")
+
+
+def test_config_profile_deepcopy_error_is_not_swallowed(set_connection_profiles):
+    from dcx.snowflake_auth import profile_connection_kwargs
+
+    class BrokenProfile(dict):
+        def __deepcopy__(self, memo):
+            raise RuntimeError("unexpected deepcopy failure")
+
+    set_connection_profiles({"dev": BrokenProfile(password="${PASSWORD}")})
+
+    with pytest.raises(RuntimeError, match="unexpected deepcopy failure"):
+        profile_connection_kwargs("dev")
+
+
+def test_api_config_profile_missing_environment_variable_is_safe_400(
+    monkeypatch, set_connection_profiles,
+):
+    from dcx.snowflake_auth import ALLOW_LOCAL_CREDENTIALS_ENV
+
+    profiles = {
+        "dev": {
+            "private_key_file_pwd": "${MISSING_PRIVATE_KEY_PASSPHRASE}",
+            "password": "neighbor-secret-must-not-leak",
+        }
+    }
+    monkeypatch.setenv(ALLOW_LOCAL_CREDENTIALS_ENV, "1")
+    monkeypatch.delenv("MISSING_PRIVATE_KEY_PASSPHRASE", raising=False)
+    set_connection_profiles(profiles)
+    connected = _capture_connect(monkeypatch)
+
+    response = _client().post(
+        "/import/snowflake",
+        json={
+            "database": "D", "schema": "S",
+            "auth": {"type": "config", "connection_name": "dev"},
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        "Environment variable 'MISSING_PRIVATE_KEY_PASSPHRASE' is not defined"
+    )
+    assert "neighbor-secret-must-not-leak" not in response.text
+    assert connected == {}
+
+
+def test_cli_import_missing_profile_environment_variable_is_import_error(
+    monkeypatch, set_connection_profiles,
+):
+    profiles = {"dev": {"password": "${MISSING_IMPORT_PASSWORD}"}}
+    monkeypatch.delenv("MISSING_IMPORT_PASSWORD", raising=False)
+    set_connection_profiles(profiles)
+
+    with pytest.raises(
+        SnowflakeImportError,
+        match="Environment variable 'MISSING_IMPORT_PASSWORD' is not defined",
+    ):
+        import_snowflake({
+            "connection_name": "dev",
+            "database": "DB",
+            "schema": "SCH",
+        })
 
 
 def test_import_snowflake_api_requires_account(monkeypatch):
@@ -1416,10 +1714,11 @@ def test_api_config_auth_disabled_by_default(monkeypatch):
     assert connected == {}          # the gate holds before any connection
 
 
-def test_api_config_auth_when_enabled(monkeypatch):
+def test_api_config_auth_when_enabled(monkeypatch, set_connection_profiles):
     from dcx.snowflake_auth import ALLOW_LOCAL_CREDENTIALS_ENV
 
     monkeypatch.setenv(ALLOW_LOCAL_CREDENTIALS_ENV, "1")
+    set_connection_profiles({"dev": {"account": "PROFILE_ACCT"}})
     connected = _capture_connect(monkeypatch)
     r = _client().post(
         "/import/snowflake",
@@ -1429,8 +1728,8 @@ def test_api_config_auth_when_enabled(monkeypatch):
         },
     )
     assert r.status_code == 200, r.text
-    assert connected["connection_name"] == "dev"
-    assert "account" not in connected
+    assert connected["account"] == "PROFILE_ACCT"
+    assert "connection_name" not in connected
 
 
 def test_api_snowflake_rejects_server_side_key_path(monkeypatch):
