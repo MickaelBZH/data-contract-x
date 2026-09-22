@@ -742,11 +742,36 @@ def _connect(import_args: dict):
     return conn
 
 
+def _user_requested_table_filter(
+    table_names: Optional[list[str]],
+) -> tuple[str, tuple[str, ...]]:
+    if not table_names:
+        return "", ()
+    placeholders = ", ".join("%s" for _ in table_names)
+    # Preserve legacy Python filtering: raw requested names match metadata names
+    # case-insensitively. Proper quoted-identifier semantics are a separate concern;
+    # in particular, legacy behavior cannot distinguish coexisting ORDERS/orders.
+    return f" AND UPPER(TABLE_NAME) IN ({placeholders})", tuple(table_names)
+
+
+def _resolved_table_filter(
+    table_names: Optional[list[str]],
+) -> tuple[str, tuple[str, ...]]:
+    if not table_names:
+        return "", ()
+    placeholders = ", ".join("%s" for _ in table_names)
+    # These names were already resolved by Snowflake TABLES metadata. Preserve and
+    # use the exact identity for subsequent VIEWS lookup.
+    return f" AND TABLE_NAME IN ({placeholders})", tuple(table_names)
+
+
 def _fetch_metadata(conn, database: str, schema: str, tables: Optional[list[str]]):
     """Read columns, primary keys, table comments, types and view definitions."""
     db = database.upper()
     sch = schema.upper()
     table_filter = [t.upper() for t in tables] if tables else None
+    table_predicate, table_params = _user_requested_table_filter(table_filter)
+    metadata_params = (sch, *table_params)
 
     cur = conn.cursor()
     try:
@@ -754,10 +779,11 @@ def _fetch_metadata(conn, database: str, schema: str, tables: Optional[list[str]
         col_sql = (
             f'SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COMMENT, '
             f'CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE '
-            f'FROM "{db}".INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = %s '
+            f'FROM "{db}".INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = %s'
+            f'{table_predicate} '
             f'ORDER BY TABLE_NAME, ORDINAL_POSITION'
         )
-        cur.execute(col_sql, (sch,))
+        cur.execute(col_sql, metadata_params)
         columns: list[dict] = []
         for row in cur.fetchall():
             (tname, cname, dtype, nullable, comment, char_len, prec, scale) = row
@@ -773,8 +799,8 @@ def _fetch_metadata(conn, database: str, schema: str, tables: Optional[list[str]
         # --- table comments + types (covers tables and views) ---
         cur.execute(
             f'SELECT TABLE_NAME, COMMENT, TABLE_TYPE FROM "{db}".INFORMATION_SCHEMA.TABLES '
-            f'WHERE TABLE_SCHEMA = %s',
-            (sch,),
+            f'WHERE TABLE_SCHEMA = %s{table_predicate}',
+            metadata_params,
         )
         table_comments: dict = {}
         table_types: dict = {}
@@ -783,12 +809,21 @@ def _fetch_metadata(conn, database: str, schema: str, tables: Optional[list[str]
             table_types[row[0]] = row[2]
 
         # --- view definitions (the SELECT body, so views can be (re)created) ---
-        cur.execute(
-            f'SELECT TABLE_NAME, VIEW_DEFINITION FROM "{db}".INFORMATION_SCHEMA.VIEWS '
-            f'WHERE TABLE_SCHEMA = %s',
-            (sch,),
+        view_definitions = {}
+        requested_views = (
+            [name for name, table_type in table_types.items()
+             if str(table_type).upper() == "VIEW"]
+            if table_filter else None
         )
-        view_definitions = {row[0]: row[1] for row in cur.fetchall() if row[1]}
+        if requested_views is None or requested_views:
+            view_predicate, view_table_params = _resolved_table_filter(requested_views)
+            view_params = (sch, *view_table_params)
+            cur.execute(
+                f'SELECT TABLE_NAME, VIEW_DEFINITION FROM "{db}".INFORMATION_SCHEMA.VIEWS '
+                f'WHERE TABLE_SCHEMA = %s{view_predicate}',
+                view_params,
+            )
+            view_definitions = {row[0]: row[1] for row in cur.fetchall() if row[1]}
 
         # --- primary keys ---
         primary_keys: dict[str, set] = {}
@@ -803,16 +838,25 @@ def _fetch_metadata(conn, database: str, schema: str, tables: Optional[list[str]
         # Best-effort: SHOW COLUMNS needs its own privileges, and the contract is still
         # correct without it for every type INFORMATION_SCHEMA does describe.
         full_types: dict[tuple[str, str], str] = {}
-        try:
-            cur.execute(f'SHOW COLUMNS IN SCHEMA "{db}"."{sch}"')
-            idx = {c[0].lower(): i for i, c in enumerate(cur.description)}
-            for row in cur.fetchall():
-                rendered = _vector_type_from_show_columns(row[idx["data_type"]])
-                if rendered:
-                    full_types[(row[idx["table_name"]], row[idx["column_name"]])] = rendered
-        except Exception:
-            logger.debug("SHOW COLUMNS unavailable; parameterised types may be incomplete",
-                         exc_info=True)
+        vector_columns = {
+            (column["table"], column["name"])
+            for column in columns
+            if str(column["data_type"]).upper() == "VECTOR"
+        }
+        if vector_columns:
+            try:
+                cur.execute(f'SHOW COLUMNS IN SCHEMA "{db}"."{sch}"')
+                idx = {c[0].lower(): i for i, c in enumerate(cur.description)}
+                for row in cur.fetchall():
+                    key = (row[idx["table_name"]], row[idx["column_name"]])
+                    if key not in vector_columns:
+                        continue
+                    rendered = _vector_type_from_show_columns(row[idx["data_type"]])
+                    if rendered:
+                        full_types[key] = rendered
+            except Exception:
+                logger.debug("SHOW COLUMNS unavailable; parameterised types may be incomplete",
+                             exc_info=True)
     finally:
         cur.close()
 

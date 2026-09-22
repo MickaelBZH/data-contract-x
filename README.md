@@ -232,7 +232,13 @@ Column comments are the catch. Snowflake persists them **only** inside the `CREA
 
 > **To update an existing view's column comments, use `--ddl-mode always`.** Every other combination leaves them as they are, and dcx notes each skip.
 
-Materialized and external tables are imported with their real `physicalType`, but are currently governed as tables.
+Selective imports query `INFORMATION_SCHEMA.VIEWS` only when Snowflake reports
+`TABLE_TYPE = 'VIEW'`. This includes regular secure views: security is exposed as a
+separate view attribute, not a different table type. Snowflake reports materialized
+views as `MATERIALIZED VIEW`, and they do not appear in `INFORMATION_SCHEMA.VIEWS`;
+their definition requires `SHOW MATERIALIZED VIEWS` or `GET_DDL`. dcx therefore
+imports materialized and external tables with their real `physicalType`, but does not
+capture a materialized-view `viewDefinition` and currently governs both as tables.
 
 **API**
 - `POST /apply/snowflake` — authenticated by the caller's own credentials (see [Connecting to Snowflake](#connecting-to-snowflake); `dry_run` needs none). Supports `dry_run`, `ddl_mode`, `strict`, `structured_types`, `tag_namespace_filter`, … (all under `options`) and returns the executed SQL plus any drift `warnings`.
