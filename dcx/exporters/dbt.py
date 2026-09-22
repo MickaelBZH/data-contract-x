@@ -19,6 +19,11 @@ Upstream `datacontract-cli` ships three separate dbt exporters (`dbt-models`,
 - **Bug fix.** Upstream's "unknown type" path emits a data test with a doubled
   `dbt_expectations.dbt_expectations.` namespace and `column_type: null`; here it is a
   single prefix with the contract's physical/logical type (or omitted if unknown).
+- **Quality → data_tests.** ODCS `quality[]` (`nullValues`/`missingValues`,
+  `duplicateValues`, `rowCount`, `type: sql`, `type: custom`) — never read by the
+  upstream exporter — is mapped onto dbt `not_null`/`unique` or
+  `dbt_utils.expression_is_true` tests. A rule that can't be mapped is surfaced as a
+  `# WARNING:` comment in the returned YAML rather than silently dropped.
 
 Type conversion (`convert_to_sql_type`) and the data-test mapping
 (`field_to_data_tests`) are reused from upstream so they keep evolving with it;
@@ -27,8 +32,10 @@ staging SQL is reused wholesale (it has no governance to map).
 Imported for its side effects (factory registration) by `dcx.exporters.command`.
 """
 
+import logging
+import re
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 
 import yaml
 from datacontract.export.dbt_exporter import (
@@ -43,11 +50,13 @@ from datacontract.export.exporter import Exporter, _check_schema_name_for_export
 from datacontract.export.exporter_factory import exporter_factory
 from datacontract.export.sql_type_converter import convert_to_sql_type
 from datacontract.integration.dbt_test_mapping import field_to_data_tests
-from open_data_contract_standard.model import OpenDataContractStandard, SchemaObject, SchemaProperty
+from open_data_contract_standard.model import DataQuality, OpenDataContractStandard, SchemaObject, SchemaProperty
 
 # The `NAME=VALUE` tag convention + namespace filtering are shared with the
 # Snowflake exporters.
 from dcx.exporters.snowflake import _filter_tags_by_namespace, _parse_tag
+
+logger = logging.getLogger(__name__)
 
 
 class DbtKind(str, Enum):
@@ -137,6 +146,244 @@ def _governance(
     return meta, tags
 
 
+# === ODCS `quality[]` → dbt `data_tests` ====================================
+# Mirrors `dcx.exporters.snowflake._LIBRARY_METRIC_TO_DMF`'s role for the Snowflake
+# DMF export: the ODCS-standard library metrics + `type: sql`/`custom` rules map onto
+# dbt's own quality vocabulary instead. `invalidValues` is excluded here — upstream's
+# `field_to_data_tests` (via `_get_enum_values`) already turns it into an
+# `accepted_values` test, so mapping it again here would just duplicate that test.
+#
+# ODCS operator → the trailing SQL comparison against a COUNT(*) (not a bare `VALUE`
+# as in the Snowflake DMF mapping, since dbt has no expectation-style placeholder).
+_COUNT_OP_SQL: dict[str, str] = {
+    "mustBe": "= {v}",
+    "mustNotBe": "<> {v}",
+    "mustBeGreaterThan": "> {v}",
+    "mustBeGreaterOrEqualTo": ">= {v}",
+    "mustBeLessThan": "< {v}",
+    "mustBeLessOrEqualTo": "<= {v}",
+}
+_COUNT_RANGE_OP_SQL: dict[str, str] = {
+    "mustBeBetween": "between {a} and {b}",
+    "mustNotBeBetween": "not between {a} and {b}",
+}
+
+
+def _fmt_num(n: Any) -> str:
+    """Render a number without a trailing `.0` so `5.0` -> `5`."""
+    if isinstance(n, float) and n.is_integer():
+        return str(int(n))
+    return str(n)
+
+
+def _quality_operator(q: DataQuality) -> Optional[tuple[str, Any]]:
+    """`(operator, value)` off whichever ODCS operator field the rule carries, or
+    None if it carries no pass condition at all."""
+    for op in _COUNT_OP_SQL:
+        v = getattr(q, op, None)
+        if v is not None:
+            return op, v
+    for op in _COUNT_RANGE_OP_SQL:
+        v = getattr(q, op, None)
+        if v:
+            return op, v
+    return None
+
+
+def _count_condition(op: str, value: Any) -> Optional[str]:
+    """The SQL comparison a `(select count(*) ...)` subquery must satisfy, or None
+    if the operator has no COUNT-based reading (there is none such today, but this
+    keeps the call sites honest about the possibility)."""
+    if op in _COUNT_OP_SQL:
+        return _COUNT_OP_SQL[op].format(v=_fmt_num(value))
+    if op in _COUNT_RANGE_OP_SQL and isinstance(value, (list, tuple)) and len(value) == 2:
+        return _COUNT_RANGE_OP_SQL[op].format(a=_fmt_num(value[0]), b=_fmt_num(value[1]))
+    return None
+
+
+def _substitute_placeholders(query: str, column: Optional[str]) -> Optional[str]:
+    """`${table}`/`${column}` (the enricher's portable `type: sql` convention, see
+    `dcx.enrich.quality`) rewritten for dbt: `${table}` -> `{{ this }}` (works for
+    both a model and a source-table test — `this` always resolves to the relation
+    under test); `${column}` -> the actual column name. None if `${column}` is used
+    but no column is in scope (a table-level rule has none to substitute)."""
+    text = query.replace("${table}", "{{ this }}")
+    if "${column}" in text:
+        if not column:
+            return None
+        text = text.replace("${column}", column)
+    return text
+
+
+def _quality_check_name(q: DataQuality) -> Optional[str]:
+    """Return the engine-neutral `check` name carried by a SQL quality rule."""
+    for custom_property in getattr(q, "customProperties", None) or []:
+        if getattr(custom_property, "property", None) == "check":
+            value = getattr(custom_property, "value", None)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def _quality_to_tests(
+    quality: Optional[list], *, column: Optional[str], label: str,
+) -> tuple[list, list, list[str]]:
+    """Map `SchemaProperty.quality` / `SchemaObject.quality` rules to dbt tests.
+
+    Returns `(column_tests, model_tests, warnings)`. `column_tests` holds only bare
+    presence/uniqueness tests (`not_null`/`unique`) scoped to `column`; anything
+    carrying a numeric threshold becomes a MODEL-level `dbt_utils.expression_is_true`
+    over a `(select count(*) ...)` subquery instead — an aggregate check doesn't fit
+    a per-row column test, and `{{ this }}` makes the same expression work whether
+    the caller is building a model or a source table. Rules this adapter can't
+    represent in dbt append a human-readable entry to `warnings` instead of vanishing.
+    """
+    column_tests: list = []
+    model_tests: list = []
+    warnings: list[str] = []
+
+    for q in quality or []:
+        rtype = (getattr(q, "type", None) or "").lower()
+        metric = getattr(q, "metric", None) if rtype == "library" else None
+        if rtype == "sql":
+            metric = _quality_check_name(q)
+        op = _quality_operator(q)
+
+        if metric == "blankCount":
+            if column is None:
+                warnings.append(f"{label}: blankCount quality rule has no column; skipped.")
+                continue
+            if op is None or op == ("mustBe", 0):
+                column_tests.append("dbt_utils.not_empty_string")
+                continue
+            condition = _count_condition(*op)
+            if condition is None:
+                warnings.append(f"{label}: blankCount on {column} has an unsupported operator; skipped.")
+                continue
+            model_tests.append({"dbt_utils.expression_is_true": {
+                "expression": (
+                    f"(select count(*) from {{{{ this }}}} "
+                    f"where {column} is not null and trim(cast({column} as string)) = '') {condition}"
+                ),
+            }})
+            continue
+
+        if metric in ("nullValues", "missingValues"):
+            if column is None:
+                warnings.append(f"{label}: {metric} quality rule has no column; skipped.")
+                continue
+            if op is None or op == ("mustBe", 0):
+                column_tests.append("not_null")
+                continue
+            condition = _count_condition(*op)
+            if condition is None:
+                warnings.append(f"{label}: {metric} on {column} has an unsupported operator; skipped.")
+                continue
+            model_tests.append({"dbt_utils.expression_is_true": {
+                "expression": f"(select count(*) from {{{{ this }}}} where {column} is null) {condition}",
+            }})
+            continue
+
+        if metric == "duplicateValues":
+            if column is not None:
+                if op is None or op == ("mustBe", 0):
+                    column_tests.append("unique")
+                    continue
+                condition = _count_condition(*op)
+                if condition is None:
+                    warnings.append(f"{label}: duplicateValues on {column} has an unsupported operator; skipped.")
+                    continue
+                model_tests.append({"dbt_utils.expression_is_true": {
+                    "expression": (
+                        f"(select count(*) from (select {column} from {{{{ this }}}} "
+                        f"group by {column} having count(*) > 1) dcx_dupes) {condition}"
+                    ),
+                }})
+                continue
+            # Table-level duplicateValues has no implicit column; it only maps when
+            # the rule names the composite key to check via `arguments.columns`.
+            columns = (getattr(q, "arguments", None) or {}).get("columns")
+            if not columns:
+                warnings.append(f"{label}: table-level duplicateValues needs arguments.columns; skipped.")
+                continue
+            model_tests.append(
+                {"dbt_expectations.expect_compound_columns_to_be_unique": {"column_list": columns}}
+            )
+            continue
+
+        if metric == "rowCount":
+            if op is None:
+                warnings.append(f"{label}: rowCount quality rule has no operator; skipped.")
+                continue
+            condition = _count_condition(*op)
+            if condition is None:
+                warnings.append(f"{label}: rowCount has an unsupported operator; skipped.")
+                continue
+            model_tests.append({"dbt_utils.expression_is_true": {
+                "expression": f"(select count(*) from {{{{ this }}}}) {condition}",
+            }})
+            continue
+
+        if metric == "invalidValues":
+            continue  # already surfaced as an `accepted_values` test by field_to_data_tests
+
+        if rtype == "sql":
+            query = getattr(q, "query", None)
+            if not query:
+                warnings.append(f"{label}: type: sql rule has no query; skipped.")
+                continue
+            expr = _substitute_placeholders(query, column)
+            if expr is None:
+                warnings.append(f"{label}: type: sql rule uses ${{column}} with no column in scope; skipped.")
+                continue
+            if op is not None:
+                condition = _count_condition(*op)
+                if condition is None:
+                    warnings.append(f"{label}: type: sql rule has an unsupported operator; skipped.")
+                    continue
+                expr = f"({expr}) {condition}"
+            model_tests.append({"dbt_utils.expression_is_true": {"expression": expr}})
+            continue
+
+        if rtype == "custom":
+            engine = (getattr(q, "engine", None) or "").lower()
+            impl = getattr(q, "implementation", None)
+            if engine != "dbt" or impl is None:
+                warnings.append(
+                    f"{label}: type: custom rule (engine={engine or '?'}) has no dbt implementation; skipped."
+                )
+                continue
+            if isinstance(impl, str):
+                try:
+                    impl = yaml.safe_load(impl)
+                except yaml.YAMLError:
+                    impl = None
+            if not isinstance(impl, (dict, str)):
+                warnings.append(f"{label}: type: custom implementation is not a usable dbt test block; skipped.")
+                continue
+            model_tests.append(impl)
+            continue
+
+        if metric:
+            warnings.append(f"{label}: quality metric '{metric}' has no dbt mapping; skipped.")
+        # No type/metric at all: nothing to report — not a gap this adapter created.
+
+    return column_tests, model_tests, warnings
+
+
+def _prepend_warnings(text: str, warnings: list[str]) -> str:
+    """Surface unmappable quality rules as `# WARNING:` comments at the top of the
+    returned YAML — visible to the caller without changing the export response shape
+    (mirrors the `-- WARNING:` convention in the Snowflake SQL exporter) — and log
+    them for server-side visibility.
+    """
+    if not warnings:
+        return text
+    for w in warnings:
+        logger.warning(w)
+    return "".join(f"# WARNING: {w}\n" for w in warnings) + text
+
+
 def _to_dbt_column(
     odcs: OpenDataContractStandard,
     prop: SchemaProperty,
@@ -147,8 +394,13 @@ def _to_dbt_column(
     *,
     meta_key_style: DbtMetaKeyStyle = DbtMetaKeyStyle.full,
     tag_namespace_filter: Optional[list] = None,
-) -> dict:
-    """Build a dbt column dict in a readable key order, routing governance to `config`."""
+) -> tuple[dict, list, list[str]]:
+    """Build a dbt column dict in a readable key order, routing governance to `config`.
+
+    Returns `(column, model_tests, warnings)`: quality rules that need a MODEL-level
+    test (a threshold on `nullValues`/`duplicateValues`, `rowCount`, `type: sql`/
+    `custom`) can't live under this column, so they bubble up to the caller.
+    """
     adapter_type = adapter_type or "snowflake"
     column: dict = {"name": prop.name}
 
@@ -194,10 +446,16 @@ def _to_dbt_column(
             source_name=odcs.id,
         )
     )
+    col_quality_tests, model_quality_tests, quality_warnings = _quality_to_tests(
+        prop.quality, column=prop.name, label=f"column {prop.name}",
+    )
+    for t in col_quality_tests:
+        if t not in data_tests:
+            data_tests.append(t)
     if data_tests:
         column["data_tests"] = data_tests
 
-    return column
+    return column, model_quality_tests, quality_warnings
 
 
 def _to_columns(
@@ -209,24 +467,29 @@ def _to_columns(
     *,
     meta_key_style: DbtMetaKeyStyle = DbtMetaKeyStyle.full,
     tag_namespace_filter: Optional[list] = None,
-) -> list:
+) -> tuple[list, list, list[str]]:
     primary_key_columns = primary_key_columns or []
     is_single_pk = len(primary_key_columns) == 1
-    return [
-        _to_dbt_column(
+    columns: list = []
+    model_tests: list = []
+    warnings: list[str] = []
+    for prop in properties:
+        column, m_tests, warns = _to_dbt_column(
             odcs, prop, supports_constraints, adapter_type,
             prop.name in primary_key_columns, is_single_pk,
             meta_key_style=meta_key_style, tag_namespace_filter=tag_namespace_filter,
         )
-        for prop in properties
-    ]
+        columns.append(column)
+        model_tests.extend(m_tests)
+        warnings.extend(warns)
+    return columns, model_tests, warnings
 
 
 def _to_dbt_model(
     schema_name: str, schema_object: SchemaObject, odcs: OpenDataContractStandard,
     adapter_type: Optional[str], meta_key_style: DbtMetaKeyStyle,
     tag_namespace_filter: Optional[list] = None,
-) -> dict:
+) -> tuple[dict, list[str]]:
     model_type = _to_dbt_model_type(schema_object.physicalType)
 
     config: dict = {"meta": {"data_contract": odcs.id}}
@@ -258,14 +521,24 @@ def _to_dbt_model(
             {"dbt_utils.unique_combination_of_columns": {"combination_of_columns": primary_key_columns}}
         ]
 
-    columns = _to_columns(
+    columns, quality_model_tests, warnings = _to_columns(
         odcs, schema_object.properties or [], _supports_constraints(model_type),
         adapter_type, primary_key_columns, meta_key_style=meta_key_style,
         tag_namespace_filter=tag_namespace_filter,
     )
     if columns:
         dbt_model["columns"] = columns
-    return dbt_model
+
+    _, table_model_tests, table_warnings = _quality_to_tests(
+        schema_object.quality, column=None, label=f"table {schema_name}",
+    )
+    warnings.extend(table_warnings)
+    for t in quality_model_tests + table_model_tests:
+        existing = dbt_model.setdefault("data_tests", [])
+        if t not in existing:
+            existing.append(t)
+
+    return dbt_model, warnings
 
 
 def _to_models_yaml(
@@ -274,21 +547,23 @@ def _to_models_yaml(
 ) -> str:
     adapter_type = _adapter_type(odcs, server)
     dbt = {"version": 2, "models": []}
+    warnings: list[str] = []
     for schema_obj in odcs.schema_ or []:
-        dbt["models"].append(
-            _to_dbt_model(
-                schema_obj.name, schema_obj, odcs, adapter_type, meta_key_style,
-                tag_namespace_filter,
-            )
+        model, warns = _to_dbt_model(
+            schema_obj.name, schema_obj, odcs, adapter_type, meta_key_style,
+            tag_namespace_filter,
         )
-    return yaml.safe_dump(dbt, indent=2, sort_keys=False, allow_unicode=True)
+        dbt["models"].append(model)
+        warnings.extend(warns)
+    text = yaml.safe_dump(dbt, indent=2, sort_keys=False, allow_unicode=True)
+    return _prepend_warnings(text, warnings)
 
 
 def _to_dbt_source_table(
     odcs: OpenDataContractStandard, model_key: str, model_value: SchemaObject,
     adapter_type: Optional[str], meta_key_style: DbtMetaKeyStyle,
     tag_namespace_filter: Optional[list] = None,
-) -> dict:
+) -> tuple[dict, list[str]]:
     table: dict = {"name": model_key}
     if model_value.description is not None:
         table["description"] = model_value.description.strip().replace("\n", " ")
@@ -302,20 +577,41 @@ def _to_dbt_source_table(
     if config:
         table["config"] = config
 
-    columns = _to_columns(
+    columns, quality_model_tests, warnings = _to_columns(
         odcs, model_value.properties or [], False, adapter_type, meta_key_style=meta_key_style,
         tag_namespace_filter=tag_namespace_filter,
     )
     if columns:
         table["columns"] = columns
-    return table
+
+    _, table_model_tests, table_warnings = _quality_to_tests(
+        model_value.quality, column=None, label=f"table {model_key}",
+    )
+    warnings.extend(table_warnings)
+    for t in quality_model_tests + table_model_tests:
+        existing = table.setdefault("data_tests", [])
+        if t not in existing:
+            existing.append(t)
+
+    return table, warnings
+
+
+def _source_name(odcs: OpenDataContractStandard) -> str:
+    """A dbt-safe source name: `sources[].name` becomes the identifier used in
+    `source('name', 'table')` calls, so it must be a plain slug — not the contract's
+    dotted `id` (e.g. `dev_dp_db.collate`). Prefer the contract's `name` field
+    (e.g. `COLLATE`), sanitized; fall back to a sanitized `id` if `name` is absent.
+    """
+    raw = (getattr(odcs, "name", None) or odcs.id or "").strip()
+    slug = re.sub(r"[^a-zA-Z0-9]+", "_", raw).strip("_").lower()
+    return slug or re.sub(r"[^a-zA-Z0-9]+", "_", odcs.id).strip("_").lower()
 
 
 def _to_sources_yaml(
     odcs: OpenDataContractStandard, server: Optional[str], meta_key_style: DbtMetaKeyStyle,
     tag_namespace_filter: Optional[list] = None,
 ) -> str:
-    source: dict = {"name": odcs.id}
+    source: dict = {"name": _source_name(odcs)}
     dbt = {"version": 2, "sources": [source]}
 
     owner = _get_owner(odcs)
@@ -336,14 +632,18 @@ def _to_sources_yaml(
             source["database"] = found_server.database
             source["schema"] = found_server.schema_
 
-    source["tables"] = [
-        _to_dbt_source_table(
+    tables = []
+    warnings: list[str] = []
+    for schema_obj in odcs.schema_ or []:
+        table, warns = _to_dbt_source_table(
             odcs, schema_obj.name, schema_obj, adapter_type, meta_key_style,
             tag_namespace_filter,
         )
-        for schema_obj in (odcs.schema_ or [])
-    ]
-    return yaml.safe_dump(dbt, indent=2, sort_keys=False, allow_unicode=True)
+        tables.append(table)
+        warnings.extend(warns)
+    source["tables"] = tables
+    text = yaml.safe_dump(dbt, indent=2, sort_keys=False, allow_unicode=True)
+    return _prepend_warnings(text, warnings)
 
 
 def _to_staging_sql(odcs: OpenDataContractStandard, schema_name: str) -> str:
