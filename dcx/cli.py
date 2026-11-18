@@ -166,6 +166,10 @@ def api(
         Optional[int],
         typer.Option(help="Worker processes to run (production). Ignored when --reload is set."),
     ] = None,
+    app_log_level: Annotated[
+        str,
+        typer.Option(envvar="DCX_LOG_LEVEL", help="Application log level (independent of Uvicorn --log-level)."),
+    ] = "INFO",
     allow_local_credentials: Annotated[
         bool,
         typer.Option(
@@ -236,8 +240,12 @@ def api(
         # After SNOWFLAKE_HOME is set: the connector resolves its paths on import.
         _report_snowflake_config()
 
-    log_config = LOGGING_CONFIG
-    log_config["root"] = {"level": "INFO"}
+    from dcx.logging_config import api_log_config
+
+    try:
+        log_config = api_log_config(LOGGING_CONFIG, app_log_level)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--app-log-level") from None
 
     extra_pairs = list(zip(ctx.args[::2], ctx.args[1::2]))
     extra_kwargs = {k.lstrip("-").replace("-", "_"): v for k, v in extra_pairs}

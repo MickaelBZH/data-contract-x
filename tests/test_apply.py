@@ -720,7 +720,7 @@ def test_detect_drift_reports_missing_extra_and_type_mismatch():
     assert "AMOUNT" in joined and "differs" in joined                          # type mismatch
 
 
-def test_detect_drift_skips_nonexistent_table():
+def test_detect_drift_skips_nonexistent_table(caplog):
     from dcx.apply.snowflake import _detect_drift
 
     contract = OpenDataContractStandard.from_string(textwrap.dedent(
@@ -755,6 +755,8 @@ def test_detect_drift_skips_nonexistent_table():
             return _Cur()
 
     assert _detect_drift(_Conn(), contract, "DB", "LOAD") == []
+    assert "event=table_check_skipped" in caplog.text
+    assert "DB.LOAD.NEW_TABLE" not in caplog.text
 
 
 # === Apply with caller-supplied credentials (API path) ======================
@@ -958,7 +960,7 @@ def test_api_apply_rejects_non_string_secondary_roles():
     assert r.status_code == 422
 
 
-def test_api_apply_error_is_502(monkeypatch):
+def test_api_apply_error_is_502(monkeypatch, caplog):
     import dcx.apply.snowflake as apply_module
 
     def boom(contract, **kw):
@@ -971,7 +973,50 @@ def test_api_apply_error_is_502(monkeypatch):
         json={"contract": _API_CONTRACT, "options": {}},
     )
     assert r.status_code == 502
-    assert "bad token" in r.json()["detail"]
+    assert r.json()["detail"]["code"] == "SF_OPERATION_FAILED"
+    assert r.json()["detail"]["retryable"] is False
+    assert "bad token" not in r.text + caplog.text
+    assert "operation=apply" in caplog.text
+
+
+@pytest.mark.parametrize("fail_second", [False, True])
+def test_api_apply_indexes_execution_events(monkeypatch, mock_snowflake_connector, caplog, fail_second):
+    import dcx.apply.snowflake as apply_module
+
+    execute_statement = apply_module._execute_statement
+    attempts = 0
+
+    def execute(conn, statement):
+        nonlocal attempts
+        attempts += 1
+        if fail_second and attempts == 2:
+            raise RuntimeError("PRIVATE_STATEMENT")
+        return execute_statement(conn, statement)
+
+    monkeypatch.setattr(apply_module, "_execute_statement", execute)
+    with caplog.at_level("DEBUG", logger="dcx"):
+        response = _api_client().post(
+            "/apply/snowflake",
+            headers={"Authorization": "Bearer PRIVATE_TOKEN"},
+            json={"contract": _API_CONTRACT, "options": {}},
+        )
+
+    assert response.status_code == (502 if fail_second else 200), response.text
+    prefix = "platform=snowflake operation=apply stage=execute statement_index="
+    events = [record.getMessage().removeprefix(prefix).split()[:2]
+              for record in caplog.records if record.getMessage().startswith(prefix)]
+    expected = [["1", "event=started"], ["1", "event=completed"], ["2", "event=started"]]
+    if fail_second:
+        expected.append(["2", "event=failed"])
+        assert response.json()["detail"]["stage"] == "execute"
+    else:
+        for index in range(2, response.json()["statements_executed"] + 1):
+            if index != 2:
+                expected.append([str(index), "event=started"])
+            expected.append([str(index), "event=completed"])
+    assert events == expected
+    assert "PRIVATE_STATEMENT" not in caplog.text + response.text
+    assert "PRIVATE_TOKEN" not in caplog.text + response.text
 
 
 def test_api_apply_key_pair_auth(monkeypatch):
