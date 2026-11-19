@@ -121,14 +121,14 @@ def test_api_app_log_level_precedence(monkeypatch, env_level, args, expected):
     assert LOGGING_CONFIG == original
 
 
-def test_api_rejects_invalid_app_log_level(monkeypatch):
+def test_api_rejects_invalid_app_log_level(monkeypatch, strip_ansi):
     from typer.testing import CliRunner
     from dcx.cli import app
 
     monkeypatch.setenv("DCX_LOG_LEVEL", "invalid")
     result = CliRunner().invoke(app, ["api"])
     assert result.exit_code == 2
-    assert "--app-log-level" in result.output
+    assert "--app-log-level" in strip_ansi(result.output)
 
 
 def test_snowflake_502_openapi_schema(client):
