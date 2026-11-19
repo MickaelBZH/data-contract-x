@@ -567,6 +567,71 @@ Every command above is mirrored to an endpoint, with request **and** response sc
 - **Enrichment** (`/enrich/*`) uses the **server's** LLM key (from the environment). Put service-level auth/quota in front of it before exposing it publicly.
 - **The CLI never takes secrets as flags** — platform secrets come from env vars or the connector's own `config.toml`; LLM keys from the provider's standard env var. (Over HTTP a caller *does* send credentials in the request body — that is the point: they are the caller's, not the server's. Terminate TLS in front of it.)
 
+### API logging and Snowflake errors
+
+Application logs go to stderr with a timestamp, level, module and event fields.
+The application level is selected by **CLI option > environment variable > INFO**:
+
+```bash
+dcx api --app-log-level debug
+DCX_LOG_LEVEL=DEBUG dcx api --host 0.0.0.0 --port 4242
+```
+
+`--log-level` still controls Uvicorn independently. `--app-log-level` accepts
+DEBUG, INFO, WARNING, ERROR and CRITICAL (case-insensitive). This configuration
+applies to `dcx api`; when embedding the ASGI app, configure logging in the host.
+It does not configure standalone import/apply CLI commands or enable third-party
+DEBUG logging.
+
+DCX Snowflake events use `platform=snowflake`, `operation=import|apply`, and
+`event`; step-level events also include `stage`. INFO logs operation boundaries,
+counts, elapsed time, and the timed connection completion. DEBUG adds stage
+boundaries, metadata query categories, and execution events with a 1-based
+`statement_index`. An Apply summary includes `dry_run` to distinguish a SQL
+preview from a live execution. WARNING reports skipped
+checks and degraded metadata reads. ERROR records a safe error category, validated
+upstream error code/SQLSTATE when available, and project-only stack locations.
+These events omit raw exception messages, SQL, query results, object names,
+connection parameters, credentials and traceback locals. Do not separately enable
+connector DEBUG logging or request-body logging in production; third-party and
+hosting logs are outside this safe event policy. CLI diagnostics are unchanged.
+
+**Response compatibility change:** only the 502 responses from
+`POST /import/snowflake` and `POST /apply/snowflake` now return an object in
+`detail` instead of a raw Snowflake error string. Other error formats and HTTP
+status codes remain unchanged. Clients should use `detail.code` for localized
+messages and `detail.message` as a fallback:
+
+```json
+{
+  "detail": {
+    "code": "SF_ACCESS_DENIED",
+    "message": "Insufficient permissions to complete the operation.",
+    "operation": "apply",
+    "stage": "execute",
+    "retryable": false
+  }
+}
+```
+
+| Application Code | Meaning |
+|---|---|
+| `SF_AUTH_FAILED` | Authentication failed; check credentials or sign in again. |
+| `SF_ACCESS_DENIED` | The identity lacks permission for this operation. |
+| `SF_WAREHOUSE_UNAVAILABLE` | Compute resources are unavailable or not selected. |
+| `SF_OBJECT_UNAVAILABLE` | A resource does not exist or is not accessible. |
+| `SF_CONNECTION_FAILED` | A connection could not be established. |
+| `SF_TIMEOUT` | The operation timed out; its outcome may be uncertain. |
+| `SF_SCHEMA_DRIFT` | Strict apply rejected differences from the contract. |
+| `SF_OPERATION_FAILED` | No reliable structured classification was available. |
+
+Classification uses structured exception attributes, not upstream message matching.
+Unknown errors deliberately use the generic fallback. `retryable` is advisory;
+apply always returns false because earlier statements may already have executed.
+Never automatically replay a write based on an error code. Successful responses
+still contain the requested contract/SQL and existing drift warnings; this policy
+is not a redaction layer for those authorized outputs or for other API endpoints.
+
 ## How it fits with datacontract-cli
 
 dcx is a **separate package that depends on datacontract-cli as a library** — no fork. It plugs into upstream's own extension points:

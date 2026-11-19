@@ -97,6 +97,47 @@ def test_dcx_api_command_registered_and_replaces_upstream():
     assert "dcx REST API" in (callback.__doc__ or "")
 
 
+@pytest.mark.parametrize("env_level,args,expected", [
+    (None, [], "INFO"),
+    ("debug", [], "DEBUG"),
+    ("debug", ["--app-log-level", "warning"], "WARNING"),
+])
+def test_api_app_log_level_precedence(monkeypatch, env_level, args, expected):
+    from copy import deepcopy
+    from typer.testing import CliRunner
+    from uvicorn.config import LOGGING_CONFIG
+    from dcx.cli import app
+
+    monkeypatch.delenv("DCX_LOG_LEVEL", raising=False)
+    if env_level is not None:
+        monkeypatch.setenv("DCX_LOG_LEVEL", env_level)
+    original = deepcopy(LOGGING_CONFIG)
+    captured = {}
+    monkeypatch.setattr("uvicorn.run", lambda **kwargs: captured.update(kwargs))
+    result = CliRunner().invoke(app, ["api", "--log-level", "debug", *args])
+    assert result.exit_code == 0, result.output
+    assert captured["log_config"]["loggers"]["dcx"]["level"] == expected
+    assert captured["log_level"] == "debug"
+    assert LOGGING_CONFIG == original
+
+
+def test_api_rejects_invalid_app_log_level(monkeypatch, strip_ansi):
+    from typer.testing import CliRunner
+    from dcx.cli import app
+
+    monkeypatch.setenv("DCX_LOG_LEVEL", "invalid")
+    result = CliRunner().invoke(app, ["api"])
+    assert result.exit_code == 2
+    assert "--app-log-level" in strip_ansi(result.output)
+
+
+def test_snowflake_502_openapi_schema(client):
+    schema = client.get("/openapi.json").json()
+    for path in ("/import/snowflake", "/apply/snowflake"):
+        response = schema["paths"][path]["post"]["responses"]["502"]
+        assert response["content"]["application/json"]["schema"]["$ref"].endswith("/SnowflakeErrorResponse")
+
+
 # === /info ==================================================================
 
 

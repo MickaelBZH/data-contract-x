@@ -14,6 +14,7 @@ Format conventions (Phase 2.2):
 - Response body: JSON by default. Pass `?format=yaml` or set
   `Accept: text/yaml` to get the YAML serialization instead.
 - Errors: JSON `{detail: "..."}` (FastAPI default) with appropriate HTTP status.
+    Snowflake 502 responses use a structured, safe `detail` object with an error code.
 
 Concurrency: the handlers are deliberately **sync** (`def`, not `async def`).
 Their bodies do blocking work — LLM calls (enrich), Snowflake connections
@@ -26,7 +27,9 @@ not make these `async` unless their bodies become truly non-blocking.
 
 import contextvars
 import inspect
+import logging
 import tempfile
+from time import perf_counter
 import typing
 import warnings
 from contextlib import contextmanager
@@ -49,6 +52,11 @@ from dcx.snowflake_auth import (
     SnowflakeAuthError,
 )
 from dcx.target import command as target_module
+from dcx.logging_config import SnowflakeLogger, log_snowflake_error
+
+logger = logging.getLogger(__name__)
+snowflake_import_logger = SnowflakeLogger(logger, "import")
+snowflake_apply_logger = SnowflakeLogger(logger, "apply")
 
 # Many CLI flags (`--schema`, etc.) intentionally shadow Pydantic BaseModel attributes
 # of the same name (e.g. the deprecated v1 `schema()` method). Suppress the noise.
@@ -187,6 +195,24 @@ class ErrorResponse(BaseModel):
     detail: str = Field(..., description="Human-readable error message.")
 
     model_config = ConfigDict(json_schema_extra={"example": {"detail": "Invalid contract: ..."}})
+
+
+class SnowflakeErrorDetail(BaseModel):
+    code: str = Field(..., description="Stable application error code; not a Snowflake error message.")
+    message: str
+    operation: str
+    stage: str
+    retryable: bool = Field(..., description="Advisory only. Never automatically replay an apply operation.")
+
+
+class SnowflakeErrorResponse(BaseModel):
+    detail: SnowflakeErrorDetail
+
+
+_SNOWFLAKE_502 = {
+    "model": SnowflakeErrorResponse,
+    "description": "Snowflake operation failed. Safe application error; no raw upstream message.",
+}
 
 
 _ERROR_DESCRIPTIONS = {
@@ -919,7 +945,7 @@ def mirror_snowflake_import_to_fastapi(api_app: FastAPI, prefix: str = "/import"
         tags=["import"],
         summary="Import a contract from a live Snowflake schema (caller-supplied credentials).",
         response_model=ContractResponse,
-        responses=_contract_responses(400, 401, 403, 502),
+        responses={**_contract_responses(400, 401, 403), 502: _SNOWFLAKE_502},
     )
     def import_snowflake_endpoint(
         body: SnowflakeImportRequest,
@@ -955,6 +981,8 @@ def mirror_snowflake_import_to_fastapi(api_app: FastAPI, prefix: str = "/import"
         auth = _resolve_auth(body.auth, authorization)
         if auth is None:
             raise HTTPException(status_code=401, detail=_MISSING_CREDENTIALS)
+        started = perf_counter()
+        snowflake_import_logger.info("event=started")
         try:
             contract = snowflake_import.import_snowflake_api(
                 auth=auth,
@@ -972,8 +1000,11 @@ def mirror_snowflake_import_to_fastapi(api_app: FastAPI, prefix: str = "/import"
         except SnowflakeAuthError as exc:
             raise _auth_http_error(exc)
         except snowflake_import.SnowflakeImportError as exc:
-            raise HTTPException(status_code=502, detail=str(exc))
+            detail = log_snowflake_error(logger, exc, "import")
+            raise HTTPException(status_code=502, detail=detail) from None
 
+        snowflake_import_logger.info("event=completed duration_ms=%.1f objects=%d",
+                    (perf_counter() - started) * 1000, len(contract.schema_ or []))
         return _serialize_response(contract, _wants_yaml(request, format))
 
 
@@ -1069,7 +1100,8 @@ def mirror_apply_snowflake_to_fastapi(api_app: FastAPI, prefix: str = "/apply") 
         response_model=ApplySnowflakeResponse,
         responses={
             200: {"description": "The SQL that was generated, and executed unless `dry_run`."},
-            **_error_responses(400, 401, 403, 502),
+            **_error_responses(400, 401, 403),
+            502: _SNOWFLAKE_502,
         },
     )
     def apply_snowflake_endpoint(
@@ -1107,6 +1139,8 @@ def mirror_apply_snowflake_to_fastapi(api_app: FastAPI, prefix: str = "/apply") 
         if not opts.dry_run and auth is None:
             raise HTTPException(status_code=401, detail=_MISSING_CREDENTIALS)
         contract = _parse_contract_input(body.contract)
+        started = perf_counter()
+        snowflake_apply_logger.info("event=started dry_run=%s", opts.dry_run)
         try:
             result = apply_module.apply_snowflake_api(
                 contract,
@@ -1131,8 +1165,12 @@ def mirror_apply_snowflake_to_fastapi(api_app: FastAPI, prefix: str = "/apply") 
         except SnowflakeAuthError as exc:
             raise _auth_http_error(exc)
         except apply_module.ApplyError as exc:
-            raise HTTPException(status_code=502, detail=str(exc))
+            detail = log_snowflake_error(logger, exc, "apply")
+            raise HTTPException(status_code=502, detail=detail) from None
 
+        snowflake_apply_logger.info("event=completed dry_run=%s duration_ms=%.1f statements=%d warnings=%d",
+                opts.dry_run, (perf_counter() - started) * 1000, result["statements_executed"],
+                    len(result.get("warnings") or []))
         # Always include the SQL so callers can review/audit what ran.
         return {
             "dry_run": result["dry_run"],

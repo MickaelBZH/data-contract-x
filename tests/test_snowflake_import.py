@@ -1420,7 +1420,7 @@ def test_api_snowflake_quality_flag_passes_through(monkeypatch):
     assert captured["quality"] is True
 
 
-def test_api_snowflake_error_is_502(monkeypatch):
+def test_api_snowflake_error_is_502(monkeypatch, caplog):
     import dcx.importers.snowflake as si
 
     def boom(**kw):
@@ -1433,7 +1433,45 @@ def test_api_snowflake_error_is_502(monkeypatch):
         json={"account": "A", "database": "D", "schema": "S"},
     )
     assert r.status_code == 502
-    assert "bad token" in r.json()["detail"]
+    assert r.json()["detail"]["code"] == "SF_OPERATION_FAILED"
+    assert "bad token" not in r.text + caplog.text
+    assert "operation=import" in caplog.text
+
+
+def test_api_degradation_warning_is_safe_and_request_scoped(monkeypatch, caplog, capsys):
+    import dcx.importers.snowflake as si
+
+    _capture_connect(monkeypatch)
+    original = si._fetch_tags
+    sensitive = "password=SECRET PRIVATE_DATABASE.PRIVATE_TABLE SELECT secret_column"
+
+    def degraded_tags(*args, **kwargs):
+        si._warn(sensitive)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(si, "_fetch_tags", degraded_tags)
+    with caplog.at_level("DEBUG", logger="dcx"):
+        response = _client().post(
+            "/import/snowflake",
+            headers={"Authorization": "Bearer PRIVATE_TOKEN"},
+            json={"account": "PRIVATE_ACCOUNT", "database": "DB", "schema": "LOAD"},
+        )
+    assert response.status_code == 200, response.text
+    emitted = caplog.text + capsys.readouterr().err
+    for value in ("SECRET", "PRIVATE_DATABASE", "PRIVATE_TABLE", "PRIVATE_TOKEN", "PRIVATE_ACCOUNT"):
+        assert value not in emitted
+    assert "metadata_conversion_degraded" in emitted
+    assert "query=columns" in emitted
+    messages = [record.getMessage() for record in caplog.records]
+    for stage in ("connect", "metadata"):
+        prefix = f"platform=snowflake operation=import stage={stage} event="
+        assert sum(message.startswith(prefix + "started") for message in messages) == 1
+        assert sum(message.startswith(prefix + "completed duration_ms=") for message in messages) == 1
+    assert sum("stage=metadata event=started" in message for message in messages) == 1
+    assert sum("stage=metadata event=completed" in message for message in messages) == 1
+    assert sum("stage=connect event=completed" in message for message in messages) == 1
+    si._warn("CLI warning still works")
+    assert "CLI warning still works" in capsys.readouterr().err
 
 
 def test_vector_column_round_trips_into_valid_ddl(monkeypatch):
@@ -1881,11 +1919,16 @@ def test_metadata_failure_closes_the_connection(monkeypatch):
     assert conn.closed is True
 
 
-def test_api_returns_502_with_snowflake_text_not_500(monkeypatch):
+def test_api_returns_safe_warehouse_error_not_500(monkeypatch, caplog):
     import dcx.importers.snowflake as si
 
     def boom(**kw):
-        raise SnowflakeImportError(f"Snowflake metadata query failed: {NO_WAREHOUSE}")
+        try:
+            error = RuntimeError(NO_WAREHOUSE)
+            error.errno = 606
+            raise error
+        except RuntimeError as exc:
+            raise SnowflakeImportError(f"Snowflake metadata query failed: {NO_WAREHOUSE}") from exc
 
     monkeypatch.setattr(si, "import_snowflake_api", boom)
     r = _client().post(
@@ -1894,7 +1937,8 @@ def test_api_returns_502_with_snowflake_text_not_500(monkeypatch):
         json={"account": "A", "database": "D", "schema": "S"},
     )
     assert r.status_code == 502
-    assert "No active warehouse selected" in r.json()["detail"]
+    assert r.json()["detail"]["code"] == "SF_WAREHOUSE_UNAVAILABLE"
+    assert "No active warehouse selected" not in r.text + caplog.text
 
 
 # === API endpoint: credential methods =======================================
@@ -2135,7 +2179,7 @@ def test_api_never_falls_back_to_the_servers_default_profile(monkeypatch):
         },
     )
     assert r.status_code == 502
-    assert "account is required" in r.json()["detail"]
+    assert r.json()["detail"]["code"] == "SF_OPERATION_FAILED"
     assert consulted == []
     assert connected == {}
 

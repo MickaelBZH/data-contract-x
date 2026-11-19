@@ -43,6 +43,9 @@ from dcx.apply.snowflake import (
     SNOWFLAKE_NETWORK_TIMEOUT,
 )
 from dcx.exporters.snowflake import _view_select_body
+from contextvars import ContextVar
+
+from dcx.logging_config import SnowflakeLogger, snowflake_stage
 from dcx.snowflake_auth import (
     connect_kwargs,
     connection_error_message,
@@ -50,15 +53,19 @@ from dcx.snowflake_auth import (
     uses_server_config,
 )
 
-logger = logging.getLogger(__name__)
+logger = SnowflakeLogger(logging.getLogger(__name__), "import")
+_safe_api_warnings = ContextVar("snowflake_safe_api_warnings", default=False)
 
 
 class SnowflakeImportError(Exception):
     """A live-import failure with a user-actionable message."""
 
 
-def _warn(msg: str) -> None:
-    print(f"Warning: {msg}", file=sys.stderr)
+def _warn(msg: str, event: str = "metadata_conversion_degraded") -> None:
+    if _safe_api_warnings.get():
+        logger.warning("stage=metadata event=%s", event)
+    else:
+        print(f"Warning: {msg}", file=sys.stderr)
 
 
 # Snowflake INFORMATION_SCHEMA DATA_TYPE → (ODCS logicalType, format). NUMBER is
@@ -783,6 +790,7 @@ def _fetch_metadata(conn, database: str, schema: str, tables: Optional[list[str]
             f'{table_predicate} '
             f'ORDER BY TABLE_NAME, ORDINAL_POSITION'
         )
+        logger.debug("stage=metadata query=columns event=querying")
         cur.execute(col_sql, metadata_params)
         columns: list[dict] = []
         for row in cur.fetchall():
@@ -797,6 +805,7 @@ def _fetch_metadata(conn, database: str, schema: str, tables: Optional[list[str]
             })
 
         # --- table comments + types (covers tables and views) ---
+        logger.debug("stage=metadata query=tables event=querying")
         cur.execute(
             f'SELECT TABLE_NAME, COMMENT, TABLE_TYPE FROM "{db}".INFORMATION_SCHEMA.TABLES '
             f'WHERE TABLE_SCHEMA = %s{table_predicate}',
@@ -818,6 +827,7 @@ def _fetch_metadata(conn, database: str, schema: str, tables: Optional[list[str]
         if requested_views is None or requested_views:
             view_predicate, view_table_params = _resolved_table_filter(requested_views)
             view_params = (sch, *view_table_params)
+            logger.debug("stage=metadata query=views event=querying")
             cur.execute(
                 f'SELECT TABLE_NAME, VIEW_DEFINITION FROM "{db}".INFORMATION_SCHEMA.VIEWS '
                 f'WHERE TABLE_SCHEMA = %s{view_predicate}',
@@ -827,6 +837,7 @@ def _fetch_metadata(conn, database: str, schema: str, tables: Optional[list[str]
 
         # --- primary keys ---
         primary_keys: dict[str, set] = {}
+        logger.debug("stage=metadata query=primary_keys event=querying")
         cur.execute(f'SHOW PRIMARY KEYS IN SCHEMA "{db}"."{sch}"')
         idx = {c[0].lower(): i for i, c in enumerate(cur.description)}
         for row in cur.fetchall():
@@ -855,8 +866,7 @@ def _fetch_metadata(conn, database: str, schema: str, tables: Optional[list[str]
                     if rendered:
                         full_types[key] = rendered
             except Exception:
-                logger.debug("SHOW COLUMNS unavailable; parameterised types may be incomplete",
-                             exc_info=True)
+                logger.warning("stage=metadata event=parameterised_types_unavailable")
     finally:
         cur.close()
 
@@ -914,6 +924,7 @@ def _fetch_tags(conn, database: str, schema: str, table_names: list[str]):
                     col = row[idx["column_name"]]
                     column_tags.setdefault((table, col), []).append(_fq_tag(row, idx))
             except Exception as exc:  # noqa: BLE001 — graceful degradation
+                logger.warning("stage=tags event=column_tags_unavailable")
                 errors.append(str(exc))
 
             # Table-level tags directly assigned to the table.
@@ -928,6 +939,7 @@ def _fetch_tags(conn, database: str, schema: str, table_names: list[str]):
                         continue
                     table_tags.setdefault(table, []).append(_fq_tag(row, idx))
             except Exception as exc:  # noqa: BLE001
+                logger.warning("stage=tags event=table_tags_unavailable")
                 errors.append(str(exc))
     finally:
         cur.close()
@@ -993,6 +1005,7 @@ def _fetch_dmf_references(conn, database: str, schema: str, table_names: list[st
                         "ref_id": _col(row, "ref_id"),
                     })
             except Exception as exc:  # noqa: BLE001 — graceful degradation
+                logger.warning("stage=quality event=metric_references_unavailable")
                 errors.append(str(exc))
 
             # Expectations live in a separate table function, joined on ref_id.
@@ -1012,6 +1025,7 @@ def _fetch_dmf_references(conn, database: str, schema: str, table_names: list[st
                     if ref_id and expression:
                         expectations.setdefault(ref_id, []).append(str(expression))
             except Exception as exc:  # noqa: BLE001 — graceful degradation
+                logger.warning("stage=quality event=metric_expectations_unavailable")
                 errors.append(str(exc))
             except Exception as exc:  # noqa: BLE001 — graceful degradation
                 errors.append(str(exc))
@@ -1056,21 +1070,23 @@ def _contract_from_connection(
     # wrapping it in SnowflakeImportError is what stops a raw ProgrammingError from
     # reaching the API as an unhandled 500.
     try:
-        columns, primary_keys, table_comments, table_types, view_definitions, full_types = _fetch_metadata(
-            conn, database, schema, tables,
-        )
+        with snowflake_stage(logger, "metadata"):
+            columns, primary_keys, table_comments, table_types, view_definitions, full_types = _fetch_metadata(
+                conn, database, schema, tables,
+            )
+            if not columns:
+                raise SnowflakeImportError(
+                    f"No accessible columns found in {database}.{schema}"
+                    + (f" for tables {tables}." if tables else ".")
+                    + " The schema may be empty, or the active primary/secondary roles may lack "
+                    "privileges to view its tables and columns."
+                )
     except SnowflakeImportError:
         raise
     except Exception as exc:
-        raise SnowflakeImportError(f"Snowflake metadata query failed: {exc}")
-
-    if not columns:
-        raise SnowflakeImportError(
-            f"No accessible columns found in {database}.{schema}"
-            + (f" for tables {tables}." if tables else ".")
-            + " The schema may be empty, or the active primary/secondary roles may lack "
-            "privileges to view its tables and columns."
-        )
+        error = SnowflakeImportError(f"Snowflake metadata query failed: {exc}")
+        error.safe_stage = "metadata"
+        raise error from exc
 
     # Both the tag and DMF lookups are per-entity table functions, so they share one
     # ordered list of table names.
@@ -1080,9 +1096,11 @@ def _contract_from_connection(
     table_tags: dict = {}
     dmf_references: list = []
     if fetch_quality:
-        dmf_references = _fetch_dmf_references(conn, database, schema, table_names)
+        with snowflake_stage(logger, "quality"):
+            dmf_references = _fetch_dmf_references(conn, database, schema, table_names)
     if fetch_tags:
-        column_tags, table_tags = _fetch_tags(conn, database, schema, table_names)
+        with snowflake_stage(logger, "tags"):
+            column_tags, table_tags = _fetch_tags(conn, database, schema, table_names)
 
     return build_snowflake_contract(
         server_info=server_info,
@@ -1190,16 +1208,23 @@ def import_snowflake_api(
     conn_kwargs.setdefault("network_timeout", SNOWFLAKE_NETWORK_TIMEOUT)
     quiet_aws_credential_noise()
     try:
-        conn = snowflake.connector.connect(**conn_kwargs)
+        with snowflake_stage(logger, "connect"):
+            conn = snowflake.connector.connect(**conn_kwargs)
     except Exception as exc:
-        raise SnowflakeImportError(connection_error_message(exc))
+        error = SnowflakeImportError(connection_error_message(exc))
+        error.safe_stage = "connect"
+        raise error from exc
 
     try:
-        configure_secondary_roles(conn, normalized_secondary_roles)
+        with snowflake_stage(logger, "session"):
+            configure_secondary_roles(conn, normalized_secondary_roles)
     except Exception as exc:
         conn.close()
-        raise SnowflakeImportError(f"Snowflake session configuration failed: {exc}")
+        error = SnowflakeImportError(f"Snowflake session configuration failed: {exc}")
+        error.safe_stage = "session"
+        raise error from exc
 
+    warning_token = _safe_api_warnings.set(True)
     try:
         return _contract_from_connection(
             conn,
@@ -1209,7 +1234,6 @@ def import_snowflake_api(
             fetch_tags=tags,
             fetch_quality=quality,
             server_info={
-                # With a connection profile the account is only known once connected.
                 "account": account or getattr(conn, "account", None),
                 "database": database,
                 "schema": schema,
@@ -1218,7 +1242,10 @@ def import_snowflake_api(
             server_name=server_name,
         )
     finally:
-        conn.close()
+        try:
+            conn.close()
+        finally:
+            _safe_api_warnings.reset(warning_token)
 
 
 class SnowflakeImporter(Importer):

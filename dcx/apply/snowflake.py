@@ -44,6 +44,7 @@ from dcx.exporters.snowflake import (
     snowflake_server_context,
     to_snowflake_full_sql,
 )
+from dcx.logging_config import SnowflakeLogger, snowflake_error, snowflake_stage
 from dcx.snowflake_auth import (
     connect_kwargs,
     connection_error_message,
@@ -66,6 +67,9 @@ def quiet_aws_credential_noise() -> None:
     and are surfaced as ApplyError/SnowflakeImportError, so nothing is hidden.
     """
     logging.getLogger("botocore.credentials").setLevel(logging.ERROR)
+
+
+logger = SnowflakeLogger(logging.getLogger(__name__), "apply")
 
 
 class ApplyError(Exception):
@@ -661,7 +665,10 @@ def _detect_drift(
             try:
                 cur.execute(f'DESCRIBE TABLE "{db}"."{sch}"."{table.upper()}"')
                 rows = cur.fetchall()
-            except Exception:
+            except Exception as exc:
+                detail = snowflake_error(exc, "apply", "drift")
+                level = logging.DEBUG if detail["code"] == "SF_OBJECT_UNAVAILABLE" else logging.WARNING
+                logger.log(level, "stage=drift event=table_check_skipped code=%s", detail["code"])
                 continue  # table absent (or not visible) — it will be created
 
             # DESCRIBE TABLE's first columns are `name` and `type`; locate by header.
@@ -722,15 +729,21 @@ def _connect_apply(
     conn_kwargs.setdefault("network_timeout", SNOWFLAKE_NETWORK_TIMEOUT)
     quiet_aws_credential_noise()
     try:
-        conn = snowflake.connector.connect(**conn_kwargs)
+        with snowflake_stage(logger, "connect"):
+            conn = snowflake.connector.connect(**conn_kwargs)
     except Exception as exc:
-        raise ApplyError(connection_error_message(exc))
+        error = ApplyError(connection_error_message(exc))
+        error.safe_stage = "connect"
+        raise error from exc
 
     try:
         try:
-            configure_secondary_roles(conn, secondary_roles)
+            with snowflake_stage(logger, "session"):
+                configure_secondary_roles(conn, secondary_roles)
         except Exception as exc:
-            raise ApplyError(f"Snowflake session configuration failed: {exc}")
+            error = ApplyError(f"Snowflake session configuration failed: {exc}")
+            error.safe_stage = "session"
+            raise error from exc
 
         warnings: list[str] = []
         if check_drift and contract is not None:
@@ -741,27 +754,41 @@ def _connect_apply(
                 # (which SNOWFLAKE_DATABASE/SNOWFLAKE_SCHEMA can point elsewhere)
                 # is session context only and must not steer this.
                 drift_db, drift_schema = snowflake_server_context(contract, server_name)
-                warnings = _detect_drift(conn, contract, drift_db, drift_schema)
+                with snowflake_stage(logger, "drift"):
+                    warnings = _detect_drift(conn, contract, drift_db, drift_schema)
             except Exception as exc:
+                logger.warning("stage=drift event=check_skipped code=%s", snowflake_error(exc, "apply")["code"])
                 warnings = [f"(drift check skipped: {exc})"]
 
         real_drift = [w for w in warnings if not w.startswith("(drift check skipped")]
+        if real_drift:
+            logger.warning("stage=drift event=differences_detected count=%d", len(real_drift))
         if strict and real_drift:
-            raise ApplyError(
+            error = ApplyError(
                 "Schema drift detected (use --no-strict to apply anyway):\n- "
                 + "\n- ".join(real_drift)
             )
+            error.safe_code = "SF_SCHEMA_DRIFT"
+            error.safe_stage = "drift"
+            raise error
 
         # Statements are split quote-aware and run one at a time, rather than handed to
         # `execute_string`, so each can absorb its own idempotent DMF/expectation
         # conflicts (see `_execute_statement`).
+        statement_index = None
         try:
             executed = 0
             for stmt in _split_sql_statements(sql):
-                _execute_statement(conn, stmt)
+                statement_index = executed + 1
+                with snowflake_stage(logger, "execute", statement_index=statement_index):
+                    _execute_statement(conn, stmt)
                 executed += 1
+                statement_index = None
         except Exception as exc:
-            raise ApplyError(f"Snowflake execution failed: {exc}")
+            error = ApplyError(f"Snowflake execution failed: {exc}")
+            error.safe_stage = "execute"
+            error.statement_index = statement_index
+            raise error from exc
         return executed, warnings
     finally:
         conn.close()
